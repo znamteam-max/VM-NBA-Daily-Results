@@ -13,7 +13,7 @@ NBA Daily Results → Telegram (RU)
   2) поиск на sports.ru;
   3) словарь исключений;
   4) фоллбэк: латиница.
-  Кэш: ru_map_nba.json (id ESPN -> "Фамилия"), очередь: ru_pending_nba.json
+  Кэш: ru_map_nba.json (id игрока ESPN -> "Фамилия"), очередь: ru_pending_nba.json
 
 • Формат:
   - Заголовок: НБА • {дата} • {N матчей}
@@ -49,6 +49,11 @@ SRU_SEARCH = SPORTS_RU + "/search/?q="
 RU_MAP_PATH     = "ru_map_nba.json"      # { athleteId(str): "Фамилия" }
 RU_PENDING_PATH = "ru_pending_nba.json"  # [{id, first, last}]
 
+# Глобальные контейнеры кэша (НЕ переназначаем в коде — только изменяем содержимое)
+RU_MAP: dict[str, str] = {}
+RU_PENDING: list[dict] = []
+_session_pending_ids: set[str] = set()
+
 # ---------- RUSSIAN DATE ----------
 RU_MONTHS = {
     1: "января", 2: "февраля", 3: "марта", 4: "апреля",
@@ -76,7 +81,7 @@ def make_session():
               allowed_methods=["GET","POST"])
     s.mount("https://", HTTPAdapter(max_retries=r))
     s.headers.update({
-        "User-Agent": "NBA-DailyResultsBot/1.0 (+espn; sports.ru resolver)",
+        "User-Agent": "NBA-DailyResultsBot/1.1 (+espn; sports.ru resolver)",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
     })
     return s
@@ -134,11 +139,13 @@ TEAM_RU = {
     "WAS": ("Вашингтон", "🧙"),
 }
 
-# ---------- RU NAME RESOLVER (SURNAME ONLY) ----------
-RU_MAP = {}         # id -> "Фамилия"
-RU_PENDING = []     # list of {id, first, last}
-_session_pending_ids = set()
+def team_ru_and_emoji(abbr: str) -> tuple[str,str]:
+    abbr = (abbr or "").upper()
+    if abbr in TEAM_RU:
+        return TEAM_RU[abbr]
+    return (abbr, "🏀")
 
+# ---------- CACHE I/O ----------
 def _load_json(path: str, default):
     if not os.path.exists(path):
         return default
@@ -154,6 +161,7 @@ def _save_json(path: str, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
+# ---------- RU NAME RESOLVER (SURNAME ONLY) ----------
 def _slugify(first: str, last: str) -> str:
     base = f"{first} {last}".strip()
     base = unicodedata.normalize("NFKD", base)
@@ -204,7 +212,6 @@ def _sportsru_search(first: str, last: str) -> str | None:
 
 # Частичные исключения (фамилия -> русская фамилия)
 EXCEPT_LAST = {
-    # из вашего примера и частые
     "Ingram":"Ингрэм","Barrett":"Барретт","Antetokounmpo":"Адетокумбо","Anthony":"Энтони",
     "Wagner":"Вагнер","Bane":"Бэйн","Young":"Янг","Alexander-Walker":"Александер-Уокер",
     "Brunson":"Брансон","Towns":"Таунс","Brown":"Браун","Hauser":"Хаузер","Thomas":"Томас",
@@ -215,13 +222,11 @@ EXCEPT_LAST = {
     "Johnson":"Джонсон","Doncic":"Дончич","Dončić":"Дончич","Reaves":"Ривз","Edwards":"Эдвардс",
     "Randle":"Рэндл","Avdija":"Авдия","Grant":"Грант","Curry":"Карри","Kuminga":"Куминга",
     "LaVine":"Лавин","Monk":"Монк","Markkanen":"Маркканен","Harden":"Харден","Leonard":"Леонард",
-    "Brooks":"Брукс","Booker":"Букер","Allen Jr.":"Аллен","Jr.":"младший",
-    # часто встречающиеся звёзды
+    "Brooks":"Брукс","Booker":"Букер","Allen Jr.":"Аллен",
     "Jokic":"Йокич","Embiid":"Эмбиид","Tatum":"Тэйтум","Lillard":"Лиллард","Morant":"Морант",
-    "Irving":"Ирвинг","James":"Джеймс","Westbrook":"Уэстбрук","Leonard":"Леонард","Paul":"Пол",
-    "Butler":"Батлер","Adebayo":"Адебайо","DeRozan":"Дерозан","Siakam":"Сиакам","VanVleet":"Ванвлит",
-    "Holiday":"Холидэй","Middleton":"Миддлтон","Lopez":"Лопес","Gobert":"Гобер","Townsend":"Таунсенд",
-    "Porzingis":"Порзингис","Gilgeous-Alexander":"Гилджес-Александер",
+    "Irving":"Ирвинг","James":"Джеймс","Westbrook":"Уэстбрук","Paul":"Пол","Butler":"Батлер",
+    "DeRozan":"Дерозан","Siakam":"Сиакам","VanVleet":"Ванвлит","Holiday":"Холидэй","Middleton":"Миддлтон",
+    "Lopez":"Лопес","Gobert":"Гобер","Porzingis":"Порзингис","Gilgeous-Alexander":"Гилджес-Александер",
 }
 
 def _queue_pending(pid: str, first: str, last: str):
@@ -242,7 +247,6 @@ def resolve_ru_surname(first: str, last: str, athlete_id: str) -> str:
 
     # нормализуем last (с учётом Jr./III)
     last_clean = last.strip()
-    # перенесём Jr./III к last, чтобы исключение сработало
     if last_clean in {"Jr.","Jr", "III", "II"}:
         last_clean = f"{first.strip()} {last_clean}"
 
@@ -267,7 +271,7 @@ def resolve_ru_surname(first: str, last: str, athlete_id: str) -> str:
     # 4) латиница (в очередь на уточнение)
     if athlete_id:
         _queue_pending(athlete_id, first, last)
-    return last  # временно латиница
+    return last or first  # временно латиница
 
 # ---------- ESPN HELPERS ----------
 def fetch_scoreboard(day: date) -> list[dict]:
@@ -286,6 +290,8 @@ def fetch_scoreboard(day: date) -> list[dict]:
             for c in competitors:
                 team = c.get("team") or {}
                 abbr = team.get("abbreviation")
+                # ESPN иногда отдаёт "GS" вместо "GSW" (редко) — нормализатор
+                if abbr == "GS": abbr = "GSW"
                 score = int(float(c.get("score", 0)))
                 win = c.get("winner", False)
                 rec = ""
@@ -331,7 +337,6 @@ def parse_players_from_box(box: dict) -> dict:
                 last = " ".join(parts[1:]) if len(parts) > 1 else parts[0] if parts else ""
 
                 # базовые числа
-                # у ESPN иногда числа лежат в athlete["stats"] или a["stats"]
                 stats_map = {}
                 for k, v in (a.get("stats") or {}).items():
                     stats_map[k.lower()] = v
@@ -356,8 +361,8 @@ def parse_players_from_box(box: dict) -> dict:
                 stl = iget("steals","stl")
                 blk = iget("blocks","blk")
 
-                # пропускаем тех, кто не играл (у некоторых вообще нет очков/минут)
-                if pts is None and reb is None and ast is None:
+                # пропускаем тех, кто вообще не играл (у некоторых нет очков/минут)
+                if all(v in (None, 0) for v in [pts, reb, ast, stl, blk]):
                     continue
 
                 arr.append({
@@ -365,7 +370,7 @@ def parse_players_from_box(box: dict) -> dict:
                     "pts": int(pts or 0), "reb": int(reb or 0),
                     "ast": int(ast or 0), "stl": int(stl or 0), "blk": int(blk or 0),
                 })
-        # Иногда статистика дублируется в нескольких группах — сведём по id (берём максимумы)
+        # Сведём дубликаты (берём максимумы по показателям)
         merged = {}
         for p in arr:
             if p["id"] not in merged:
@@ -392,14 +397,7 @@ def fmt_stat_line_ru(p: dict, ru_surname: str) -> str:
     return ", ".join(parts)
 
 # ---------- GAME BLOCK ----------
-def team_ru_and_emoji(abbr: str) -> tuple[str,str]:
-    abbr = (abbr or "").upper()
-    if abbr in TEAM_RU:
-        return TEAM_RU[abbr]
-    return (abbr, "🏀")
-
 def build_game_block(game: dict) -> str:
-    # строки счета
     comp = game["competitors"]
     if len(comp) != 2:
         return ""
@@ -422,7 +420,7 @@ def build_game_block(game: dict) -> str:
 
     body_lines = []
 
-    # для каждой команды: берём ТОП-3 по очкам (можете поменять на 2)
+    # для каждой команды: берём ТОП-3 по очкам
     def team_players_lines(team_obj):
         tid = team_obj["teamId"]
         plist = players_by_team.get(tid, [])
@@ -494,10 +492,15 @@ def tg_send(text: str):
 # ---------- MAIN ----------
 if __name__ == "__main__":
     try:
-        # загрузим кэши
-        global RU_MAP, RU_PENDING
-        RU_MAP = _load_json(RU_MAP_PATH, {})
-        RU_PENDING = _load_json(RU_PENDING_PATH, [])
+        # загрузим кэши БЕЗ переназначения глобальных переменных
+        loaded_map = _load_json(RU_MAP_PATH, {})
+        loaded_pending = _load_json(RU_PENDING_PATH, [])
+
+        RU_MAP.clear()
+        RU_MAP.update(loaded_map)
+
+        RU_PENDING.clear()
+        RU_PENDING.extend(loaded_pending)
 
         day = pick_report_date()
         text = build_post(day)
