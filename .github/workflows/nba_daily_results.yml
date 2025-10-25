@@ -52,7 +52,7 @@ jobs:
           print('Values that look like custom_emoji_id:', looks_like_ids, 'of', len(d))
           PY
 
-      # 2) Узнаёт ли Telegram эти ID (JSON body)
+      # 2) Валидация ID через Bot API (JSON body)
       - name: Validate custom emoji IDs against Telegram
         continue-on-error: true
         env:
@@ -95,8 +95,8 @@ jobs:
               print('Unknown IDs (first 10):', ','.join(unknown[:10]))
           PY
 
-      # 3) Тест: отправим 1 custom emoji (NYK) через entities (emoji-плейсхолдер)
-      - name: Send one test emoji (NYK) via entities
+      # 3) Тест: отправим 1 логотип (NYK) через HTML <tg-emoji>
+      - name: Send one test emoji (NYK) via HTML
         continue-on-error: true
         if: ${{ always() }}
         env:
@@ -117,13 +117,11 @@ jobs:
           if not m:
               print('No NYK ID in secret'); raise SystemExit(0)
           cid = m.group(1)
-          text = "🙂 тест NYK"
+          html = f'<tg-emoji emoji-id="{cid}">🙂</tg-emoji> тест NYK'
           payload = {
             "chat_id": chat,
-            "text": text,
-            "entities": [
-              {"type": "custom_emoji", "offset": 0, "length": 2, "custom_emoji_id": cid}
-            ]
+            "text": html,
+            "parse_mode": "HTML"
           }
           data = json.dumps(payload).encode('utf-8')
           req = urllib.request.Request(
