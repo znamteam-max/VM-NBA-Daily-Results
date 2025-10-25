@@ -47,7 +47,7 @@ def make_session():
     ad = _mk_adapter()
     s.mount("https://", ad); s.mount("http://", ad)
     s.headers.update({
-        "User-Agent": "NBA-DailyResultsBot/3.9 (custom-emoji, abbr-normalization, sportsru+espn)",
+        "User-Agent": "NBA-DailyResultsBot/4.0 (entities custom-emoji, abbr-normalization, sportsru+espn)",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
         "Connection": "close",
     })
@@ -98,7 +98,6 @@ TEAM_RU_TO_ABBR = {
 }
 ABBR_TO_RU = {v:k for k,v in TEAM_RU_TO_ABBR.items()}
 
-# Нормализация аббревиатур из разнородных источников
 _ABBR_CANON = {
     "GS":"GSW","NY":"NYK","NO":"NOP","SA":"SAS","WSH":"WAS","UTAH":"UTA","PHO":"PHX",
     "BRK":"BKN","CHO":"CHA","PHL":"PHI","CHH":"CHA","NJN":"BKN",
@@ -116,9 +115,9 @@ TEAM_EMOJI_DEFAULT = {
 
 def _as_tg_emoji(val) -> str:
     """
-    val может быть:
-      • Unicode-эмодзи (☘️) — вернём как есть;
-      • ID кастом-эмодзи (строка/число) или 'id:123...' — завернём в <tg-emoji emoji-id="...">🏀</tg-emoji>.
+    val:
+      • Unicode-эмодзи (☘️) — вернуть как есть;
+      • ID кастом-эмодзи (строка/число) или 'id:123...' — вернём как <tg-emoji emoji-id="...">🏀</tg-emoji>.
     """
     if val is None: return ""
     s = str(val).strip()
@@ -126,7 +125,7 @@ def _as_tg_emoji(val) -> str:
     if m:
         cid = m.group(1)
         return f'<tg-emoji emoji-id="{cid}">🏀</tg-emoji>'
-    return s  # обычный Unicode
+    return s
 
 def load_team_emojis():
     if TEAM_EMOJI_JSON:
@@ -188,12 +187,10 @@ def parse_sports_match(url: str) -> dict | None:
     if not m: return None
     scoreA, scoreB = int(m.group(1)), int(m.group(2))
 
-    # OT по числу «периодов» рядом
     tail = text[m.end():m.end()+240]
     add = re.findall(r"\d+\s:\s\d+", tail)
     ot = max(len(add)-4, 0) if add else 0
 
-    # команды через og:title и заголовки таблиц
     meta = soup.find("meta", attrs={"property":"og:title"})
     title = meta.get("content") if meta and meta.get("content") else (soup.title.string if soup.title else "")
     teamA = teamB = None
@@ -229,7 +226,6 @@ def parse_sports_match(url: str) -> dict | None:
             tds = [td.get_text(" ", strip=True) for td in tr.find_all(["td","th"])]
             if not tds: continue
             if any(x.lower().startswith("игрок") for x in tds): continue
-            # имя
             name_idx=None
             for i,cell in enumerate(tds[:3]):
                 if re.search(r"[^\d/:% ]", cell):
@@ -259,7 +255,7 @@ def parse_sports_match(url: str) -> dict | None:
         "url": url,
     }
 
-# -------- ESPN site.api (пары, рекорды, игроки фоллбек) --------
+# -------- ESPN site.api --------
 ESPN_SB = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates={ymd}"
 ESPN_BOX = "https://site.web.api.espn.com/apis/v2/sports/basketball/nba/boxscore?event={eid}"
 
@@ -277,7 +273,6 @@ def fetch_espn_events_for_day(d: date) -> list[dict]:
             comp = (ev.get("competitions") or [None])[0] or {}
             comps = comp.get("competitors") or []
             if len(comps) != 2: continue
-            # home/away
             home = next(c for c in comps if c.get("homeAway")=="home")
             away = next(c for c in comps if c.get("homeAway")=="away")
             th = (home.get("team") or {}); ta = (away.get("team") or {})
@@ -315,26 +310,18 @@ def fetch_espn_events_for_day(d: date) -> list[dict]:
     return out
 
 def fetch_espn_events_multi(days: list[date]) -> dict[frozenset, dict]:
-    # объединяем по парам; сохраняем только completed
     seen={}
     for d in days:
         for e in fetch_espn_events_for_day(d):
-            if not e.get("completed"):  # нужны финалы
+            if not e.get("completed"):
                 continue
             key = frozenset([e["home"]["abbr"], e["away"]["abbr"]])
-            if key in seen:  # уже есть — ок
+            if key in seen:
                 continue
             seen[key] = e
-    return seen  # pair -> event
+    return seen
 
 def fetch_espn_players(event_id: str) -> dict:
-    """
-    Возвращает:
-    {
-      'by_tid': { '123': [players], ... },
-      'by_abbr': { 'NYK': [players], ... }  # нормализованные аббревиатуры
-    }
-    """
     out_tid = {}
     out_abbr = {}
     if not event_id:
@@ -366,7 +353,6 @@ def fetch_espn_players(event_id: str) -> dict:
                 ast=iget("assists","ast"); stl=iget("steals","stl"); blk=iget("blocks","blk")
                 if any([pts,reb,ast,stl,blk]):
                     arr.append({"name": nm, "pts": pts, "reb": reb, "ast": ast, "stl": stl, "blk": blk})
-        # merge by name (max)
         merged={}
         for p in arr:
             if p["name"] not in merged: merged[p["name"]] = p
@@ -381,7 +367,7 @@ def fetch_espn_players(event_id: str) -> dict:
 
     return {"by_tid": out_tid, "by_abbr": out_abbr}
 
-# -------- BallDontLie (страховка для списка пар + счёт) --------
+# -------- BallDontLie --------
 BDL = "https://www.balldontlie.io/api/v1/games?dates[]={ymd}&per_page=100"
 
 def _bdl_extract_ot(status: str) -> int:
@@ -391,11 +377,6 @@ def _bdl_extract_ot(status: str) -> int:
     return int(m.group(1)) if m else 1
 
 def fetch_bdl_games_multi(days: list[date]) -> dict[frozenset, dict]:
-    """
-    Возвращает pair -> {
-        'home_abbr','away_abbr','home_score','away_score','ot'
-    } только для финалов.
-    """
     seen=set(); out={}
     for d in days:
         j = _get_json(BDL.format(ymd=d.strftime("%Y-%m-%d")))
@@ -426,9 +407,8 @@ def initials_ru(full: str) -> str:
     if not parts: return full or ""
     if len(parts) == 1: return parts[0]
     first = parts[0]; last = parts[-1]
-    # нормализуем «мл.»/«ст.»
     if last.lower() in {"jr.","jr","мл.","ст.","sr.","sr"} and len(parts)>=3:
-        last = parts[-2] + " " + parts[-1]
+        last = parts[-2] + " " + last
     return f"{first[0]}. {last}"
 
 def ru_forms(label: str, v: int) -> str:
@@ -453,7 +433,6 @@ def second_ok(p: dict) -> bool:
 def score_key(p: dict): return (p["pts"], p["reb"]+p["ast"], p["stl"]+p["blk"])
 
 def pick_team_players(abbr: str, rows: list[dict]) -> list[tuple[dict,bool,bool]]:
-    # [(player, bold, special_detail)]
     if not rows: return []
     rows = sorted(rows, key=score_key, reverse=True)
     special_keys = []
@@ -496,9 +475,53 @@ def format_player_special(p: dict) -> str:
     chosen=stats[:3]
     return f"{name}: " + ", ".join(ru_forms(k,v) for k,v in chosen) + hot_mark(p)
 
-# -------- Спойлер и разделитель --------
+# -------- Спойлер / Разделитель / Конвертер HTML→entities --------
 def sp(s: str) -> str: return f'<span class="tg-spoiler">{s}</span>'
 SEP = "–––––––––––––––––––––––"
+
+_TAG = re.compile(r'(<b>|</b>|<span class="tg-spoiler">|</span>|<tg-emoji emoji-id="(\d{10,})">.*?</tg-emoji>)', re.S)
+def html_to_plain_entities(text: str) -> tuple[str, list[dict]]:
+    """
+    Превращает наш HTML в (plain_text, entities) для sendMessage.
+    Поддерживает: <b>, <span class="tg-spoiler">, <tg-emoji emoji-id="...">…</tg-emoji>
+    """
+    out = []
+    entities = []
+    bold_stack = []
+    spoiler_stack = []
+
+    i = 0
+    for m in _TAG.finditer(text):
+        out.append(text[i:m.start()])
+        pos = len("".join(out))
+
+        token = m.group(0)
+        cid = m.group(2)
+
+        if token == "<b>":
+            bold_stack.append(pos)
+        elif token == "</b>":
+            if bold_stack:
+                start = bold_stack.pop()
+                if pos > start:
+                    entities.append({"type":"bold","offset":start,"length":pos-start})
+        elif token == '<span class="tg-spoiler">':
+            spoiler_stack.append(pos)
+        elif token == "</span>":
+            if spoiler_stack:
+                start = spoiler_stack.pop()
+                if pos > start:
+                    entities.append({"type":"spoiler","offset":start,"length":pos-start})
+        else:
+            # custom emoji
+            out.append("■")  # плейсхолдер символ
+            entities.append({"type":"custom_emoji","offset":pos,"length":1,"custom_emoji_id":cid})
+
+        i = m.end()
+
+    out.append(text[i:])
+    plain = "".join(out)
+    return plain, entities
 
 # -------- Блоки --------
 def format_score_line(name_ru: str, abbr: str, score: int, winner: bool, record: str, ot_str: str) -> str:
@@ -522,7 +545,7 @@ def build_block_from_sports(info: dict, records: dict[str,str]) -> str:
           for (p,bold,det) in pick_team_players(B["abbr"], rowsB)]
     lines=[]
     if al: lines.extend(al)
-    if al and bl: lines.append("")  # пустая строка между командами
+    if al and bl: lines.append("")
     if bl: lines.extend(bl)
     return head + ("\n".join(lines) if lines else "")
 
@@ -559,17 +582,15 @@ def fetch_sports_games_for_title_day(d_title: date) -> dict[frozenset, dict]:
         if pair in games:
             continue
         games[pair] = info
-    return games  # pair -> sports.info
+    return games
 
 def build_post() -> str:
     d_title = pick_report_date_london()
     days = candidate_days()
 
-    # 1) Пары и рекорды: ESPN (completed) по нескольким дням
-    espn_by_pair = fetch_espn_events_multi(days)  # pair -> event
+    espn_by_pair = fetch_espn_events_multi(days)
 
-    # 2) Добавка недостающих пар и счёта через BallDontLie
-    bdl_games = fetch_bdl_games_multi(days)  # pair -> meta
+    bdl_games = fetch_bdl_games_multi(days)
     for pair, meta in bdl_games.items():
         if pair not in espn_by_pair:
             h_abbr = meta["home_abbr"]; a_abbr = meta["away_abbr"]
@@ -581,10 +602,8 @@ def build_post() -> str:
                 "completed": True, "ot": meta.get("ot", 0)
             }
 
-    # 3) Контент: Sports.ru для даты заголовка (русские фамилии/статы/точные счёты)
     sports_by_pair = fetch_sports_games_for_title_day(d_title)
 
-    # 4) Итоговый порядок: сначала ESPN/BDL пары; если есть блок Sports.ru — заменяем
     ordered_pairs = list(espn_by_pair.keys())
     title_count = len(ordered_pairs)
     title = f"НБА • {ru_date(d_title)} • {title_count} {ru_plural(title_count, ('матч','матча','матчей'))}\n"
@@ -606,20 +625,23 @@ def build_post() -> str:
         else:
             blocks.append(build_block_from_espn(espn_by_pair[pair]))
         if i < title_count:
-            # ДОПОЛНИТЕЛЬНЫЙ отступ перед разделителем
+            # один доп. отступ (пустая строка) ПЕРЕД разделителем
             blocks.append("\n\n" + SEP + "\n\n")
 
     return (title + "".join(blocks)).strip()
 
-# -------- Telegram --------
+# -------- Telegram (entities) --------
 def tg_send(text: str):
     if not (BOT_TOKEN and CHAT_ID):
         raise RuntimeError("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы")
+    # конвертируем наш HTML в plain+entities (включая кастом-эмодзи)
+    plain, ents = html_to_plain_entities(text)
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     r = S.post(url, json={
         "chat_id": CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",  # важно для <tg-emoji>
+        "text": plain,
+        # когда передаём entities — НЕ указывать parse_mode
+        "entities": ents,
         "disable_web_page_preview": True,
     }, timeout=HTTP_TIMEOUT)
     if r.status_code != 200:
