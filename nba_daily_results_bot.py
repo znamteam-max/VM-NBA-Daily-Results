@@ -2,17 +2,25 @@
 # -*- coding: utf-8 -*-
 
 """
-NBA Daily Results → Telegram (RU) — Sports.ru primary, ESPN cross-check
-Добавлены: отступы и спойлеры (скрыт счёт и статистика игроков; названия команд видны).
+NBA Daily Results → Telegram (RU) — Sports.ru primary, ESPN cross-check (+spoilers)
+Правки:
+  • Сбор всех матчей со страницы дня sports.ru (без требования "X : Y" в тексте ссылки) + нормализация URL.
+  • ESPN cross-check по трём датам (day-1, day, day+1). Если после фильтрации пропало >2 матчей — оставляем sports.ru.
+  • Спойлеры: счёт/ОТ и строки игроков скрыты; видны эмодзи и названия команд.
 """
 
 import os, sys, re, json, time
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
+from urllib.parse import urlparse, urlunparse
 
 import requests
 from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from urllib3.util_retry import Retry as _Retry  # PyPI alias sometimes differs
+try:
+    from urllib3.util.retry import Retry
+except Exception:
+    Retry = _Retry
 from bs4 import BeautifulSoup
 
 # ---------- ENV ----------
@@ -28,7 +36,7 @@ def make_session():
               allowed_methods=["GET","POST"])
     s.mount("https://", HTTPAdapter(max_retries=r))
     s.headers.update({
-        "User-Agent": "NBA-DailyResultsBot/2.5 (Sports.ru + ESPN cross-check, spoilers)",
+        "User-Agent": "NBA-DailyResultsBot/2.6 (Sports.ru + ESPN cross-check, spoilers)",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
     })
     return s
@@ -87,6 +95,20 @@ TEAM_EMOJI = load_team_emoji_map()
 def team_emoji_by_abbr(abbr: str) -> str:
     return TEAM_EMOJI.get((abbr or "").upper(), "🏀")
 
+def canonical_ru_team(raw: str) -> str | None:
+    if not raw: return None
+    txt = (raw or "").strip()
+    txt = re.split(r"—|\-|/|\|", txt, maxsplit=1)[0].strip()
+    txt = txt.replace("«","").replace("»","").replace("“","").replace("”","").replace('"',"")
+    txt = re.sub(r"\(.*?\)", "", txt).strip()
+    txt = re.sub(r"\s{2,}", " ", txt)
+    if txt in TEAM_RU_TO_ABBR: return txt
+    for key in TEAM_RU_TO_ABBR.keys():
+        if txt.startswith(key): return key
+    for key in TEAM_RU_TO_ABBR.keys():
+        if key in txt: return key
+    return None
+
 # ---------- ESPN CROSS-CHECK ----------
 ESPN_SB = "https://site.web.api.espn.com/apis/v2/sports/basketball/nba/scoreboard?dates={yyyy}{mm}{dd}"
 def fetch_espn_pairs(d: date) -> set[frozenset]:
@@ -105,7 +127,7 @@ def fetch_espn_pairs(d: date) -> set[frozenset]:
             continue
         comp = (ev.get("competitions") or [None])[0] or {}
         comps = comp.get("competitors") or []
-        if len(comps) != 2: 
+        if len(comps) != 2:
             continue
         abbrs = []
         for c in comps:
@@ -117,32 +139,11 @@ def fetch_espn_pairs(d: date) -> set[frozenset]:
             pairs.add(frozenset(abbrs))
     return pairs
 
-# ---------- UTILS ----------
-def unique_preserve(seq):
-    seen=set(); out=[]
-    for x in seq:
-        if x in seen: 
-            continue
-        seen.add(x); out.append(x)
-    return out
-
-def clean_team_label(s: str) -> str:
-    s = (s or "").strip()
-    s = re.split(r"—|\-|/|\|", s, maxsplit=1)[0].strip()
-    s = s.replace("«","").replace("»","").replace("“","").replace("”","").replace('"',"")
-    s = re.sub(r"\(.*?\)", "", s).strip()
-    s = re.sub(r"\s{2,}", " ", s)
-    return s
-
-def canonical_ru_team(raw: str) -> str | None:
-    if not raw: return None
-    txt = clean_team_label(raw)
-    if txt in TEAM_RU_TO_ABBR: return txt
-    for key in TEAM_RU_TO_ABBR.keys():
-        if txt.startswith(key): return key
-    for key in TEAM_RU_TO_ABBR.keys():
-        if key in txt: return key
-    return None
+def fetch_espn_pairs_multi(center_day: date) -> set[frozenset]:
+    pairs = set()
+    for delta in (-1, 0, 1):
+        pairs |= fetch_espn_pairs(center_day + timedelta(days=delta))
+    return pairs
 
 # ---------- FETCH / DAY ----------
 def day_url(d: date) -> str:
@@ -153,18 +154,27 @@ def get_html(url: str):
     if r.status_code != 200: return None
     return BeautifulSoup(r.text, "lxml")
 
+def _normalize_match_url(u: str) -> str:
+    full = "https://www.sports.ru" + u if u.startswith("/") else u
+    p = urlparse(full)
+    # режем query/fragment
+    return urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
+
 def collect_day_match_links(d: date) -> list[str]:
+    """Берём все ссылки /basketball/match/ со страницы дня; нормализуем, уникализируем."""
     soup = get_html(day_url(d))
     if not soup: return []
-    links = []
+    seen = set()
+    out = []
     for a in soup.find_all("a", href=True):
-        href = a["href"]; txt = a.get_text(" ", strip=True)
-        if not href.startswith("/basketball/match/"): 
+        href = a["href"]
+        if "/basketball/match/" not in href:
             continue
-        if re.search(r"\d+\s:\s\d+", txt):
-            full = "https://www.sports.ru" + href if href.startswith("/") else href
-            links.append(full)
-    return unique_preserve(links)
+        full = _normalize_match_url(href)
+        if full not in seen:
+            seen.add(full)
+            out.append(full)
+    return out
 
 # ---------- TEAM EXTRACTION ----------
 def _extract_teams_via_meta(soup: BeautifulSoup) -> tuple[str|None,str|None]:
@@ -185,7 +195,12 @@ def _extract_teams_via_stat_headers(soup: BeautifulSoup) -> list[str]:
             t0 = t.split(".")[0].strip()
             k = canonical_ru_team(t0)
             if k: found.append(k)
-    return unique_preserve(found)
+    # уникализация при сохранении порядка
+    seen=set(); out=[]
+    for x in found:
+        if x in seen: continue
+        seen.add(x); out.append(x)
+    return out
 
 # ---------- PARSE MATCH ----------
 def parse_match(url: str) -> dict | None:
@@ -193,17 +208,21 @@ def parse_match(url: str) -> dict | None:
     if not soup: return None
     page_text = soup.get_text(" ", strip=True)
 
+    # финальный счёт
     m_score = re.search(r"(\d+)\s:\s(\d+)", page_text)
     if not m_score: return None
     scoreA, scoreB = int(m_score.group(1)), int(m_score.group(2))
 
+    # завершён ли матч
     low = page_text.lower()
     finished = ("завершен" in low) or ("завершён" in low) or ("матч заверш" in low)
 
+    # овертаймы — пары после основного счёта
     tail = page_text[m_score.end(): m_score.end()+240]
     pairs = re.findall(r"\d+\s:\s\d+", tail)
     ot = max(len(pairs) - 4, 0) if pairs else 0
 
+    # команды
     teamA = teamB = None
     a1, b1 = _extract_teams_via_meta(soup)
     if a1 and b1: teamA, teamB = a1, b1
@@ -214,6 +233,7 @@ def parse_match(url: str) -> dict | None:
             if not teamB or teamB == teamA:
                 teamB = next((x for x in headers[1:] if x != teamA), teamB)
     if not (teamA and teamB) or teamA == teamB:
+        # резерв: первые подходящие заголовки
         h2s = [h.get_text(" ", strip=True) for h in soup.find_all(["h2","h1"])]
         candidates = []
         for t in h2s:
@@ -221,15 +241,20 @@ def parse_match(url: str) -> dict | None:
             if not t or t in {"Онлайн","Видео"}: continue
             k = canonical_ru_team(t)
             if k: candidates.append(k)
-        candidates = unique_preserve(candidates)
-        if len(candidates) >= 2:
-            teamA, teamB = candidates[0], candidates[1]
-    if not (teamA and teamB) or teamA == teamB:
-        return None
+        seen=set(); cand=[]
+        for x in candidates:
+            if x in seen: continue
+            seen.add(x); cand.append(x)
+        if len(cand) >= 2:
+            teamA, teamB = cand[0], cand[1]
+
+    if not (teamA and teamB): return None
+    if teamA == teamB: return None
 
     abbrA = TEAM_RU_TO_ABBR.get(teamA,""); abbrB = TEAM_RU_TO_ABBR.get(teamB,"")
     if not abbrA or not abbrB: return None
 
+    # таблицы «… статистика игроков»
     def take_team_rows(team_ru_key: str) -> list[dict]:
         rows: list[dict] = []
         key_low = team_ru_key.lower()
@@ -381,7 +406,6 @@ def pick_players_for_team(team_ru: str, abbr: str, rows: list[dict]) -> list[tup
 
 # ---------- SPOILER ----------
 def sp(s: str) -> str:
-    # Телеграм поддерживает HTML-спойлер: <span class="tg-spoiler">...</span>
     return f'<span class="tg-spoiler">{s}</span>'
 
 # ---------- BUILD MESSAGE ----------
@@ -391,6 +415,7 @@ def build_post() -> str:
     chosen_day = None
     games = []
 
+    # соберём завершённые матчи со sports.ru
     for d in pick_candidate_days():
         links = collect_day_match_links(d)
         day_games = []
@@ -413,10 +438,14 @@ def build_post() -> str:
     if not chosen_day:
         chosen_day = pick_report_date()
 
-    # ESPN cross-check
-    espn_pairs = fetch_espn_pairs(chosen_day)
-    if espn_pairs:
-        games = [g for g in games if frozenset({g["teamA"]["abbr"], g["teamB"]["abbr"]}) in espn_pairs]
+    # ESPN cross-check по трём датам (для таймзон)
+    if games:
+        espn_pairs = fetch_espn_pairs_multi(chosen_day)
+        if espn_pairs:
+            original = list(games)
+            filtered = [g for g in games if frozenset({g["teamA"]["abbr"], g["teamB"]["abbr"]}) in espn_pairs]
+            # если отфильтровалось слишком много (больше 2) — не фильтруем
+            games = filtered if len(filtered) >= len(original) - 2 else original
 
     title = f"НБА • {ru_date(chosen_day)} • {len(games)} {ru_plural(len(games), ('матч','матча','матчей'))}\n"
     title += "Результаты надёжно спрятаны 👇\n"
@@ -430,36 +459,26 @@ def build_post() -> str:
         A, B = g["teamA"], g["teamB"]
         ot_str = "" if g["ot"] == 0 else (" (ОТ)" if g["ot"] == 1 else f" ({g['ot']} ОТ)")
 
-        # Счёт и (ОТ) — под спойлером; названия — видимы
         head = (
             f"{A['emoji']} {A['name']}: {sp(str(A['score']))}\n"
             f"{B['emoji']} {B['name']}: {sp(str(B['score']) + ot_str)}\n\n"  # двойной отступ до блока игроков
         )
 
-        lines = []
         rowsA = g["players"].get(A["name"], [])
         rowsB = g["players"].get(B["name"], [])
 
-        # Команда A — строки игроков, каждая под спойлером
         a_lines = []
         for p, bold, special_detail in pick_players_for_team(A["name"], A["abbr"], rowsA):
-            txt = (
-                format_player_line_special_detail(p, bold=True) if special_detail
-                else format_player_line_regular(p, bold)
-            )
+            txt = format_player_line_special_detail(p, bold=True) if special_detail else format_player_line_regular(p, bold)
             a_lines.append(sp(txt))
 
-        # Пустая строка между командами внутри блока игроков
         b_lines = []
         for p, bold, special_detail in pick_players_for_team(B["name"], B["abbr"], rowsB):
-            txt = (
-                format_player_line_special_detail(p, bold=True) if special_detail
-                else format_player_line_regular(p, bold)
-            )
+            txt = format_player_line_special_detail(p, bold=True) if special_detail else format_player_line_regular(p, bold)
             b_lines.append(sp(txt))
 
-        # удалим дубли строк
-        def dedupe_strs(arr): 
+        # дедуп
+        def dedupe_strs(arr):
             seen=set(); res=[]
             for sline in arr:
                 if sline in seen: continue
@@ -468,10 +487,12 @@ def build_post() -> str:
         a_lines = dedupe_strs([ln for ln in a_lines if ln.strip()])
         b_lines = dedupe_strs([ln for ln in b_lines if ln.strip()])
 
+        # склеиваем с пустой строкой между командами, если обе есть
+        lines = []
         if a_lines:
             lines.extend(a_lines)
         if a_lines and b_lines:
-            lines.append("")  # пустая строка между командами
+            lines.append("")
         if b_lines:
             lines.extend(b_lines)
 
@@ -489,7 +510,7 @@ def tg_send(text: str):
     resp = S.post(url, json={
         "chat_id": CHAT_ID,
         "text": text,
-        "parse_mode": "HTML",  # важно для <span class="tg-spoiler">
+        "parse_mode": "HTML",  # для <span class="tg-spoiler">
         "disable_web_page_preview": True,
     }, timeout=25)
     if resp.status_code != 200:
