@@ -6,7 +6,7 @@ NBA Daily Results → Telegram (RU) — Sports.ru only
 
 Только НБА (матчи ВТБ отфильтрованы по хлебным крошкам «НБА» на странице матча).
 
-• Источник: Sports.ru
+Источник: Sports.ru
   - День:   https://www.sports.ru/stat/basketball/center/end/YYYY/MM/DD.html
   - Матч:   https://www.sports.ru/basketball/match/<slug>/
 
@@ -21,7 +21,10 @@ NBA Daily Results → Telegram (RU) — Sports.ru only
           ИЛИ (перехваты ≥6) ИЛИ (блок-шоты ≥6)
       печатаем только значимые показатели: REB ≥5, AST ≥5, STL ≥4, BLK ≥4
       🔥 если: PTS ≥35, REB ≥15, AST ≥12, STL ≥5, BLK ≥5
-    Спец-правило: Дёмин (Бруклин) и Голдин (Майами) — включаем и выделяем жирным, если играли.
+
+Спец-правила:
+  • Дёмин (Бруклин, BKN) и Голдин (Майами, MIA) — включаем обязательно, если играли, выделяем жирным
+    и показываем минимум 3 самых больших ( >0 ) показателя из {PTS, REB, AST, STL, BLK}.
 """
 
 import os, sys, re, json, time
@@ -46,7 +49,7 @@ def make_session():
               allowed_methods=["GET","POST"])
     s.mount("https://", HTTPAdapter(max_retries=r))
     s.headers.update({
-        "User-Agent": "NBA-DailyResultsBot/2.1 (Sports.ru-only)",
+        "User-Agent": "NBA-DailyResultsBot/2.2 (Sports.ru-only)",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
     })
     return s
@@ -71,7 +74,7 @@ def pick_report_date() -> date:
     if now.hour < 11:
         base = base - timedelta(days=1)
     return base
-def pick_candidate_days(): 
+def pick_candidate_days():
     d = pick_report_date()
     return [d, d - timedelta(days=1), d - timedelta(days=2)]
 
@@ -132,47 +135,42 @@ def collect_day_match_links(d: date) -> list[str]:
 
 # ---------- PARSE MATCH ----------
 def _is_nba_match(soup: BeautifulSoup) -> bool:
-    """
-    Жёсткая проверка турнира: среди ссылок вида /basketball/tournament/ должен быть ровно «НБА».
-    Это отсекает ВТБ и прочие лиги.
-    """
+    # Жёстко проверяем турнир «НБА»
     for a in soup.select('a[href^="/basketball/tournament/"]'):
-        title = (a.get_text(" ", strip=True) or "").strip()
-        if title == "НБА":
+        if (a.get_text(" ", strip=True) or "").strip() == "НБА":
             return True
     return False
 
 def parse_match(url: str) -> dict | None:
     soup = get_html(url)
     if not soup: return None
-    if not _is_nba_match(soup):
-        return None  # не НБА — отбрасываем
+    if not _is_nba_match(soup):  # отбрасываем ВТБ и прочее
+        return None
 
     page_text = soup.get_text(" ", strip=True)
 
-    # команды (обычно первые два заголовка h2/h1)
+    # команды (обычно первые два h2/h1)
     h2s = [h.get_text(" ", strip=True) for h in soup.find_all(["h2","h1"])]
     teams = [t for t in h2s if t and t not in {"Онлайн","Видео"} and len(t) <= 40]
     if len(teams) < 2:
         return None
     teamA, teamB = teams[0], teams[1]
 
-    # финальный счёт (первое вхождение «NNN : NNN»)
+    # финальный счёт
     m_score = re.search(r"(\d+)\s:\s(\d+)", page_text)
-    if not m_score:
-        return None
+    if not m_score: return None
     scoreA, scoreB = int(m_score.group(1)), int(m_score.group(2))
 
-    # завершён?
+    # завершён ли матч
     low = page_text.lower()
     finished = ("завершен" in low) or ("завершён" in low) or ("матч заверш" in low)
 
-    # овертаймы — пары «N : N» сразу после финального счёта
+    # овертаймы
     tail = page_text[m_score.end(): m_score.end()+240]
     pairs = re.findall(r"\d+\s:\s\d+", tail)
     ot = max(len(pairs) - 4, 0) if pairs else 0
 
-    # таблицы «<Команда>. статистика игроков»
+    # парсим таблицы «<Команда>. статистика игроков»
     def take_team_rows(team_ru: str) -> list[dict]:
         rows: list[dict] = []
         # заголовок секции
@@ -181,16 +179,15 @@ def parse_match(url: str) -> dict | None:
             text = tag.get_text(" ", strip=True)
             if text.lower().startswith(team_ru.lower() + ".") and "статистика игроков" in text.lower():
                 hdr = tag; break
-        if not hdr:
-            return rows
+        if not hdr: return rows
         table = hdr.find_next("table")
         if not table: return rows
 
         for tr in table.find_all("tr"):
             tds = [td.get_text(" ", strip=True) for td in tr.find_all(["td","th"])]
-            if not tds or "Игрок" in tds[0]: 
+            if not tds or "Игрок" in tds[0]:
                 continue
-            # найти ячейку с именем (в первых 2-3 позициях)
+            # найти ячейку с именем (в первых 2–3 позициях)
             name_idx = None
             for i, cell in enumerate(tds[:3]):
                 if re.search(r"[^\d/:% ]", cell):
@@ -199,7 +196,7 @@ def parse_match(url: str) -> dict | None:
                 continue
             name = tds[name_idx]
             nums = tds[name_idx+1:]
-            if len(nums) < 14:  # не ожидаемый формат таблицы
+            if len(nums) < 14:
                 continue
 
             def as_int(x: str) -> int:
@@ -247,7 +244,7 @@ def hot_mark(p: dict) -> str:
         return " 🔥"
     return ""
 
-def format_player_line(p: dict, bold=False) -> str:
+def format_player_line_regular(p: dict, bold=False) -> str:
     name = initials_ru(p["name"])
     if bold: name = f"<b>{name}</b>"
     parts = [f"{p['pts']} {ru_plural(p['pts'], ('очко','очка','очков'))}"]
@@ -255,7 +252,45 @@ def format_player_line(p: dict, bold=False) -> str:
     if p["ast"] >= 5: parts.append(f"{p['ast']} {ru_plural(p['ast'], ('передача','передачи','передач'))}")
     if p["stl"] >= 4: parts.append(f"{p['stl']} {ru_plural(p['stl'], ('перехват','перехвата','перехватов'))}")
     if p["blk"] >= 4: parts.append(f"{p['blk']} {ru_plural(p['blk'], ('блок-шот','блок-шота','блок-шотов'))}")
-    return f"{name}: {', '.join(parts)}{hot_mark(p)}"
+    return f"{name}: " + ", ".join(parts) + hot_mark(p)
+
+def format_player_line_special_detail(p: dict, bold=True) -> str:
+    """
+    Для Дёмина/Голдина: минимум 3 самых больших показателя (>0) из {PTS, REB, AST, STL, BLK}.
+    """
+    name = initials_ru(p["name"])
+    if bold: name = f"<b>{name}</b>"
+
+    # Собираем пары (label, value) и сортируем по value убыв.
+    stats = [
+        ("очки", p["pts"], p["pts"]),
+        ("подбор", p["reb"], p["reb"]),
+        ("передача", p["ast"], p["ast"]),
+        ("перехват", p["stl"], p["stl"]),
+        ("блок-шот", p["blk"], p["blk"]),
+    ]
+    # оставляем только > 0
+    stats = [(lab, val, raw) for (lab, val, raw) in stats if raw and raw > 0]
+    stats.sort(key=lambda x: x[2], reverse=True)
+
+    # гарантируем минимум 3 пункта, если есть столько >0
+    chosen = stats[:3] if len(stats) >= 3 else stats
+
+    parts = []
+    # очки печатаем с правильным склонением, остальное тоже склоняем
+    for lab, val, raw in chosen:
+        if lab == "очки":
+            parts.append(f"{val} {ru_plural(val, ('очко','очка','очков'))}")
+        elif lab == "подбор":
+            parts.append(f"{val} {ru_plural(val, ('подбор','подбора','подборов'))}")
+        elif lab == "передача":
+            parts.append(f"{val} {ru_plural(val, ('передача','передачи','передач'))}")
+        elif lab == "перехват":
+            parts.append(f"{val} {ru_plural(val, ('перехват','перехвата','перехватов'))}")
+        elif lab == "блок-шот":
+            parts.append(f"{val} {ru_plural(val, ('блок-шот','блок-шота','блок-шотов'))}")
+
+    return f"{name}: " + ", ".join(parts) + hot_mark(p)
 
 def _score_key(p: dict):
     return (p["pts"], p["reb"] + p["ast"], p["stl"] + p["blk"])
@@ -268,32 +303,77 @@ def second_player_condition(p: dict) -> bool:
     # ≥20 очков ИЛИ дабл-дабл (любые 2 из 5 категорий ≥10) ИЛИ перехваты ≥6 ИЛИ блоки ≥6
     return (p["pts"] >= 20) or _is_double_double(p) or (p["stl"] >= 6) or (p["blk"] >= 6)
 
-def pick_players_for_team(team_ru: str, abbr: str, rows: list[dict]) -> list[tuple[dict,bool]]:
+def pick_players_for_team(team_ru: str, abbr: str, rows: list[dict]) -> list[tuple[dict,bool,bool]]:
+    """
+    Возвращает до двух игроков в виде (player, bold, special_detail).
+      • всегда топ-скорер
+      • спец-игрок (Дёмин/Голдин) — включаем обязательно (если играл), жирным и с подробной строкой
+      • второй по условию (если ещё нет двух)
+    """
     if not rows: return []
     rows = sorted(rows, key=_score_key, reverse=True)
-    out: list[tuple[dict,bool]] = []
+    out: list[tuple[dict,bool,bool]] = []
 
-    # 1) всегда топ-скорер
+    # 1) всегда топ
     top = rows[0]
-    out.append((top, False))
+    is_special_top = False
 
-    # 2) спец-игрок (Дёмин/Голдин) — если не топ
-    special_name = "дёмин" if abbr == "BKN" else ("голдин" if abbr == "MIA" else None)
+    # 2) спец-игрок
+    special_key = "дёмин" if abbr == "BKN" else ("голдин" if abbr == "MIA" else None)
     special = None
-    if special_name:
+    if special_key:
         for p in rows:
-            if special_name in (p["name"] or "").lower():
-                special = p; break
-        if special and special["name"] != top["name"]:
-            out.append((special, True))
+            if special_key in (p["name"] or "").lower():
+                special = p
+                break
 
-    # 3) второй по условию (если ещё нет 2)
+    if special:
+        if special["name"] == top["name"]:
+            # топ — это спец-игрок
+            out.append((special, True, True))
+            is_special_top = True
+        else:
+            # сначала топ (обычно), затем спец-игрок
+            out.append((top, False, False))
+            out.append((special, True, True))
+    else:
+        out.append((top, False, False))
+
+    # 3) если ещё нет двух — добираем по условию второго
     if len(out) < 2:
-        cand = next((p for p in rows[1:] if second_player_condition(p) and p["name"] != top["name"]), None)
-        if cand:
-            out.append((cand, False))
+        for p in rows[1:]:
+            if p["name"] == top["name"]:
+                continue
+            if second_player_condition(p):
+                out.append((p, False, False))
+                break
 
-    return out[:2]
+    # Ограничим двумя
+    if len(out) > 2:
+        # если в наборе есть спец и >2, оставляем спец и лучшего по очкам
+        have_special = any(s for (_, _, s) in out)
+        if have_special:
+            # найдём спец и лучшего по очкам помимо него
+            spec = next(item for item in out if item[2])
+            others = [item for item in out if not item[2]]
+            # выбрать среди others самого полезного
+            if others:
+                others.sort(key=lambda it: _score_key(it[0]), reverse=True)
+                out = [others[0], spec] if spec[0]["name"] != others[0][0]["name"] else [spec, others[1] if len(others)>1 else spec]
+                # убрать возможный дубль
+                uniq = []
+                seen = set()
+                for item in out:
+                    if item[0]["name"] in seen: continue
+                    seen.add(item[0]["name"]); uniq.append(item)
+                out = uniq[:2]
+            else:
+                out = [spec]
+        else:
+            # обычный срез
+            out = out[:2]
+
+    return out
 
 # ---------- BUILD MESSAGE ----------
 SEP = "–––––––––––––––––––––––"
@@ -311,7 +391,6 @@ def build_post() -> str:
                 continue
             if not info["finished"]:
                 continue
-            # здесь гарантированно только НБА (parse_match уже фильтрует)
             day_games.append(info)
         if day_games:
             chosen_day = d
@@ -337,11 +416,18 @@ def build_post() -> str:
         lines = []
         rowsA = g["players"].get(A["name"], [])
         rowsB = g["players"].get(B["name"], [])
-        for p, bold in pick_players_for_team(A["name"], A["abbr"], rowsA):
-            lines.append(format_player_line(p, bold))
+
+        for p, bold, special_detail in pick_players_for_team(A["name"], A["abbr"], rowsA):
+            if special_detail:
+                lines.append(format_player_line_special_detail(p, bold=True))
+            else:
+                lines.append(format_player_line_regular(p, bold))
         if lines: lines.append("")
-        for p, bold in pick_players_for_team(B["name"], B["abbr"], rowsB):
-            lines.append(format_player_line(p, bold))
+        for p, bold, special_detail in pick_players_for_team(B["name"], B["abbr"], rowsB):
+            if special_detail:
+                lines.append(format_player_line_special_detail(p, bold=True))
+            else:
+                lines.append(format_player_line_regular(p, bold))
 
         blocks.append(head + ("\n".join(lines) if lines else ""))
         if i < len(games): blocks.append("\n" + SEP + "\n")
