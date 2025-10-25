@@ -2,128 +2,142 @@
 # -*- coding: utf-8 -*-
 
 """
-NBA Daily Results → Telegram (русский формат sports.ru для фамилий)
+NBA Daily Results → Telegram (RU)
 
-Данные:
-• Список матчей дня, счёты, рекорды (W-L) — liveData scoreboard от NBA:
-  https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json
-• Игроки и бокскор — liveData boxscore по gameId:
-  https://cdn.nba.com/static/json/liveData/boxscore/boxscore_<gameId>.json
-(эти эндпойнты общедоступны и стабильны). 
+• Источник матчей/статистики: ESPN (public)
+  - Scoreboard: https://site.web.api.espn.com/apis/v2/sports/basketball/nba/scoreboard?dates=YYYYMMDD
+  - Boxscore : https://site.web.api.espn.com/apis/v2/sports/basketball/nba/boxscore?event={eventId}
 
-Имена игроков:
-• Строго как на sports.ru/ basketball (фамилия на кириллице).
-• Файлы-кэши: ru_map_nba.json (id→фамилия), ru_pending_nba.json (очередь).
-• Если профиль sports.ru не найден мгновенно — временно берём словарь исключений
-  + транслит, а игрок попадает в очередь; отдельный скрипт добьёт кэш.
+• Имена игроков (фамилия по-русски):
+  1) профиль на sports.ru/basketball/person|player/{slug}/ -> заголовок -> последнее слово;
+  2) поиск на sports.ru;
+  3) словарь исключений;
+  4) фоллбэк: латиница.
+  Кэш: ru_map_nba.json (id ESPN -> "Фамилия"), очередь: ru_pending_nba.json
 
-Формат поста:
-НБА • 25 октября • 12 матчей
-Результаты надёжно спрятаны 👇
-–––––––––––––––––––––––
-🏀 Дом: 116 (W-L)
-🏀 Гости: 122 (W-L)
-
-Фамилия: X очков, Y подборов, Z передач
-Фамилия: ...
-(потом две строки для другой команды)
-–––––––––––––––––––––––
-
-Выбор «двух лучших» — сортировка по очкам (tiebreak: REB+AST, затем +/-).
-Маркер 🔥 если 35+ очков, либо трипл-дабл, либо 30+ и дабл-дабл.
+• Формат:
+  - Заголовок: НБА • {дата} • {N матчей}
+  - По матчу: 2 строки со счётом, у победителя жирным только число, рядом эмодзи-логотип;
+  - Далее 1–3 игрока у каждой команды (топ по очкам):
+      очки — всегда; подборы ≥5; передачи ≥5; перехваты ≥4; блок-шоты ≥4.
 """
 
-import os
-import sys
-import re
-import json
-import time
-import unicodedata
-from datetime import datetime
-from urllib.parse import quote_plus
+import os, sys, re, json, time, unicodedata
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
+from urllib.parse import quote_plus
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 
-# --------------------------- Telegram ---------------------------
-
+# ---------- ENV ----------
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# --------------------------- NBA API ---------------------------
+# ---------- ESPN ----------
+ESPN_BASE = "https://site.web.api.espn.com/apis/v2/sports/basketball/nba"
 
-NBA_SCOREBOARD = "https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json"
-NBA_BOXSCORE   = "https://cdn.nba.com/static/json/liveData/boxscore/boxscore_{gid}.json"
+# ---------- SPORTS.RU ----------
+SPORTS_RU = "https://www.sports.ru"
+SRU_PERSON = SPORTS_RU + "/basketball/person/"
+SRU_PLAYER = SPORTS_RU + "/basketball/player/"
+SRU_SEARCH = SPORTS_RU + "/search/?q="
 
-# --------------------------- sports.ru -------------------------
+# ---------- CACHE FILES ----------
+RU_MAP_PATH     = "ru_map_nba.json"      # { athleteId(str): "Фамилия" }
+RU_PENDING_PATH = "ru_pending_nba.json"  # [{id, first, last}]
 
-SPORTS_RU_HOST   = "https://www.sports.ru"
-SRU_PERSON_ROOT  = SPORTS_RU_HOST + "/basketball/person/"
-SRU_PLAYER_ROOT  = SPORTS_RU_HOST + "/basketball/player/"
-SRU_SEARCH       = SPORTS_RU_HOST + "/search/?q="
-
-RU_MAP_PATH      = "ru_map_nba.json"
-RU_PENDING_PATH  = "ru_pending_nba.json"
-
-# --------------------------- Русификация -----------------------
-
+# ---------- RUSSIAN DATE ----------
 RU_MONTHS = {
-    1:"января",2:"февраля",3:"марта",4:"апреля",5:"мая",6:"июня",
-    7:"июля",8:"августа",9:"сентября",10:"октября",11:"ноября",12:"декабря"
+    1: "января", 2: "февраля", 3: "марта", 4: "апреля",
+    5: "мая", 6: "июня", 7: "июля", 8: "августа",
+    9: "сентября", 10: "октября", 11: "ноября", 12: "декабря",
 }
 
-TEAMS_RU = {
-    "ATL":"Атланта","BOS":"Бостон","BKN":"Бруклин","CHA":"Шарлотт","CHI":"Чикаго","CLE":"Кливленд",
-    "DAL":"Даллас","DEN":"Денвер","DET":"Детройт","GSW":"Голден Стэйт","HOU":"Хьюстон","IND":"Индиана",
-    "LAC":"Клипперс","LAL":"Лейкерс","MEM":"Мемфис","MIA":"Майами","MIL":"Милуоки","MIN":"Миннесота",
-    "NOP":"Новый Орлеан","NYK":"Нью-Йорк","OKC":"Оклахома-Сити","ORL":"Орландо","PHI":"Филадельфия",
-    "PHX":"Финикс","POR":"Портленд","SAC":"Сакраменто","SAS":"Сан-Антонио","TOR":"Торонто","UTA":"Юта",
-    "WAS":"Вашингтон"
-}
+def ru_date(d: date) -> str:
+    return f"{d.day} {RU_MONTHS[d.month]}"
 
-# Наиболее частые фамилии (список будет пополняться апдейтером)
-EXCEPT_LAST = {
-    "Doncic":"Дончич","Jokic":"Йокич","Embiid":"Эмбиид","Curry":"Карри","James":"Джеймс","Davis":"Дэвис",
-    "Durant":"Дюрэнт","Booker":"Букер","Irving":"Ирвинг","Tatum":"Тейтум","Brown":"Браун","Harden":"Харден",
-    "George":"Джордж","Leonard":"Леонард","Antetokounmpo":"Адетокумбо","Young":"Янг","Adebayo":"Адебайо",
-    "Williamson":"Уильямсон","Mitchell":"Митчелл","Brunson":"Брансон","Randle":"Рэндл","Sabonis":"Сабонис",
-    "Markkanen":"Маркканен","Haliburton":"Халибертон","Wembanyama":"Вембаньяма","Edwards":"Эдвардс",
-    "Siakam":"Сиакам","Anunoby":"Ануноби","Porzingis":"Порзингис","Gilgeous-Alexander":"Гилджес-Александер",
-    "Fox":"Фокс","Kawhi":"Леонард","Maxey":"Макси","Holiday":"Холидэй","Lopez":"Лопес","Mobley":"Мобли",
-    "Allen":"Аллен","Hachimura":"Хачимура","Vucevic":"Вучевич","Adebajo":"Адебайо","Ayton":"Эйтон",
-}
+def ru_plural(n: int, forms: tuple[str, str, str]) -> str:
+    # очко/очка/очков
+    n = abs(int(n)) % 100
+    n1 = n % 10
+    if 11 <= n <= 19: return forms[2]
+    if 2 <= n1 <= 4:  return forms[1]
+    if n1 == 1:      return forms[0]
+    return forms[2]
 
-# --------------------------- Утилиты ---------------------------
-
-def log(*a): print(*a, file=sys.stderr)
-
+# ---------- HTTP ----------
 def make_session():
     s = requests.Session()
     r = Retry(total=6, connect=6, read=6, backoff_factor=0.6,
-              status_forcelist=[429,500,502,503,504], allowed_methods=["GET","POST"])
+              status_forcelist=[429,500,502,503,504],
+              allowed_methods=["GET","POST"])
     s.mount("https://", HTTPAdapter(max_retries=r))
     s.headers.update({
-        "User-Agent":"NBA-DailyResultsBot/1.0 (+cdn.nba.com liveData; sports.ru resolver)",
-        "Accept":"application/json, text/html;q=0.8",
-        "Accept-Language":"ru-RU,ru;q=0.9,en;q=0.6"
+        "User-Agent": "NBA-DailyResultsBot/1.0 (+espn; sports.ru resolver)",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
     })
     return s
 
 S = make_session()
 
-def ru_plural(n: int, forms: tuple[str,str,str]) -> str:
-    n = abs(int(n)) % 100
-    n1 = n % 10
-    if 11 <= n <= 19: return forms[2]
-    if n1 == 1: return forms[0]
-    if 2 <= n1 <= 4: return forms[1]
-    return forms[2]
+def _get_json(url: str) -> dict:
+    r = S.get(url, timeout=25)
+    if r.status_code != 200:
+        return {}
+    try:
+        return r.json()
+    except Exception:
+        return {}
 
-def ru_date(d: datetime) -> str:
-    return f"{d.day} {RU_MONTHS[d.month]}"
+def log(*a): print(*a, file=sys.stderr)
+
+# ---------- PICK DATE ----------
+def pick_report_date() -> date:
+    # По умолчанию ориентируемся на Восточное время США, как по НБА
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    return (now_et.date() - timedelta(days=1)) if now_et.hour < 8 else now_et.date()
+
+# ---------- TEAM NAMES / EMOJIS ----------
+TEAM_RU = {
+    "ATL": ("Атланта", "🦅"),
+    "BOS": ("Бостон", "☘️"),
+    "BKN": ("Бруклин", "🕸️"),
+    "CHA": ("Шарлотт", "🐝"),
+    "CHI": ("Чикаго", "🐂"),
+    "CLE": ("Кливленд", "🛡️"),
+    "DAL": ("Даллас", "🐎"),
+    "DEN": ("Денвер", "⛏️"),
+    "DET": ("Детройт", "🔧"),
+    "GSW": ("Голден Стэйт", "🗡️"),
+    "HOU": ("Хьюстон", "🚀"),
+    "IND": ("Индиана", "💫"),
+    "LAC": ("Клипперс", "✂️"),
+    "LAL": ("Лейкерс", "⭐"),
+    "MEM": ("Мемфис", "🐻"),
+    "MIA": ("Майами", "🔥"),
+    "MIL": ("Милуоки", "🦌"),
+    "MIN": ("Миннесота", "🐺"),
+    "NOP": ("Новый Орлеан", "🪶"),
+    "NYK": ("Нью-Йорк", "🗽"),
+    "OKC": ("Оклахома-Сити", "⚡"),
+    "ORL": ("Орландо", "✨"),
+    "PHI": ("Филадельфия", "🔔"),
+    "PHX": ("Финикс", "☀️"),
+    "POR": ("Портленд", "🧭"),
+    "SAC": ("Сакраменто", "👑"),
+    "SAS": ("Сан-Антонио", "🪙"),
+    "TOR": ("Торонто", "🦖"),
+    "UTA": ("Юта", "🎷"),
+    "WAS": ("Вашингтон", "🧙"),
+}
+
+# ---------- RU NAME RESOLVER (SURNAME ONLY) ----------
+RU_MAP = {}         # id -> "Фамилия"
+RU_PENDING = []     # list of {id, first, last}
+_session_pending_ids = set()
 
 def _load_json(path: str, default):
     if not os.path.exists(path):
@@ -140,267 +154,358 @@ def _save_json(path: str, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
-RU_MAP = _load_json(RU_MAP_PATH, {})          # personId -> "Фамилия"
-RU_PENDING = _load_json(RU_PENDING_PATH, [])  # [{id, first, last}]
-_pending_ids_session: set[str] = set()
-
-def pick_report_day_et() -> datetime:
-    # Запуск по Лондону утром → в ET ещё «сегодняшний» день с играми
-    now_et = datetime.now(ZoneInfo("America/New_York"))
-    # Ждём пока всё точно финалится — после 06:00 ET обычно уже ок
-    if now_et.hour < 6:
-        return now_et  # всё равно берём «today» с liveData
-    return now_et
-
-# --------------------------- Спортс.ру имена ------------------
-
 def _slugify(first: str, last: str) -> str:
     base = f"{first} {last}".strip()
     base = unicodedata.normalize("NFKD", base)
     base = "".join(ch for ch in base if not unicodedata.combining(ch))
-    base = base.lower().strip()
-    base = re.sub(r"[^a-z0-9]+","-", base).strip("-")
+    base = base.lower()
+    base = re.sub(r"[^a-z0-9]+", "-", base).strip("-")
     return base
 
 def _sportsru_try_profile(first: str, last: str) -> str | None:
     slug = _slugify(first, last)
-    for root in (SRU_PERSON_ROOT, SRU_PLAYER_ROOT):
+    for root in (SRU_PERSON, SRU_PLAYER):
         url = root + slug + "/"
-        r = S.get(url, timeout=20)
+        r = S.get(url, timeout=15)
         if r.status_code == 200 and ("/basketball/person/" in r.url or "/basketball/player/" in r.url):
             return url
     return None
 
-def _sportsru_extract_surname(url: str) -> str | None:
-    r = S.get(url, timeout=20)
-    if r.status_code != 200: return None
-    soup = BeautifulSoup(r.text, "html.parser")
-    h = soup.find(["h1","h2"])
-    if not h: return None
-    full = " ".join(h.get_text(" ", strip=True).split())
-    parts = [p for p in re.split(r"\s+", full) if p]
-    if len(parts) >= 2:
-        # последний «токен» обычно фамилия; покрывает «Джексон-мл.»
-        return parts[-1]
+def _sportsru_from_profile(url: str) -> str | None:
+    try:
+        r = S.get(url, timeout=20)
+        if r.status_code != 200:
+            return None
+        soup = BeautifulSoup(r.text, "html.parser")
+        h = soup.find(["h1","h2"])
+        if not h: return None
+        full = " ".join(h.get_text(" ", strip=True).split())
+        parts = [p for p in re.split(r"\s+", full) if p]
+        if len(parts) >= 2:
+            # фамилия — последнее слово (обрабатывает «Александер-Уокер», т.к. дефис сохранится)
+            return parts[-1]
+    except Exception:
+        return None
     return None
 
-def _sportsru_search_surname(first: str, last: str) -> str | None:
-    q = quote_plus(f"{first} {last}".strip())
-    r = S.get(SRU_SEARCH + q, timeout=20)
-    if r.status_code != 200: return None
-    soup = BeautifulSoup(r.text, "html.parser")
-    link = soup.select_one('a[href*="/basketball/person/"]') or soup.select_one('a[href*="/basketball/player/"]')
-    if not link or not link.get("href"): return None
-    href = link["href"]
-    if href.startswith("/"): href = SPORTS_RU_HOST + href
-    return _sportsru_extract_surname(href)
+def _sportsru_search(first: str, last: str) -> str | None:
+    try:
+        q = quote_plus(f"{first} {last}".strip())
+        r = S.get(SRU_SEARCH + q, timeout=20)
+        if r.status_code != 200: return None
+        soup = BeautifulSoup(r.text, "html.parser")
+        a = soup.select_one('a[href*="/basketball/person/"]') or soup.select_one('a[href*="/basketball/player/"]')
+        if not a or not a.get("href"): return None
+        href = a["href"]
+        if href.startswith("/"): href = SPORTS_RU + href
+        return _sportsru_from_profile(href)
+    except Exception:
+        return None
+
+# Частичные исключения (фамилия -> русская фамилия)
+EXCEPT_LAST = {
+    # из вашего примера и частые
+    "Ingram":"Ингрэм","Barrett":"Барретт","Antetokounmpo":"Адетокумбо","Anthony":"Энтони",
+    "Wagner":"Вагнер","Bane":"Бэйн","Young":"Янг","Alexander-Walker":"Александер-Уокер",
+    "Brunson":"Брансон","Towns":"Таунс","Brown":"Браун","Hauser":"Хаузер","Thomas":"Томас",
+    "Porter":"Портер","Mitchell":"Митчелл","Allen":"Аллен","Durant":"Дюрэнт","Sengun":"Шенгюн",
+    "Cunningham":"Каннингем","Thompson":"Томпсон","Jackson Jr.":"Джексон-младший","Jackson":"Джексон",
+    "Adebayor":"Адебайо","Adebayo":"Адебайо","Jovic":"Йович","Williamson":"Уильямсон","Murphy":"Мерфи",
+    "Wembanyama":"Вембаньяма","Vassell":"Васселл","Davis":"Дэвис","Flagg":"Флэгг","George":"Джордж",
+    "Johnson":"Джонсон","Doncic":"Дончич","Dončić":"Дончич","Reaves":"Ривз","Edwards":"Эдвардс",
+    "Randle":"Рэндл","Avdija":"Авдия","Grant":"Грант","Curry":"Карри","Kuminga":"Куминга",
+    "LaVine":"Лавин","Monk":"Монк","Markkanen":"Маркканен","Harden":"Харден","Leonard":"Леонард",
+    "Brooks":"Брукс","Booker":"Букер","Allen Jr.":"Аллен","Jr.":"младший",
+    # часто встречающиеся звёзды
+    "Jokic":"Йокич","Embiid":"Эмбиид","Tatum":"Тэйтум","Lillard":"Лиллард","Morant":"Морант",
+    "Irving":"Ирвинг","James":"Джеймс","Westbrook":"Уэстбрук","Leonard":"Леонард","Paul":"Пол",
+    "Butler":"Батлер","Adebayo":"Адебайо","DeRozan":"Дерозан","Siakam":"Сиакам","VanVleet":"Ванвлит",
+    "Holiday":"Холидэй","Middleton":"Миддлтон","Lopez":"Лопес","Gobert":"Гобер","Townsend":"Таунсенд",
+    "Porzingis":"Порзингис","Gilgeous-Alexander":"Гилджес-Александер",
+}
 
 def _queue_pending(pid: str, first: str, last: str):
-    if not pid or pid in _pending_ids_session: return
-    if pid in RU_MAP: return
-    for it in RU_PENDING:
-        if str(it.get("id")) == pid: return
-    RU_PENDING.append({"id": pid, "first": first or "", "last": last or ""})
-    _pending_ids_session.add(pid)
-
-def ru_surname(pid: str, first: str, last: str) -> str:
-    pid = str(pid)
+    if not pid or pid in _session_pending_ids:
+        return
     if pid in RU_MAP:
-        return RU_MAP[pid]
+        return
+    for it in RU_PENDING:
+        if it.get("id") == pid:
+            return
+    RU_PENDING.append({"id": pid, "first": first, "last": last})
+    _session_pending_ids.add(pid)
 
-    # словарь громких фамилий как fallback
+def resolve_ru_surname(first: str, last: str, athlete_id: str) -> str:
+    # 0) кэш по id
+    if athlete_id and athlete_id in RU_MAP:
+        return RU_MAP[athlete_id]
+
+    # нормализуем last (с учётом Jr./III)
+    last_clean = last.strip()
+    # перенесём Jr./III к last, чтобы исключение сработало
+    if last_clean in {"Jr.","Jr", "III", "II"}:
+        last_clean = f"{first.strip()} {last_clean}"
+
+    # 1) sports.ru (slug)
+    url = _sportsru_try_profile(first, last)
+    if url:
+        ru = _sportsru_from_profile(url)
+        if ru:
+            return ru
+
+    # 2) sports.ru (поиск)
+    ru = _sportsru_search(first, last)
+    if ru:
+        return ru
+
+    # 3) исключения
+    if last_clean in EXCEPT_LAST:
+        return EXCEPT_LAST[last_clean]
     if last in EXCEPT_LAST:
-        RU_MAP[pid] = EXCEPT_LAST[last]
-        return RU_MAP[pid]
+        return EXCEPT_LAST[last]
 
-    # sports.ru slug → профиль
-    try:
-        url = _sportsru_try_profile(first, last)
-        if url:
-            sname = _sportsru_extract_surname(url)
-            if sname:
-                RU_MAP[pid] = sname
-                return sname
-    except Exception as e:
-        log("[sports.ru slug] fail", first, last, e)
+    # 4) латиница (в очередь на уточнение)
+    if athlete_id:
+        _queue_pending(athlete_id, first, last)
+    return last  # временно латиница
 
-    # поиск
-    try:
-        sname = _sportsru_search_surname(first, last)
-        if sname:
-            RU_MAP[pid] = sname
-            return sname
-    except Exception as e:
-        log("[sports.ru search] fail", first, last, e)
-
-    # очередь на доразрешение
-    _queue_pending(pid, first, last)
-    # временно — латиница как есть (последнее слово фамилии)
-    return last or first or pid
-
-# --------------------------- Парсинг liveData ------------------
-
-def fetch_scoreboard() -> list[dict]:
-    r = S.get(NBA_SCOREBOARD, timeout=25)
-    r.raise_for_status()
-    j = r.json() or {}
-    games = j.get("scoreboard", {}).get("games", []) or []
+# ---------- ESPN HELPERS ----------
+def fetch_scoreboard(day: date) -> list[dict]:
+    dates = day.strftime("%Y%m%d")
+    j = _get_json(f"{ESPN_BASE}/scoreboard?dates={dates}")
+    events = j.get("events") or []
     out = []
-    for g in games:
-        # gameStatus: 1 — предматч, 2 — идёт, 3 — финал
-        if int(g.get("gameStatus", 0)) != 3:
-            continue
-        gid = str(g.get("gameId"))
-        h = g.get("homeTeam", {}) or {}
-        a = g.get("awayTeam", {}) or {}
-        out.append({
-            "gameId": gid,
-            "homeAbbr": (h.get("teamTricode") or h.get("triCode") or "").upper(),
-            "awayAbbr": (a.get("teamTricode") or a.get("triCode") or "").upper(),
-            "homeScore": int(h.get("score", 0)),
-            "awayScore": int(a.get("score", 0)),
-            "homeW": int(h.get("wins", 0)), "homeL": int(h.get("losses", 0)),
-            "awayW": int(a.get("wins", 0)), "awayL": int(a.get("losses", 0)),
-        })
+    for ev in events:
+        try:
+            st = ev.get("status", {}).get("type", {}).get("completed", False)
+            if not st:
+                continue  # финалы
+            comp = (ev.get("competitions") or [])[0]
+            competitors = comp.get("competitors") or []
+            game = {"eventId": ev.get("id"), "competitors": []}
+            for c in competitors:
+                team = c.get("team") or {}
+                abbr = team.get("abbreviation")
+                score = int(float(c.get("score", 0)))
+                win = c.get("winner", False)
+                rec = ""
+                for recobj in c.get("records") or []:
+                    if recobj.get("type") == "total" and recobj.get("summary"):
+                        rec = recobj["summary"]  # "2-0"
+                game["competitors"].append({
+                    "abbr": abbr,
+                    "score": score,
+                    "winner": bool(win),
+                    "record": rec or "",
+                    "teamId": str(team.get("id") or ""),
+                })
+            if len(game["competitors"]) == 2:
+                out.append(game)
+        except Exception as e:
+            log("[scoreboard parse] skip:", e)
     return out
 
-def fetch_boxscore(game_id: str) -> dict:
-    r = S.get(NBA_BOXSCORE.format(gid=game_id), timeout=25)
-    r.raise_for_status()
-    j = r.json() or {}
-    game = j.get("game", {}) or {}
-    return {
-        "home": (game.get("homeTeam") or {}),
-        "away": (game.get("awayTeam") or {}),
-    }
+def fetch_boxscore(event_id: str) -> dict:
+    j = _get_json(f"{ESPN_BASE}/boxscore?event={event_id}")
+    return j or {}
 
-def _extract_name_fields(p: dict) -> tuple[str,str]:
-    # NBA liveData чаще даёт firstName/familyName; иначе разобьём name
-    fn = (p.get("firstName") or "").strip()
-    ln = (p.get("familyName") or "").strip()
-    if not (fn and ln):
-        nm = (p.get("name") or "").strip()
-        parts = [x for x in re.split(r"\s+", nm) if x]
-        if len(parts) >= 2:
-            fn = fn or parts[0]
-            ln = ln or parts[-1]
-    return fn, ln
+def parse_players_from_box(box: dict) -> dict:
+    """
+    Возвращает словарь teamId -> список игроков:
+    [{"id","first","last","pts","reb","ast","stl","blk"}]
+    """
+    out = {}
+    for t in (box.get("players") or []):
+        team = t.get("team") or {}
+        tid = str(team.get("id") or "")
+        arr = []
+        for grp in (t.get("statistics") or []):
+            # grp["athletes"] содержит игроков с полями stats + athlete
+            for a in (grp.get("athletes") or []):
+                ath = a.get("athlete") or {}
+                pid = str(ath.get("id") or "")
+                name = ath.get("displayName") or ""
+                # разбор имени
+                parts = [p for p in re.split(r"\s+", name.strip()) if p]
+                first = parts[0] if parts else ""
+                last = " ".join(parts[1:]) if len(parts) > 1 else parts[0] if parts else ""
 
-def _pick_top_two(players: list[dict]) -> list[dict]:
-    act = []
-    for p in players or []:
-        st = (p.get("status") or "").upper()
-        stats = p.get("statistics") or {}
-        pts = int(stats.get("points") or 0)
-        reb = int(stats.get("reboundsTotal") or stats.get("rebounds") or 0)
-        ast = int(stats.get("assists") or 0)
-        pm  = int(stats.get("plusMinusPoints") or 0)
-        # отсекаем совсем DNP (у них обычно нет statistics)
-        if pts == reb == ast == 0 and not stats:
-            continue
-        score_key = (pts, reb+ast, pm)
-        act.append({"raw":p, "pts":pts, "reb":reb, "ast":ast, "pm":pm, "key":score_key})
-    act.sort(key=lambda x: x["key"], reverse=True)
-    return act[:2]
+                # базовые числа
+                # у ESPN иногда числа лежат в athlete["stats"] или a["stats"]
+                stats_map = {}
+                for k, v in (a.get("stats") or {}).items():
+                    stats_map[k.lower()] = v
+                for k, v in (ath.get("stats") or {}).items():
+                    stats_map.setdefault(k.lower(), v)
 
-def _flame(pts:int, reb:int, ast:int, stl:int, blk:int) -> str:
-    dbl = sum(v>=10 for v in (pts,reb,ast,stl,blk))
-    if pts >= 35 or dbl >= 3 or (pts>=30 and dbl>=2):
-        return " 🔥"
-    return ""
+                def iget(*keys, default=0):
+                    for k in keys:
+                        if k in stats_map:
+                            try:
+                                return int(stats_map[k])
+                            except Exception:
+                                try:
+                                    return int(float(stats_map[k]))
+                                except Exception:
+                                    pass
+                    return default
 
-def player_line_ru(p: dict, pid: str) -> str:
-    fn, ln = _extract_name_fields(p)
-    stats = p.get("statistics") or {}
-    pts = int(stats.get("points") or 0)
-    reb = int(stats.get("reboundsTotal") or stats.get("rebounds") or 0)
-    ast = int(stats.get("assists") or 0)
-    stl = int(stats.get("steals") or 0)
-    blk = int(stats.get("blocks") or 0)
+                pts = iget("points","pts")
+                reb = iget("rebounds","reb","totreb","reboundstotal")
+                ast = iget("assists","ast")
+                stl = iget("steals","stl")
+                blk = iget("blocks","blk")
 
-    fam = ru_surname(pid, fn, ln)
+                # пропускаем тех, кто не играл (у некоторых вообще нет очков/минут)
+                if pts is None and reb is None and ast is None:
+                    continue
 
-    pts_word = ru_plural(pts, ("очко","очка","очков"))
-    reb_word = ru_plural(reb, ("подбор","подбора","подборов"))
-    ast_word = ru_plural(ast, ("передача","передачи","передач"))
+                arr.append({
+                    "id": pid, "first": first, "last": last,
+                    "pts": int(pts or 0), "reb": int(reb or 0),
+                    "ast": int(ast or 0), "stl": int(stl or 0), "blk": int(blk or 0),
+                })
+        # Иногда статистика дублируется в нескольких группах — сведём по id (берём максимумы)
+        merged = {}
+        for p in arr:
+            if p["id"] not in merged:
+                merged[p["id"]] = p
+            else:
+                m = merged[p["id"]]
+                for k in ("pts","reb","ast","stl","blk"):
+                    m[k] = max(m[k], p[k])
+        out[tid] = list(merged.values())
+    return out
 
-    return f"{fam}: {pts} {pts_word}, {reb} {reb_word}, {ast} {ast_word}{_flame(pts,reb,ast,stl,blk)}"
+# ---------- PLAYER LINE BUILD ----------
+def fmt_stat_line_ru(p: dict, ru_surname: str) -> str:
+    pts, reb, ast, stl, blk = p["pts"], p["reb"], p["ast"], p["stl"], p["blk"]
+    parts = [f"{ru_surname}: {pts} {ru_plural(pts, ('очко','очка','очков'))}"]
+    if reb >= 5:
+        parts.append(f"{reb} {ru_plural(reb, ('подбор','подбора','подборов'))}")
+    if ast >= 5:
+        parts.append(f"{ast} {ru_plural(ast, ('передача','передачи','передач'))}")
+    if stl >= 4:
+        parts.append(f"{stl} {ru_plural(stl, ('перехват','перехвата','перехватов'))}")
+    if blk >= 4:
+        parts.append(f"{blk} {ru_plural(blk, ('блок-шот','блок-шота','блок-шотов'))}")
+    return ", ".join(parts)
 
-def build_game_block(gmeta: dict) -> str:
-    # Заголовок
-    home_ru = TEAMS_RU.get(gmeta["homeAbbr"], gmeta["homeAbbr"])
-    away_ru = TEAMS_RU.get(gmeta["awayAbbr"], gmeta["awayAbbr"])
-    head = (f"🏀 {home_ru}: {gmeta['homeScore']} ({gmeta['homeW']}-{gmeta['homeL']})\n"
-            f"🏀 {away_ru}: {gmeta['awayScore']} ({gmeta['awayW']}-{gmeta['awayL']})\n\n")
+# ---------- GAME BLOCK ----------
+def team_ru_and_emoji(abbr: str) -> tuple[str,str]:
+    abbr = (abbr or "").upper()
+    if abbr in TEAM_RU:
+        return TEAM_RU[abbr]
+    return (abbr, "🏀")
 
-    # Игроки
-    box = fetch_boxscore(gmeta["gameId"])
-    h_players = (box.get("home") or {}).get("players") or []
-    a_players = (box.get("away") or {}).get("players") or []
+def build_game_block(game: dict) -> str:
+    # строки счета
+    comp = game["competitors"]
+    if len(comp) != 2:
+        return ""
+    a, b = comp[0], comp[1]
+    # сопоставим эмодзи/название
+    name_a, emo_a = team_ru_and_emoji(a["abbr"])
+    name_b, emo_b = team_ru_and_emoji(b["abbr"])
 
-    top_h = _pick_top_two(h_players)
-    top_a = _pick_top_two(a_players)
+    def score_line(cname, cemo, score, record, is_winner):
+        s = f"<b>{score}</b>" if is_winner else f"{score}"
+        rec = f" ({record})" if record else ""
+        return f"{cemo} {cname}: {s}{rec}"
 
-    lines = []
-    for x in top_h:
-        pid = str((x["raw"].get("personId") or x["raw"].get("playerId") or ""))
-        lines.append(player_line_ru(x["raw"], pid))
-    lines.append("")  # пустая строка между командами
-    for x in top_a:
-        pid = str((x["raw"].get("personId") or x["raw"].get("playerId") or ""))
-        lines.append(player_line_ru(x["raw"], pid))
+    head = score_line(name_a, emo_a, a["score"], a["record"], a["winner"]) + "\n" + \
+           score_line(name_b, emo_b, b["score"], b["record"], b["winner"]) + "\n\n"
 
-    return head + "\n".join(lines)
+    # игроки
+    box = fetch_boxscore(game["eventId"])
+    players_by_team = parse_players_from_box(box)
 
-def build_post_text(games: list[dict]) -> str:
-    now_et = pick_report_day_et()
-    title = f"НБА • {ru_date(now_et)} • {len(games)} {ru_plural(len(games), ('матч','матча','матчей'))}\n"
+    body_lines = []
+
+    # для каждой команды: берём ТОП-3 по очкам (можете поменять на 2)
+    def team_players_lines(team_obj):
+        tid = team_obj["teamId"]
+        plist = players_by_team.get(tid, [])
+        plist.sort(key=lambda x: (x["pts"], x["reb"], x["ast"]), reverse=True)
+        top = plist[:3]
+        lines = []
+        for p in top:
+            ru_surname = resolve_ru_surname(p["first"], p["last"], p["id"])
+            line = fmt_stat_line_ru(p, ru_surname)
+            lines.append(line)
+        return lines
+
+    body_lines += team_players_lines(a)
+    if body_lines: body_lines.append("")  # разделитель между командами
+    body_lines += team_players_lines(b)
+
+    return head + "\n".join([l for l in body_lines if l.strip()])
+
+# ---------- POST ----------
+def build_post(day: date) -> str:
+    games = fetch_scoreboard(day)
+    title = f"НБА • {ru_date(day)} • {len(games)} {ru_plural(len(games), ('матч','матча','матчей'))}\n"
     title += "Результаты надёжно спрятаны 👇\n"
-    title += "–––––––––––––––––––––––\n"
-    parts = [title]
-    for i, g in enumerate(games, 1):
-        parts.append(build_game_block(g))
-        if i < len(games):
-            parts.append("–––––––––––––––––––––––")
-    return "\n".join(parts)
+    title += "–––––––––––––––––––––––\n\n"
 
+    blocks = []
+    for i, g in enumerate(games, 1):
+        try:
+            blk = build_game_block(g)
+            if blk.strip():
+                blocks.append(blk)
+            else:
+                blocks.append("— данные по матчу временно недоступны")
+        except Exception as e:
+            log("[game block error]", e)
+            blocks.append("— данные по матчу временно недоступны")
+        if i < len(games):
+            blocks.append("–––––––––––––––––––––––")
+
+    return (title + "\n".join(blocks)).strip()
+
+# ---------- TELEGRAM ----------
 def tg_send(text: str):
     if not (BOT_TOKEN and CHAT_ID):
         raise RuntimeError("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы")
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
     MAX = 3500
-    rest = text
-    while rest:
-        if len(rest) <= MAX:
-            chunk = rest
-            rest = ""
-        else:
-            cut = rest.rfind("\n––––", 0, MAX)
-            if cut == -1: cut = rest.rfind("\n", 0, MAX)
-            if cut == -1: cut = MAX
-            chunk, rest = rest[:cut], rest[cut:].lstrip()
+    t = text
+    parts = []
+    while t:
+        if len(t) <= MAX:
+            parts.append(t); break
+        cut = t.rfind("\n\n", 0, MAX)
+        if cut == -1: cut = MAX
+        parts.append(t[:cut]); t = t[cut:].lstrip()
+
+    for part in parts:
         resp = S.post(url, json={
             "chat_id": CHAT_ID,
-            "text": chunk,
+            "text": part,
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }, timeout=25)
         if resp.status_code != 200:
             raise RuntimeError(f"Telegram error {resp.status_code}: {resp.text}")
-        time.sleep(0.4)
+        time.sleep(0.3)
 
+# ---------- MAIN ----------
 if __name__ == "__main__":
     try:
-        games = fetch_scoreboard()
-        if not games:
-            # Если ни одного FIN, всё равно отправим шапку «0 матчей» – редкий случай
-            text = build_post_text([])
-        else:
-            text = build_post_text(games)
+        # загрузим кэши
+        global RU_MAP, RU_PENDING
+        RU_MAP = _load_json(RU_MAP_PATH, {})
+        RU_PENDING = _load_json(RU_PENDING_PATH, [])
+
+        day = pick_report_date()
+        text = build_post(day)
         tg_send(text)
-        # Обновим файлы кэша/очереди (создадим, если не было)
-        _save_json(RU_MAP_PATH, RU_MAP)
+
+        # сохраним очереди (если появились новые)
         _save_json(RU_PENDING_PATH, RU_PENDING)
+        _save_json(RU_MAP_PATH, RU_MAP)
         print("OK")
     except Exception as e:
         print("ERROR:", repr(e), file=sys.stderr)
