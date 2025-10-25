@@ -31,19 +31,3 @@ jobs:
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python nba_daily_results_bot.py
-
-      - name: Update RU surname cache (sports.ru)
-        run: |
-          python update_ru_cache_nba.py
-
-      - name: Commit cache changes (if any)
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          if [ -n "$(git status --porcelain -- ru_map_nba.json ru_pending_nba.json)" ]; then
-            git add ru_map_nba.json ru_pending_nba.json
-            git commit -m "chore(nba-cache): update RU surnames"
-            git push
-          else
-            echo "No cache changes."
-          fi
