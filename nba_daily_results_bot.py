@@ -1,18 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-NBA Daily Results → Telegram (RU)
-
-• Один пост на день. В строке матча: эмодзи-логотип/кастом-эмодзи + русское название + счёт + (ОТ/2ОТ/...).
-• Игроки: только «выдающиеся» (1–2 на команду). Критерии:
-    ≥30 PTS  | дабл-дабл (PTS/REB/AST) | ≥15 REB | ≥12 AST | ≥4 STL | ≥4 BLK.
-  В строке показываем очки всегда; REB/AST — если ≥5; STL/BLK — если ≥4; добавляем 🔥 для супер-игр.
-• BKN: всегда включаем Дёмина (если играл), MIA: Голдина — выделяем жирным.
-• Источники: ESPN API (scoreboard/boxscore). Если boxscore пуст — берём leaders из scoreboard.
-• Кастом-эмодзи: если есть team_emoji_ids.json { "LAL": "custom_emoji_id", ... }, бот подставит их через entities.
-"""
-
 import os, sys, re, json, time, unicodedata
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -23,28 +11,28 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 
-# --------- ENV ----------
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# --------- ESPN ----------
-ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba"
+# ESPN endpoints
+ESPN_SCORE_BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba"
+ESPN_BOX_WEB    = "https://site.web.api.espn.com/apis/v2/sports/basketball/nba/boxscore?event="
+ESPN_BOX_SITE   = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/boxscore?event="
 
-# --------- sports.ru ----------
+# sports.ru
 SPORTS_RU   = "https://www.sports.ru"
 SRU_PERSON  = SPORTS_RU + "/basketball/person/"
 SRU_PLAYER  = SPORTS_RU + "/basketball/player/"
 SRU_SEARCH  = SPORTS_RU + "/search/?q="
 
-# --------- CACHE ----------
-RU_MAP_PATH     = "ru_map_nba.json"      # { athleteId: "Фамилия" }
+# caches
+RU_MAP_PATH     = "ru_map_nba.json"      # { athleteId: {"first":"...", "last":"..."} | "Фамилия" }
 RU_PENDING_PATH = "ru_pending_nba.json"  # [{ id, first, last }]
 
-RU_MAP: dict[str, str] = {}
+RU_MAP: dict[str, object] = {}
 RU_PENDING: list[dict] = []
 _session_pending_ids: set[str] = set()
 
-# --------- TEAM NAMES + EMOJI ----------
 TEAM_RU = {
     "ATL":"Атланта","BOS":"Бостон","BKN":"Бруклин","NY":"Нью-Йорк","NYK":"Нью-Йорк","PHI":"Филадельфия",
     "TOR":"Торонто","CHI":"Чикаго","CLE":"Кливленд","DET":"Детройт","IND":"Индиана","MIL":"Милуоки",
@@ -53,7 +41,7 @@ TEAM_RU = {
     "MIA":"Майами","ORL":"Орландо","DAL":"Даллас","HOU":"Хьюстон","MEM":"Мемфис","NO":"Новый Орлеан",
     "NOP":"Новый Орлеан","SA":"Сан-Антонио","SAS":"Сан-Антонио","WSH":"Вашингтон","WAS":"Вашингтон",
 }
-TEAM_EMOJI = {  # компактные эмодзи-логотипы по умолчанию
+TEAM_EMOJI = {
     "ATL":"🦅","BOS":"☘️","BKN":"🕸️","NY":"🗽","NYK":"🗽","PHI":"🔔",
     "TOR":"🦖","CHI":"🐂","CLE":"🛡️","DET":"🔧","IND":"💫","MIL":"🦌",
     "DEN":"⛏️","MIN":"🐺","OKC":"⚡","POR":"🧭","UTA":"🎷","UTAH":"🎷",
@@ -61,22 +49,19 @@ TEAM_EMOJI = {  # компактные эмодзи-логотипы по умо
     "MIA":"🔥","ORL":"✨","DAL":"🐎","HOU":"🚀","MEM":"🐻","NO":"🪶",
     "NOP":"🪶","SA":"🪙","SAS":"🪙","WSH":"🧙","WAS":"🧙",
 }
-TEAM_CUSTOM_IDS_PATH = "team_emoji_ids.json"  # опционально
+TEAM_CUSTOM_IDS_PATH = "team_emoji_ids.json"
 TEAM_CUSTOM_IDS = {}
 
-# --------- RUS DATES ----------
 RU_MONTHS = {1:"января",2:"февраля",3:"марта",4:"апреля",5:"мая",6:"июня",7:"июля",8:"августа",9:"сентября",10:"октября",11:"ноября",12:"декабря"}
 def ru_date(d: date) -> str: return f"{d.day} {RU_MONTHS[d.month]}"
-def ru_plural(n: int, forms: tuple[str,str,str]) -> str:
+def ru_plural(n: int, f: tuple[str,str,str]) -> str:
     n = abs(int(n)) % 100; n1 = n % 10
-    if 11 <= n <= 19: return forms[2]
-    if 2 <= n1 <= 4:  return forms[1]
-    if n1 == 1:      return forms[0]
-    return forms[2]
-
+    if 11 <= n <= 19: return f[2]
+    if 2 <= n1 <= 4:  return f[1]
+    if n1 == 1:      return f[0]
+    return f[2]
 def log(*a): print(*a, file=sys.stderr)
 
-# --------- HTTP ----------
 def make_session():
     s = requests.Session()
     r = Retry(total=6, connect=6, read=6, backoff_factor=0.6,
@@ -84,13 +69,12 @@ def make_session():
               allowed_methods=["GET","POST"])
     s.mount("https://", HTTPAdapter(max_retries=r))
     s.headers.update({
-        "User-Agent": "NBA-DailyResultsBot/2.4 (+espn; sports.ru resolver)",
+        "User-Agent": "NBA-DailyResultsBot/2.5 (+espn; sports.ru resolver)",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
     })
     return s
 S = make_session()
 
-# --------- IO helpers ----------
 def _load_json(path: str, default):
     if not os.path.exists(path): return default
     try:
@@ -104,7 +88,7 @@ def _save_json(path: str, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
-# --------- sports.ru resolver ----------
+# ---------- sports.ru: русское имя+фамилия ----------
 def _slugify(first: str, last: str) -> str:
     base = f"{first} {last}".strip()
     base = unicodedata.normalize("NFKD", base)
@@ -112,6 +96,7 @@ def _slugify(first: str, last: str) -> str:
     base = base.lower()
     base = re.sub(r"[^a-z0-9]+", "-", base).strip("-")
     return base
+
 def _sportsru_try_profile(first: str, last: str) -> str | None:
     slug = _slugify(first, last)
     for root in (SRU_PERSON, SRU_PLAYER):
@@ -120,21 +105,34 @@ def _sportsru_try_profile(first: str, last: str) -> str | None:
         if r.status_code == 200 and ("/basketball/person/" in r.url or "/basketball/player/" in r.url):
             return url
     return None
-def _sportsru_from_profile(url: str) -> str | None:
+
+def _rus_first_last_from_header(text: str) -> tuple[str,str] | None:
+    # ожидаем "Имя Фамилия" (иногда 3 слова). Берём первое как имя, последнее как фамилию.
+    full = " ".join(text.split())
+    parts = [p for p in re.split(r"\s+", full) if p]
+    if len(parts) >= 2:
+        ru_first = parts[0]
+        ru_last  = parts[-1]
+        # суффикс младший
+        if ru_last.lower() in {"мл.", "младший"} and len(parts) >= 3:
+            ru_last = parts[-2] + " мл."
+        return ru_first, ru_last
+    return None
+
+def _sportsru_from_profile(url: str) -> tuple[str,str] | None:
     try:
         r = S.get(url, timeout=20)
         if r.status_code != 200: return None
         soup = BeautifulSoup(r.text, "html.parser")
         h = soup.find(["h1","h2"])
         if not h: return None
-        full = " ".join(h.get_text(" ", strip=True).split())
-        parts = [p for p in re.split(r"\s+", full) if p]
-        if len(parts) >= 2:
-            return parts[-1]
+        parsed = _rus_first_last_from_header(h.get_text(" ", strip=True))
+        if parsed: return parsed
     except Exception:
         return None
     return None
-def _sportsru_search(first: str, last: str) -> str | None:
+
+def _sportsru_search(first: str, last: str) -> tuple[str,str] | None:
     try:
         q = quote_plus(f"{first} {last}".strip())
         r = S.get(SRU_SEARCH + q, timeout=20)
@@ -162,36 +160,57 @@ EXCEPT_LAST = {
     "Brooks":"Брукс","Booker":"Букер","Porzingis":"Порзингис","Gilgeous-Alexander":"Гилджес-Александер",
     "Demin":"Дёмин","Goldin":"Голдин",
 }
+
 def _queue_pending(pid: str, first: str, last: str):
     if not pid or pid in _session_pending_ids or pid in RU_MAP: return
     for it in RU_PENDING:
         if it.get("id") == pid: return
     RU_PENDING.append({"id": pid, "first": first, "last": last})
     _session_pending_ids.add(pid)
-def resolve_ru_surname(first: str, last: str, athlete_id: str) -> str:
-    if athlete_id and athlete_id in RU_MAP:
-        return RU_MAP[athlete_id]
-    last_clean = (last or "").strip()
-    if last_clean in {"Jr.","Jr","III","II"}:
-        last_clean = f"{(first or '').strip()} {last_clean}"
-    url = _sportsru_try_profile(first or "", last or "")
-    if url:
-        ru = _sportsru_from_profile(url)
-        if ru:
-            if athlete_id: RU_MAP[athlete_id] = ru
-            return ru
-    ru = _sportsru_search(first or "", last or "")
-    if ru:
-        if athlete_id: RU_MAP[athlete_id] = ru
-        return ru
-    if last_clean in EXCEPT_LAST: ru = EXCEPT_LAST[last_clean]
-    elif (last or "") in EXCEPT_LAST: ru = EXCEPT_LAST[last]
-    else: ru = last or first or ""
-    if athlete_id and not RU_MAP.get(athlete_id):
-        _queue_pending(athlete_id, first or "", last or "")
-    return ru
 
-# --------- JSON fetch ----------
+def _latin_initial_to_cyr(first_en: str) -> str:
+    if not first_en: return "?"
+    ch = first_en.strip()[0].upper()
+    table = {
+        "A":"А","B":"Б","C":"К","D":"Д","E":"Е","F":"Ф","G":"Г","H":"Х","I":"И",
+        "J":"Д","K":"К","L":"Л","M":"М","N":"Н","O":"О","P":"П","Q":"К","R":"Р",
+        "S":"С","T":"Т","U":"У","V":"В","W":"В","X":"К","Y":"Й","Z":"З"
+    }
+    return table.get(ch, ch)
+
+def resolve_ru_name(first_en: str, last_en: str, athlete_id: str) -> tuple[str,str]:
+    """
+    Возвращает (ru_first, ru_last). Кэш RU_MAP допускает старый формат (только фамилия-строка).
+    """
+    if athlete_id and athlete_id in RU_MAP:
+        val = RU_MAP[athlete_id]
+        if isinstance(val, dict):
+            return (val.get("first",""), val.get("last",""))
+        else:
+            return ("", str(val))
+
+    # 1) sports.ru прямой профиль
+    url = _sportsru_try_profile(first_en or "", last_en or "")
+    if url:
+        got = _sportsru_from_profile(url)
+        if got:
+            ru_first, ru_last = got
+            if athlete_id: RU_MAP[athlete_id] = {"first": ru_first, "last": ru_last}
+            return ru_first, ru_last
+
+    # 2) sports.ru поиск
+    got = _sportsru_search(first_en or "", last_en or "")
+    if got:
+        ru_first, ru_last = got
+        if athlete_id: RU_MAP[athlete_id] = {"first": ru_first, "last": ru_last}
+        return ru_first, ru_last
+
+    # 3) исключения/фоллбэк по фамилии
+    ru_last = EXCEPT_LAST.get(last_en or "", "") or (last_en or "")
+    if athlete_id: _queue_pending(athlete_id, first_en or "", last_en or "")
+    return ("", ru_last)
+
+# ---------- HTTP ----------
 def _get_json(url: str) -> dict:
     r = S.get(url, timeout=25)
     if r.status_code != 200:
@@ -202,7 +221,7 @@ def _get_json(url: str) -> dict:
     except Exception:
         return {}
 
-# --------- DATE PICK ----------
+# ---------- dates ----------
 def pick_report_date() -> date:
     now_et = datetime.now(ZoneInfo("America/New_York"))
     return (now_et.date() - timedelta(days=1)) if now_et.hour < 8 else now_et.date()
@@ -210,10 +229,10 @@ def pick_candidate_days() -> list[date]:
     base = pick_report_date()
     return [base, base - timedelta(days=1), base - timedelta(days=2)]
 
-# --------- ESPN helpers ----------
+# ---------- ESPN helpers ----------
 def fetch_scoreboard(day: date) -> list[dict]:
     dates = day.strftime("%Y%m%d")
-    j = _get_json(f"{ESPN_BASE}/scoreboard?dates={dates}")
+    j = _get_json(f"{ESPN_SCORE_BASE}/scoreboard?dates={dates}")
     events = j.get("events") or []
     out = []
     for ev in events:
@@ -239,7 +258,7 @@ def fetch_scoreboard(day: date) -> list[dict]:
                 abbr = (team.get("abbreviation") or "").upper()
                 if abbr == "GS": abbr = "GSW"
 
-                # leaders из scoreboard (фоллбэк)
+                # leaders (фоллбэк)
                 leaders_raw = c.get("leaders") or []
                 leaders = {}
                 for ld in leaders_raw:
@@ -267,11 +286,8 @@ def fetch_scoreboard(day: date) -> list[dict]:
                     if recobj.get("type") == "total" and recobj.get("summary"):
                         rec = recobj["summary"]
                 game["competitors"].append({
-                    "abbr": abbr,
-                    "score": score,
-                    "winner": win,
-                    "record": rec or "",
-                    "teamId": str(team.get("id") or ""),
+                    "abbr": abbr, "score": score, "winner": win,
+                    "record": rec or "", "teamId": str(team.get("id") or ""),
                 })
                 game["leaders_by_abbr"][abbr] = leaders
 
@@ -282,7 +298,10 @@ def fetch_scoreboard(day: date) -> list[dict]:
     return out
 
 def fetch_boxscore(event_id: str) -> dict:
-    return _get_json(f"{ESPN_BASE}/boxscore?event={event_id}") or {}
+    j = _get_json(ESPN_BOX_WEB + str(event_id))
+    if not j or not (j.get("boxscore") or j.get("players")):
+        j = _get_json(ESPN_BOX_SITE + str(event_id))
+    return j or {}
 
 def _to_int(x, default=0) -> int:
     if x is None: return default
@@ -292,10 +311,7 @@ def _to_int(x, default=0) -> int:
     return int(m.group(0)) if m else default
 
 def parse_players_from_box(box: dict) -> dict:
-    """
-    teamId -> [{"id","first","last","name","pts","reb","ast","stl","blk"}]
-    (имена берём надёжно: firstName/lastName -> fullName/displayName -> разбор)
-    """
+    """ teamId -> [{"id","first","last","name","pts","reb","ast","stl","blk"}] """
     out: dict[str, list[dict]] = {}
     players_section = (box.get("boxscore", {}) or {}).get("players") or box.get("players") or []
     for team_block in players_section:
@@ -310,16 +326,14 @@ def parse_players_from_box(box: dict) -> dict:
                 pid = str(ath.get("id") or "")
                 if not pid: continue
 
-                # НОРМАЛИЗУЕМ ИМЕНА НАДЁЖНО
+                # надёжные имена
                 first = (ath.get("firstName") or "").strip()
                 last  = (ath.get("lastName")  or "").strip()
                 name_full = (ath.get("displayName") or ath.get("fullName") or "").strip()
                 if not (first and last):
                     parts = [p for p in re.split(r"\s+", name_full) if p]
-                    if not first and parts:
-                        first = parts[0]
-                    if not last:
-                        last = " ".join(parts[1:]) if len(parts) > 1 else (parts[0] if parts else "")
+                    if not first and parts: first = parts[0]
+                    if not last:  last  = " ".join(parts[1:]) if len(parts) > 1 else (parts[0] if parts else "")
                 name_fallback = name_full or (first + (" " + last if last else "")) or "Игрок"
 
                 stats_list = a.get("stats") or []
@@ -339,16 +353,12 @@ def parse_players_from_box(box: dict) -> dict:
                                 "pts": pts, "reb": reb, "ast": ast, "stl": stl, "blk": blk}
                 else:
                     m = col[pid]
-                    m["pts"] = max(m["pts"], pts)
-                    m["reb"] = max(m["reb"], reb)
-                    m["ast"] = max(m["ast"], ast)
-                    m["stl"] = max(m["stl"], stl)
-                    m["blk"] = max(m["blk"], blk)
+                    for k,v in (("pts",pts),("reb",reb),("ast",ast),("stl",stl),("blk",blk)):
+                        m[k] = max(m[k], v)
 
         out[tid] = list(col.values())
     return out
 
-# --------- highlights & format ----------
 def _flame(pts:int, reb:int, ast:int, stl:int, blk:int) -> str:
     dd = sum(v>=10 for v in (pts,reb,ast))
     td = dd >= 3
@@ -356,11 +366,18 @@ def _flame(pts:int, reb:int, ast:int, stl:int, blk:int) -> str:
         return " 🔥"
     return ""
 
-def fmt_stat_line_ru(p: dict, ru_surname: str | None, bold: bool=False) -> str:
-    # надёжный фоллбэк имени, если по какой-то причине пусто
-    base_name = (ru_surname or "").strip() or (p.get("last") or "").strip() or (p.get("first") or "").strip() or (p.get("name") or "Игрок")
-    name = f"<b>{base_name}</b>" if bold else base_name
+def display_name_ru(p: dict, ru_first: str, ru_last: str) -> str:
+    # формируем "И. Фамилия"
+    if ru_first:
+        init = ru_first.strip()[0].upper()
+    else:
+        init = _latin_initial_to_cyr(p.get("first",""))
+    surname = (ru_last or p.get("last") or p.get("name") or "Игрок").strip()
+    return f"{init}. {surname}"
 
+def fmt_stat_line_ru(p: dict, ru_first: str, ru_last: str, bold: bool=False) -> str:
+    name = display_name_ru(p, ru_first, ru_last)
+    if bold: name = f"<b>{name}</b>"
     pts, reb, ast, stl, blk = p["pts"], p["reb"], p["ast"], p["stl"], p["blk"]
     parts = [f"{name}: {pts} {ru_plural(pts, ('очко','очка','очков'))}"]
     if reb >= 5: parts.append(f"{reb} {ru_plural(reb, ('подбор','подбора','подборов'))}")
@@ -404,7 +421,6 @@ def select_highlights(players: list[dict], abbr: str) -> list[tuple[dict,bool]]:
         out.append((p, bool(spec and p["id"] == spec["id"])))
     return out
 
-# --------- leaders → fake players (фоллбэк) ----------
 def leaders_to_players(leaders: dict) -> list[dict]:
     by_id: dict[str, dict] = {}
     def add(cat, key):
@@ -424,7 +440,6 @@ def leaders_to_players(leaders: dict) -> list[dict]:
     add("points","pts"); add("rebounds","reb"); add("assists","ast"); add("steals","stl"); add("blocks","blk")
     return list(by_id.values())
 
-# --------- GAME → text block ----------
 SEP = "–––––––––––––––––––––––"
 
 def _team_line_text(abbr: str, score: int, record: str, winner: bool, ot_suffix: str, entities, offset_ref) -> str:
@@ -434,13 +449,8 @@ def _team_line_text(abbr: str, score: int, record: str, winner: bool, ot_suffix:
     use_custom = TEAM_CUSTOM_IDS.get(abbr)
     if use_custom:
         piece = f"■ {name}: {s}{rec}{ot_suffix}"
-        entities.append({
-            "type": "custom_emoji",
-            "offset": offset_ref[0],
-            "length": 1,
-            "custom_emoji_id": use_custom
-        })
-        offset_ref[0] += len(piece) + 1  # + '\n' дальше
+        entities.append({"type":"custom_emoji","offset":offset_ref[0],"length":1,"custom_emoji_id":use_custom})
+        offset_ref[0] += len(piece) + 1
         return piece
     else:
         emo = TEAM_EMOJI.get(abbr, "🏀")
@@ -452,14 +462,12 @@ def build_game_block(game: dict, entities, offset_ref) -> str:
     comp = game["competitors"]
     if len(comp) != 2: return ""
     a, b = comp[0], comp[1]
-
-    # Заголовок матча (две строки)
     head_a = _team_line_text(a["abbr"], a["score"], a["record"], a["winner"], "", entities, offset_ref)
     head_b = _team_line_text(b["abbr"], b["score"], b["record"], b["winner"], game.get("ot",""), entities, offset_ref)
     head = head_a + "\n" + head_b + "\n"
-    offset_ref[0] += 1  # пустая строка перед игроками
+    offset_ref[0] += 1
 
-    # Игроки
+    # игроки
     box = fetch_boxscore(game["eventId"])
     players_by_team = parse_players_from_box(box)
 
@@ -468,13 +476,13 @@ def build_game_block(game: dict, entities, offset_ref) -> str:
 
     def lines_for_team(c):
         arr = players_by_team.get(c["teamId"], [])
-        if not arr:  # boxscore пуст — берём leaders
+        if not arr:
             arr = leaders_to_players(game.get("leaders_by_abbr", {}).get(c["abbr"], {}))
         picks = select_highlights(arr, c["abbr"])
         out = []
         for p, bold in picks:
-            ru = resolve_ru_surname(p.get("first",""), p.get("last",""), p.get("id",""))
-            out.append(fmt_stat_line_ru(p, ru, bold))
+            ru_first, ru_last = resolve_ru_name(p.get("first",""), p.get("last",""), p.get("id",""))
+            out.append(fmt_stat_line_ru(p, ru_first, ru_last, bold))
         return out
 
     la = lines_for_team(a)
@@ -490,14 +498,13 @@ def build_game_block(game: dict, entities, offset_ref) -> str:
                 all_players += leaders_to_players(game.get("leaders_by_abbr", {}).get(ab, {}))
         if all_players:
             best = sorted(all_players, key=lambda p: (p.get("pts",0), p.get("reb",0)+p.get("ast",0), p.get("stl",0)+p.get("blk",0)), reverse=True)[0]
-            ru = resolve_ru_surname(best.get("first",""), best.get("last",""), best.get("id",""))
-            lines.append(fmt_stat_line_ru(best, ru, False))
+            ru_first, ru_last = resolve_ru_name(best.get("first",""), best.get("last",""), best.get("id",""))
+            lines.append(fmt_stat_line_ru(best, ru_first, ru_last, False))
 
     text = head + ("\n".join(l for l in lines if l.strip()))
     offset_ref[0] += len(text) - len(head)
     return text.strip()
 
-# --------- POST ----------
 def build_post_text_and_entities() -> tuple[str, list]:
     global TEAM_CUSTOM_IDS
     TEAM_CUSTOM_IDS = _load_json(TEAM_CUSTOM_IDS_PATH, {})
@@ -529,13 +536,11 @@ def build_post_text_and_entities() -> tuple[str, list]:
 
     return (title + "\n".join(blocks)).strip(), entities
 
-# --------- TELEGRAM ----------
 def tg_send(text: str, entities: list[dict]):
     if not (BOT_TOKEN and CHAT_ID):
         raise RuntimeError("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы")
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-    # стараемся уложиться в одно сообщение
     if len(text) > 3900:
         parts = []
         t = text
@@ -546,40 +551,28 @@ def tg_send(text: str, entities: list[dict]):
             parts.append(t[:cut].rstrip())
             t = t[cut:].lstrip()
         parts.append(t)
-
         first = True
         for part in parts:
-            payload = {
-                "chat_id": CHAT_ID,
-                "text": part,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            }
-            if first and entities:
-                payload["entities"] = entities
+            payload = {"chat_id": CHAT_ID, "text": part, "parse_mode": "HTML", "disable_web_page_preview": True}
+            if first and entities: payload["entities"] = entities
             resp = S.post(url, json=payload, timeout=25)
             if resp.status_code != 200:
                 raise RuntimeError(f"Telegram error {resp.status_code}: {resp.text}")
             first = False
             time.sleep(0.3)
     else:
-        payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
-                   "disable_web_page_preview": True}
-        if entities:
-            payload["entities"] = entities
+        payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+        if entities: payload["entities"] = entities
         resp = S.post(url, json=payload, timeout=25)
         if resp.status_code != 200:
             raise RuntimeError(f"Telegram error {resp.status_code}: {resp.text}")
 
-# --------- MAIN ----------
 if __name__ == "__main__":
     try:
         loaded_map = _load_json(RU_MAP_PATH, {})
         loaded_pending = _load_json(RU_PENDING_PATH, [])
-        if isinstance(loaded_map, dict):
-            RU_MAP.clear(); RU_MAP.update(loaded_map)
-        if isinstance(loaded_pending, list):
-            RU_PENDING.clear(); RU_PENDING.extend(loaded_pending)
+        if isinstance(loaded_map, dict): RU_MAP.update(loaded_map)
+        if isinstance(loaded_pending, list): RU_PENDING.extend(loaded_pending)
 
         text, entities = build_post_text_and_entities()
         tg_send(text, entities)
