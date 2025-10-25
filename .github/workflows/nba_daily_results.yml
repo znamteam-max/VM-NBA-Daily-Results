@@ -1,3 +1,4 @@
+# .github/workflows/nba_daily_results.yml
 name: NBA daily results to Telegram
 
 on:
@@ -51,7 +52,7 @@ jobs:
           print('Values that look like custom_emoji_id:', looks_like_ids, 'of', len(d))
           PY
 
-      # 2) Проверка у Bot API: узнаёт ли Telegram эти ID
+      # 2) Спросим у Telegram, сколько из этих ID он реально узнаёт
       - name: Validate custom emoji IDs against Telegram
         env:
           TEAM_EMOJI_JSON:    ${{ secrets.TEAM_EMOJI_JSON }}
@@ -80,10 +81,10 @@ jobs:
           if not ok or len(res) == 0:
               print('⚠️ Telegram не признал ни один ID — в сообщении будет fallback 🏀')
           elif len(res) < len(uniq):
-              print('⚠️ Часть ID не распознана — проверь источники ID.')
+              print('⚠️ Часть ID не распознана — проверь источник этих ID.')
           PY
 
-      # 3) Отправим одно тестовое сообщение с NYK через entities
+      # 3) Отправим одно тестовое сообщение с NYK через entities (без HTML)
       - name: Send one test emoji (NYK) via entities
         if: ${{ always() }}
         env:
@@ -109,7 +110,8 @@ jobs:
               {"type": "custom_emoji", "offset": 0, "length": 1, "custom_emoji_id": cid}
             ]
           }
-          data = json.dumps(payload).encode('utf-8')
+          import json as _json
+          data = _json.dumps(payload).encode('utf-8')
           req = urllib.request.Request(
             f"https://api.telegram.org/bot{token}/sendMessage",
             data=data,
