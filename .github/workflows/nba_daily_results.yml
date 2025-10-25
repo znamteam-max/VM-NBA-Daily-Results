@@ -2,12 +2,18 @@ name: NBA daily results to Telegram
 
 on:
   schedule:
-    - cron: "35 5 * * *"   # 06:35 Europe/London
+    - cron: "35 5 * * *"   # 06:35 Europe/London (GitHub Actions cron — в UTC)
   workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    concurrency:
+      group: nba-daily-results
+      cancel-in-progress: false
 
     steps:
       - name: Checkout repo
@@ -17,15 +23,40 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4 lxml
 
+      # Не печатаем сам секрет — только его наличие и число ключей
+      - name: Sanity check TEAM_EMOJI_JSON
+        env:
+          TEAM_EMOJI_JSON: ${{ secrets.TEAM_EMOJI_JSON }} # или vars.TEAM_EMOJI_JSON, если храните как Variable
+        run: |
+          python - <<'PY'
+          import os, json
+          s = os.getenv('TEAM_EMOJI_JSON')
+          print('TEAM_EMOJI_JSON present:', bool(s))
+          if s:
+              try:
+                  d = json.loads(s)
+                  print('Parsed OK. Keys total:', len(d))
+                  bad = [k for k in d if len(k) != 3]
+                  empty = [k for k,v in d.items() if not str(v).strip()]
+                  if bad:   print('Non-canonical keys (should be 3 letters):', ','.join(bad))
+                  if empty: print('Empty values for:', ','.join(empty))
+              except Exception as e:
+                  print('JSON error:', e)
+                  raise
+          PY
+
       - name: Run bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEAM_EMOJI_JSON:    ${{ secrets.TEAM_EMOJI_JSON }} # важно: прокидываем в процесс
+          PYTHONUNBUFFERED:   "1"
         run: |
           python nba_daily_results_bot.py
