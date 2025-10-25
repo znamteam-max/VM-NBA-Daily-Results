@@ -1,4 +1,3 @@
-# .github/workflows/nba_daily_results.yml
 name: NBA daily results to Telegram
 
 on:
@@ -31,7 +30,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4 lxml
 
-      # 1) Проверяем секрет (не выводим ID)
+      # 1) Быстрая проверка секрета (не выводим ID)
       - name: Sanity check TEAM_EMOJI_JSON
         env:
           TEAM_EMOJI_JSON: ${{ secrets.TEAM_EMOJI_JSON }}
@@ -52,14 +51,15 @@ jobs:
           print('Values that look like custom_emoji_id:', looks_like_ids, 'of', len(d))
           PY
 
-      # 2) Узнаёт ли Telegram эти ID
+      # 2) Узнаёт ли Telegram эти ID (теперь через JSON body)
       - name: Validate custom emoji IDs against Telegram
+        continue-on-error: true
         env:
           TEAM_EMOJI_JSON:    ${{ secrets.TEAM_EMOJI_JSON }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
           python - <<'PY'
-          import os, json, re, urllib.parse, urllib.request, urllib.error
+          import os, json, re, urllib.request, urllib.error
           s = os.getenv('TEAM_EMOJI_JSON'); token = os.getenv('TELEGRAM_BOT_TOKEN')
           if not (s and token):
               print('Skip: no TEAM_EMOJI_JSON or TELEGRAM_BOT_TOKEN'); raise SystemExit(0)
@@ -72,25 +72,32 @@ jobs:
           uniq = list(dict.fromkeys(ids))
           if not uniq:
               print('No numeric IDs found'); raise SystemExit(0)
-          data = urllib.parse.urlencode({'custom_emoji_ids': ','.join(uniq)}).encode()
-          url = f"https://api.telegram.org/bot{token}/getCustomEmojiStickers"
+          payload = {"custom_emoji_ids": uniq}
+          data = json.dumps(payload).encode('utf-8')
+          req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/getCustomEmojiStickers",
+            data=data,
+            headers={"Content-Type":"application/json"}
+          )
           try:
-              with urllib.request.urlopen(url, data=data, timeout=20) as r:
-                  j = json.loads(r.read().decode('utf-8'))
+            with urllib.request.urlopen(req, timeout=20) as r:
+                j = json.loads(r.read().decode('utf-8'))
           except urllib.error.HTTPError as e:
-              print('HTTPError', e.code, e.reason)
-              print(e.read().decode('utf-8'))
-              raise
+            print('HTTPError', e.code, e.reason)
+            print(e.read().decode('utf-8'))
+            raise
           ok = j.get('ok'); res = j.get('result') or []
           print('Bot API ok:', ok, '| recognized IDs:', len(res), 'of', len(uniq))
-          if not ok or len(res) == 0:
-              print('⚠️ Telegram не признал ни один ID — в сообщении будет fallback 🏀')
-          elif len(res) < len(uniq):
-              print('⚠️ Часть ID не распознана — проверь источник этих ID.')
+          known = {st.get('custom_emoji_id') for st in res}
+          unknown = [x for x in uniq if x not in known]
+          if unknown:
+              print('Unknown IDs (first 10):', ','.join(unknown[:10]))
           PY
 
-      # 3) Пробуем отправить 1 custom emoji (NYK) через entities и печатаем тело ошибки при 400
+      # 3) Тест: отправим 1 custom emoji (NYK) через entities
+        # (оставляем JSON + печать тела ошибки; не ломаем весь ран)
       - name: Send one test emoji (NYK) via entities
+        continue-on-error: true
         if: ${{ always() }}
         env:
           TEAM_EMOJI_JSON:    ${{ secrets.TEAM_EMOJI_JSON }}
@@ -101,13 +108,16 @@ jobs:
           import os, json, re, urllib.request, urllib.error
           token = os.getenv('TELEGRAM_BOT_TOKEN')
           chat  = os.getenv('TELEGRAM_CHAT_ID')
-          d = json.loads(os.getenv('TEAM_EMOJI_JSON','{}'))
+          try:
+              d = json.loads(os.getenv('TEAM_EMOJI_JSON','{}'))
+          except Exception:
+              d = {}
           val = str(d.get('NYK','')).strip()
           m = re.fullmatch(r'(?:id:)?(\d{10,})', val)
           if not m:
               print('No NYK ID in secret'); raise SystemExit(0)
           cid = m.group(1)
-          text = "■ тест NYK"  # плейсхолдер на первой позиции
+          text = "■ тест NYK"
           payload = {
             "chat_id": chat,
             "text": text,
@@ -115,8 +125,7 @@ jobs:
               {"type": "custom_emoji", "offset": 0, "length": 1, "custom_emoji_id": cid}
             ]
           }
-          import json as _json
-          data = _json.dumps(payload).encode('utf-8')
+          data = json.dumps(payload).encode('utf-8')
           req = urllib.request.Request(
             f"https://api.telegram.org/bot{token}/sendMessage",
             data=data,
@@ -131,7 +140,7 @@ jobs:
             raise
           PY
 
-      # 4) Запускаем бота — сюда прокидываем секрет!
+      # 4) Запускаем бота
       - name: Run bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
