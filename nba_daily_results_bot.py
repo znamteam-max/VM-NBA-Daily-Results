@@ -69,7 +69,7 @@ def make_session():
               allowed_methods=["GET","POST"])
     s.mount("https://", HTTPAdapter(max_retries=r))
     s.headers.update({
-        "User-Agent": "NBA-DailyResultsBot/2.8 (+espn; sports.ru resolver)",
+        "User-Agent": "NBA-DailyResultsBot/2.9 (+espn; sports.ru resolver)",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
     })
     return s
@@ -88,7 +88,7 @@ def _save_json(path: str, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
-# ---------- utils for RU name quality ----------
+# ---------- utils ----------
 def is_cyrillic(s: str) -> bool:
     return bool(s) and all(('А' <= ch <= 'я') or ch in " .-’ʼ'" for ch in s)
 
@@ -100,18 +100,6 @@ def _latin_initial_to_cyr(first_en: str) -> str:
              "W":"В","X":"К","Y":"Й","Z":"З"}
     return table.get(ch, "И")
 
-_TR_MAP = [("sch","ш"),("sh","ш"),("ch","ч"),("kh","х"),("ts","ц"),("ya","я"),("yu","ю"),
-           ("ye","е"),("yo","ё"),("zh","ж"),("ph","ф")]
-_TR_LET = {"a":"а","b":"б","c":"к","d":"д","e":"е","f":"ф","g":"г","h":"х","i":"и","j":"дж","k":"к",
-           "l":"л","m":"м","n":"н","o":"о","p":"п","q":"к","r":"р","s":"с","t":"т","u":"у","v":"в",
-           "w":"в","x":"кс","y":"и","z":"з"}
-def translit_en_to_ru(s: str) -> str:
-    t = (s or "").strip().lower()
-    for pat,rep in _TR_MAP: t = re.sub(pat, rep, t)
-    out = "".join(_TR_LET.get(ch, ch) for ch in t)
-    return (out[:1].upper() + out[1:]) if out else s or ""
-
-# ---------- sports.ru resolver ----------
 def _slugify(first: str, last: str) -> str:
     base = f"{first} {last}".strip()
     base = unicodedata.normalize("NFKD", base)
@@ -120,6 +108,7 @@ def _slugify(first: str, last: str) -> str:
     base = re.sub(r"[^a-z0-9]+", "-", base).strip("-")
     return base
 
+# ---------- sports.ru resolver ----------
 def _sportsru_try_profile(first: str, last: str) -> str | None:
     slug = _slugify(first, last)
     for root in (SRU_PERSON, SRU_PLAYER):
@@ -164,8 +153,8 @@ def _sportsru_search(first: str, last: str) -> tuple[str,str] | None:
     except Exception:
         return None
 
-# исключения — теперь case-insensitive
 EXCEPT_LAST = {
+    # case-insensitive ключи
     "ingram":"Ингрэм","barrett":"Барретт","antetokounmpo":"Адетокумбо","anthony":"Энтони",
     "wagner":"Вагнер","bane":"Бэйн","young":"Янг","alexander-walker":"Александер-Уокер",
     "brunson":"Брансон","towns":"Таунс","brown":"Браун","hauser":"Хаузер","thomas":"Томас",
@@ -182,19 +171,17 @@ EXCEPT_LAST = {
 
 def _queue_pending(pid: str, first: str, last: str):
     if not pid or pid in _session_pending_ids: return
-    # не дублируем
+    if pid in RU_MAP: return
     for it in RU_PENDING:
         if it.get("id") == pid: return
     RU_PENDING.append({"id": pid, "first": first, "last": last})
     _session_pending_ids.add(pid)
 
 def _improve_cached_if_needed(pid: str, first: str, last: str):
-    """Если в кэше латиница/транслит — пробуем улучшить через sports.ru и/или exceptions."""
     cur = RU_MAP.get(pid)
     need = (not cur) or (isinstance(cur, str) and not is_cyrillic(cur)) \
            or (isinstance(cur, dict) and (not is_cyrillic(cur.get("last","")) or not cur.get("first")))
     if not need: return
-    # 1) sports.ru
     url = _sportsru_try_profile(first, last)
     got = _sportsru_from_profile(url) if url else None
     if not got:
@@ -202,37 +189,26 @@ def _improve_cached_if_needed(pid: str, first: str, last: str):
     if got:
         RU_MAP[pid] = {"first": got[0], "last": got[1]}
         return
-    # 2) exceptions
-    ru_last = EXCEPT_LAST.get((last or "").strip().lower())
-    if ru_last:
-        RU_MAP[pid] = {"first": "", "last": ru_last}
+    low_last = (last or "").strip().lower()
+    if low_last in EXCEPT_LAST:
+        RU_MAP[pid] = {"first": "", "last": EXCEPT_LAST[low_last]}
         return
-    # 3) транслит
-    RU_MAP[pid] = {"first": "", "last": translit_en_to_ru(last or "")}
+    RU_MAP[pid] = {"first": "", "last": (last or "").strip()}  # ← без транслита — оставляем латиницу
 
 def resolve_ru_name(first_en: str, last_en: str, athlete_id: str) -> tuple[str,str]:
-    # пытаемся улучшить кэш при каждом обращении
     if athlete_id:
         _improve_cached_if_needed(athlete_id, first_en or "", last_en or "")
         val = RU_MAP.get(athlete_id)
-        if isinstance(val, dict):
-            return (val.get("first",""), val.get("last",""))
-        if isinstance(val, str):
-            # old legacy cache → фамилия, без имени
-            return ("", val)
-
-    # если нет pid — пытаемся on-the-fly
+        if isinstance(val, dict): return (val.get("first",""), val.get("last",""))
+        if isinstance(val, str):  return ("", val)  # legacy
+    # без id — on-the-fly
     url = _sportsru_try_profile(first_en or "", last_en or "")
     got = _sportsru_from_profile(url) if url else None
     if not got:
         got = _sportsru_search(first_en or "", last_en or "")
-    if got:
-        if athlete_id: RU_MAP[athlete_id] = {"first": got[0], "last": got[1]}
-        return got
-
-    # exceptions → транслит
+    if got: return got
     low_last = (last_en or "").strip().lower()
-    ru_last = EXCEPT_LAST.get(low_last) or translit_en_to_ru(last_en or "")
+    ru_last = EXCEPT_LAST.get(low_last) or (last_en or "").strip()  # ← латиница, если неизвестно
     if athlete_id: _queue_pending(athlete_id, first_en or "", last_en or "")
     return ("", ru_last)
 
@@ -266,9 +242,8 @@ def fetch_scoreboard(day: date) -> list[dict]:
             t = (ev.get("status") or {}).get("type") or {}
             completed = bool(t.get("completed"))
             state = str(t.get("state") or "").lower()
-            if not (completed or state in {"post","final"}):
+            if not (completed or state in {"post","final"}):  # только завершённые
                 continue
-
             comp = (ev.get("competitions") or [])[0]
             competitors = comp.get("competitors") or []
             status_comp = (comp.get("status") or {}).get("type") or {}
@@ -277,13 +252,12 @@ def fetch_scoreboard(day: date) -> list[dict]:
             if "ot" in short:
                 m = re.search(r'(\d+)\s*ot', short) or re.search(r'(\d)ot', short)
                 ot_label = f" ({int(m.group(1))}ОТ)" if m else " (ОТ)"
-
             game = {"eventId": ev.get("id"), "competitors": [], "ot": ot_label, "leaders_by_abbr": {}}
             for c in competitors:
                 team = c.get("team") or {}
                 abbr = (team.get("abbreviation") or "").upper()
                 if abbr == "GS": abbr = "GSW"
-
+                # leaders этой команды
                 leaders_raw = c.get("leaders") or []
                 leaders = {}
                 for ld in leaders_raw:
@@ -308,7 +282,6 @@ def fetch_scoreboard(day: date) -> list[dict]:
                     "record": rec or "", "teamId": str(team.get("id") or ""),
                 })
                 game["leaders_by_abbr"][abbr] = leaders
-
             if len(game["competitors"]) == 2:
                 out.append(game)
         except Exception as e:
@@ -317,7 +290,7 @@ def fetch_scoreboard(day: date) -> list[dict]:
 
 def fetch_boxscore(event_id: str) -> dict:
     j = _get_json(ESPN_BOX_WEB + str(event_id))
-    if not j or not (j.get("boxscore") or j.get("players")):
+    if not j or not (j.get("boxscore") or j.get("players") or j.get("gamepackageJSON")):
         j = _get_json(ESPN_BOX_SITE + str(event_id))
     return j or {}
 
@@ -328,7 +301,7 @@ def _to_int_any(x, default=0) -> int:
         m = re.search(r"-?\d+", x)
         return int(m.group(0)) if m else default
     if isinstance(x, dict):
-        for k in ("value","val"): 
+        for k in ("value","val"):
             if k in x:
                 try: return int(float(x[k]))
                 except Exception: pass
@@ -345,8 +318,18 @@ def _norm_key(k: str) -> str:
     }
     return aliases.get(k, k)
 
+def _merge_statmap(statmap: dict, source) -> None:
+    # source может быть list (по ключам), dict, или list of "x-y" (игнор)
+    if isinstance(source, dict):
+        for k, v in source.items():
+            nk = _norm_key(k)
+            statmap[nk] = max(statmap.get(nk, 0), _to_int_any(v, 0))
+
 def parse_players_from_box(box: dict) -> dict:
     """ teamId -> [{"id","first","last","name","pts","reb","ast","stl","blk"}] """
+    # поддержка формата gamepackageJSON
+    if "gamepackageJSON" in box:
+        box = box["gamepackageJSON"]
     out: dict[str, list[dict]] = {}
     players_section = (box.get("boxscore", {}) or {}).get("players") or box.get("players") or []
     for team_block in players_section:
@@ -354,66 +337,74 @@ def parse_players_from_box(box: dict) -> dict:
         tid = str(team.get("id") or "")
         col: dict[str, dict] = {}
 
-        for grp in (team_block.get("statistics") or []):
-            keys = [ _norm_key(k) for k in (grp.get("keys") or grp.get("labels") or []) ]
-            for a in (grp.get("athletes") or []):
-                ath = a.get("athlete") or {}
-                pid = str(ath.get("id") or "")
-                if not pid: continue
+        stats_groups = team_block.get("statistics") or []
+        # иногда нужное сидит в team_block['athletes'] (редко)
+        athletes_direct = team_block.get("athletes") or []
 
-                first = (ath.get("firstName") or "").strip()
-                last  = (ath.get("lastName")  or "").strip()
-                name_full = (ath.get("displayName") or ath.get("fullName") or "").strip()
+        def ensure_player(ath) -> dict:
+            pid = str((ath.get("id") or ath.get("athlete", {}).get("id") or "") if isinstance(ath, dict) else "")
+            if not pid: return {}
+            if pid not in col:
+                a = ath.get("athlete", ath)
+                first = (a.get("firstName") or "").strip()
+                last  = (a.get("lastName")  or "").strip()
+                name_full = (a.get("displayName") or a.get("fullName") or "").strip()
                 if not (first and last):
                     parts = [p for p in re.split(r"\s+", name_full) if p]
                     if not first and parts: first = parts[0]
                     if not last:  last  = " ".join(parts[1:]) if len(parts) > 1 else (parts[0] if parts else "")
-                name_fallback = name_full or (first + (" " + last if last else "")) or "Игрок"
+                col[pid] = {"id": pid, "first": first, "last": last,
+                            "name": name_full or (first + (" " + last if last else "")) or "Игрок",
+                            "pts":0,"reb":0,"ast":0,"stl":0,"blk":0}
+            return col[pid]
 
-                stats_list = a.get("stats") or []
+        # 1) стандартный путь: groups -> athletes
+        for grp in stats_groups:
+            keys = [ _norm_key(k) for k in (grp.get("keys") or grp.get("labels") or []) ]
+            for a in (grp.get("athletes") or []):
+                m = ensure_player(a)
+                if not m: continue
+                # a["stats"] может быть list, dict, или список строк
+                stats_obj = a.get("stats")
                 statmap = {}
-                n = min(len(keys), len(stats_list))
-                for i in range(n):
-                    statmap[keys[i]] = _to_int_any(stats_list[i], 0)
+                if isinstance(stats_obj, list):
+                    n = min(len(keys), len(stats_obj))
+                    for i in range(n):
+                        statmap[keys[i]] = _to_int_any(stats_obj[i], 0)
+                elif isinstance(stats_obj, dict):
+                    _merge_statmap(statmap, stats_obj)
+                # дубли прямо в athlete.stats/totals
+                ath = a.get("athlete") or {}
+                _merge_statmap(statmap, ath.get("stats") or {})
+                _merge_statmap(statmap, ath.get("totals") or {})
+                # применяем
+                for k in ("pts","reb","ast","stl","blk"):
+                    m[k] = max(m[k], int(statmap.get(k, 0)))
 
-                # иногда ESPN дублирует в athlete.stats
-                for k, v in (ath.get("stats") or {}).items():
-                    nk = _norm_key(k)
-                    statmap[nk] = max(statmap.get(nk, 0), _to_int_any(v, 0))
-
-                pts = max(0, _to_int_any(statmap.get("pts"), 0))
-                reb = max(0, _to_int_any(statmap.get("reb"), 0))
-                ast = max(0, _to_int_any(statmap.get("ast"), 0))
-                stl = max(0, _to_int_any(statmap.get("stl"), 0))
-                blk = max(0, _to_int_any(statmap.get("blk"), 0))
-
-                if pid not in col:
-                    col[pid] = {"id": pid, "first": first, "last": last, "name": name_fallback,
-                                "pts": pts, "reb": reb, "ast": ast, "stl": stl, "blk": blk}
-                else:
-                    m = col[pid]
-                    for k,v in (("pts",pts),("reb",reb),("ast",ast),("stl",stl),("blk",blk)):
-                        m[k] = max(m[k], v)
+        # 2) иногда список игроков лежит отдельно
+        for a in athletes_direct:
+            m = ensure_player(a)
+            if not m: continue
+            _merge_statmap(m, (a.get("stats") or {}))
+            _merge_statmap(m, (a.get("totals") or {}))
+            ath = a.get("athlete") or {}
+            _merge_statmap(m, ath.get("stats") or {})
+            _merge_statmap(m, ath.get("totals") or {})
 
         out[tid] = list(col.values())
     return out
 
-# merge with team leaders and with global leaders (for same player)
-def merge_with_leaders(players: list[dict], leaders_team: dict, leaders_global: dict | None = None) -> list[dict]:
+def merge_with_leaders(players: list[dict], leaders: dict) -> list[dict]:
     by_id = {p["id"]: p for p in (players or [])}
-    def apply(ld: dict):
-        if not ld: return
-        def put(cat, key):
-            for it in ld.get(cat, []) or []:
-                pid = it.get("id","")
-                if not pid: continue
-                v = int(float(it.get("value") or 0))
-                m = by_id.setdefault(pid, {"id":pid,"first":it.get("first",""),"last":it.get("last",""),
-                                           "name":it.get("name",""),"pts":0,"reb":0,"ast":0,"stl":0,"blk":0})
-                m[key] = max(m[key], v)
-        put("points","pts"); put("rebounds","reb"); put("assists","ast"); put("steals","stl"); put("blocks","blk")
-    apply(leaders_team)
-    apply(leaders_global or {})
+    def apply(cat, key):
+        for it in leaders.get(cat, []) or []:
+            pid = it.get("id","")
+            if not pid: continue
+            val = int(float(it.get("value") or 0))
+            m = by_id.setdefault(pid, {"id":pid,"first":it.get("first",""),"last":it.get("last",""),
+                                       "name":it.get("name",""),"pts":0,"reb":0,"ast":0,"stl":0,"blk":0})
+            m[key] = max(m[key], val)
+    apply("points","pts"); apply("rebounds","reb"); apply("assists","ast"); apply("steals","stl"); apply("blocks","blk")
     return list(by_id.values())
 
 def _flame(pts:int, reb:int, ast:int, stl:int, blk:int) -> str:
@@ -424,11 +415,12 @@ def _flame(pts:int, reb:int, ast:int, stl:int, blk:int) -> str:
     return ""
 
 def display_name_ru(p: dict, ru_first: str, ru_last: str) -> str:
+    # «И. Фамилия»; если русской фамилии нет — оставляем латиницу как есть
     initial = ru_first.strip()[:1].upper() if ru_first else _latin_initial_to_cyr(p.get("first") or (p.get("name","").split()[:1] or [""])[0])
     surname = (ru_last or "").strip()
     if not surname:
         last_en = (p.get("last") or (p.get("name","").split()[-1] if p.get("name") else ""))
-        surname = translit_en_to_ru(last_en)
+        surname = (last_en or "").strip()  # ← латиница, без транслита
     return f"{initial}. {surname}"
 
 def fmt_stat_line_ru(p: dict, ru_first: str, ru_last: str, bold: bool=False) -> str:
@@ -450,19 +442,16 @@ def is_highlight(p: dict) -> bool:
 def select_highlights(players: list[dict], abbr: str) -> list[tuple[dict,bool]]:
     if not players: return []
     want_special = "demin" if abbr=="BKN" else ("goldin" if abbr=="MIA" else None)
-
     def score_key(p):
         return (p.get("pts",0), p.get("reb",0)+p.get("ast",0), p.get("stl",0)+p.get("blk",0))
     sorted_all = sorted(players, key=score_key, reverse=True)
     picks = [p for p in sorted_all if is_highlight(p)][:2] or sorted_all[:1]
-
     spec = None
     if want_special:
         spec = next((p for p in sorted_all if (p.get("last","") or p.get("name","")).strip().lower().endswith(want_special)), None)
         if spec and all(spec["id"] != q["id"] for q in picks):
             if len(picks) == 2: picks[1] = spec
             else: picks.append(spec)
-
     return [(p, bool(spec and p["id"] == spec["id"])) for p in picks]
 
 SEP = "–––––––––––––––––––––––"
@@ -499,7 +488,6 @@ def build_game_block(game: dict, entities, offset_ref) -> str:
 
     def lines_for_team(c):
         arr = players_by_team.get(c["teamId"], [])
-        # дополнить недостающие показатели из team leaders и (на всякий) из leaders другой команды — не нужно
         arr = merge_with_leaders(arr, game.get("leaders_by_abbr", {}).get(c["abbr"], {}))
         picks = select_highlights(arr, c["abbr"])
         lines = []
@@ -514,10 +502,8 @@ def build_game_block(game: dict, entities, offset_ref) -> str:
     if la: lines.extend(la + [""])
     if lb: lines.extend(lb)
 
-    # если совсем нет — возьмём лучшего из всех игроков матча
     if not any(l.strip() for l in lines):
         allp = (players_by_team.get(a["teamId"], []) or []) + (players_by_team.get(b["teamId"], []) or [])
-        allp = merge_with_leaders(allp, game.get("leaders_by_abbr", {}).get(a["abbr"], {}), game.get("leaders_by_abbr", {}).get(b["abbr"], {}))
         if allp:
             best = sorted(allp, key=lambda p:(p.get("pts",0), p.get("reb",0)+p.get("ast",0), p.get("stl",0)+p.get("blk",0)), reverse=True)[0]
             ru_first, ru_last = resolve_ru_name(best.get("first",""), best.get("last",""), best.get("id",""))
