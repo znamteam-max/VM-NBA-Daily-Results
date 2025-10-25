@@ -48,7 +48,7 @@ def make_session():
     ad = _mk_adapter()
     s.mount("https://", ad); s.mount("http://", ad)
     s.headers.update({
-        "User-Agent": "NBA-DailyResultsBot/4.1 (entities+UTF16 custom-emoji, sportsru+espn)",
+        "User-Agent": "NBA-DailyResultsBot/4.2 (entities+UTF16 custom-emoji, sportsru+espn)",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
         "Connection": "close",
     })
@@ -114,6 +114,7 @@ TEAM_EMOJI_DEFAULT = {
 }
 
 def _as_tg_emoji(val) -> str:
+    # Unicode -> вернуть как есть; ID -> оборачиваем в тег, который позже конвертнём в entity
     if val is None: return ""
     s = str(val).strip()
     m = re.fullmatch(r'(?:id:)?(\d{10,})', s)
@@ -474,6 +475,7 @@ def format_player_special(p: dict) -> str:
 def sp(s: str) -> str: return f'<span class="tg-spoiler">{s}</span>'
 SEP = "–––––––––––––––––––––––"
 
+# ловим <b>, </b>, <span class="tg-spoiler">, </span>, <tg-emoji emoji-id="...">…</tg-emoji>
 _TAG = re.compile(r'(<b>|</b>|<span class="tg-spoiler">|</span>|<tg-emoji emoji-id="(\d{10,})">.*?</tg-emoji>)', re.S)
 
 def html_to_plain_entities(text: str) -> tuple[str, list[dict]]:
@@ -505,7 +507,8 @@ def html_to_plain_entities(text: str) -> tuple[str, list[dict]]:
                 if pos > start:
                     entities.append({"type":"spoiler","offset":start,"length":pos-start})
         else:
-            out.append("■")
+            # Вставляем обычный emoji-плейсхолдер (важно: не произвольный символ)
+            out.append("🙂")  # длина = 1 code point (2 UTF-16 units)
             entities.append({"type":"custom_emoji","offset":pos,"length":1,"custom_emoji_id":cid})
 
         i = m.end()
@@ -515,7 +518,7 @@ def html_to_plain_entities(text: str) -> tuple[str, list[dict]]:
     return plain, entities
 
 def to_utf16_entities(plain: str, entities: list[dict]) -> list[dict]:
-    # Преобразуем offset/length из codepoints в UTF-16 code units
+    # Переводим offset/length из code points в UTF-16 code units (требование Telegram)
     pref = [0]*(len(plain)+1)
     for i,ch in enumerate(plain):
         pref[i+1] = pref[i] + (2 if ord(ch) > 0xFFFF else 1)
@@ -646,7 +649,7 @@ def tg_send(text: str):
     r = S.post(url, json={
         "chat_id": CHAT_ID,
         "text": plain,
-        "entities": ents_utf16,  # offsets/length в UTF-16 code units
+        "entities": ents_utf16,
         "disable_web_page_preview": True,
     }, timeout=HTTP_TIMEOUT)
     if r.status_code != 200:
