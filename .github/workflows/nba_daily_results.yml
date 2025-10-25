@@ -1,0 +1,49 @@
+name: NBA daily results to Telegram
+
+on:
+  schedule:
+    - cron: "45 5 * * *"   # 06:45 Europe/London
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4
+
+      - name: Run NBA bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python nba_daily_results_bot.py
+
+      - name: Update RU surname cache (sports.ru)
+        run: |
+          python update_ru_cache_nba.py
+
+      - name: Commit cache changes (if any)
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -n "$(git status --porcelain -- ru_map_nba.json ru_pending_nba.json)" ]; then
+            git add ru_map_nba.json ru_pending_nba.json
+            git commit -m "chore(nba-cache): update RU surnames"
+            git push
+          else
+            echo "No cache changes."
+          fi
