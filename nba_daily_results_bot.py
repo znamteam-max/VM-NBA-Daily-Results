@@ -1,6 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+NBA Daily Results → Telegram (RU), Yahoo-based
+
+• Источник матчей/статистики: Yahoo Sports (внутренние JSON + fallback из HTML).
+• Имёны/фамилии: тянем русские фамилии со sports.ru; если не нашли — оставляем латиницу.
+• Порог показа игроков:
+    - очки ≥ 30, ИЛИ
+    - дабл-дабл (любые два из PTS/REB/AST ≥ 10), ИЛИ
+    - подборы ≥ 15, ИЛИ передачи ≥ 12, ИЛИ перехваты ≥ 4, ИЛИ блок-шоты ≥ 4.
+  Спец-правило: Дёмин (BKN) и Голдин (MIA) форс-включение и выделение жирным, если играли.
+• Овертайм: "(ОТ)" или "(2ОТ)" и т.п.
+• Логотипы: обычные emoji из словаря или кастом-эмодзи по файлу team_emoji_ids.json (карта { "LAL": "<custom_emoji_id>" }).
+  Сообщение отправляется одним постом.
+"""
+
 import os, sys, re, json, time, unicodedata
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -16,14 +31,13 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 # ---------------- YAHOO ----------------
-Y_SCORE_HTML   = "https://sports.yahoo.com/nba/scoreboard/?date={date}"  # 2025-10-24
+Y_SCORE_HTML   = "https://sports.yahoo.com/nba/scoreboard/?date={date}"  # YYYY-MM-DD
 Y_SCORES_API_CANDIDATES = [
     "https://sports.yahoo.com/_td/api/resource/sports.scores;leagues=nba;date={date}",
     "https://sports.yahoo.com/_td/api/resource/sports.league.scoreboard;league=nba;date={date}",
     "https://sports.yahoo.com/_td/api/resource/sports.scoreboard;leagues=nba;date={date}",
 ]
 Y_BOX_API_CANDIDATES = [
-    # внутренние ресурсы с боксами/деталями
     "https://sports.yahoo.com/_td/api/resource/sports.game.stats;gameId={gid}",
     "https://sports.yahoo.com/_td/api/resource/sports.game.stats?gameId={gid}",
     "https://sports.yahoo.com/_td/api/resource/sports.game.meta;gameId={gid}",
@@ -38,9 +52,9 @@ SRU_PLAYER  = SPORTS_RU + "/basketball/player/"
 SRU_SEARCH  = SPORTS_RU + "/search/?q="
 
 # ---------------- CACHE ----------------
-RU_MAP_PATH         = "ru_map_nba.json"       # { athleteId: {"first":"Имя-ru","last":"Фамилия-ru"} | "Фамилия-legacy" }
-RU_PENDING_PATH     = "ru_pending_nba.json"   # [{id, first, last}]
-TEAM_CUSTOM_IDS_PATH= "team_emoji_ids.json"   # { "LAL": "custom_emoji_id", ... }
+RU_MAP_PATH          = "ru_map_nba.json"        # { athleteId: {"first":"Имя-ru","last":"Фамилия-ru"} | "Фамилия-legacy" }
+RU_PENDING_PATH      = "ru_pending_nba.json"    # [{id, first, last}]
+TEAM_CUSTOM_IDS_PATH = "team_emoji_ids.json"    # { "LAL": "custom_emoji_id", ... }
 
 RU_MAP: dict[str, object] = {}
 RU_PENDING: list[dict] = []
@@ -65,7 +79,7 @@ def make_session():
               allowed_methods=["GET","POST"])
     s.mount("https://", HTTPAdapter(max_retries=r))
     s.headers.update({
-        "User-Agent": "NBA-DailyResultsBot/4.0 (Yahoo+sports.ru resolver)",
+        "User-Agent": "NBA-DailyResultsBot/4.1 (Yahoo + sports.ru resolver)",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
     })
     return s
@@ -243,17 +257,14 @@ def pick_candidate_days() -> list[date]:
 
 # ---------------- YAHOO SCOREBOARD ----------------
 def _extract_app_json_from_html(html: str) -> dict:
-    # ищем root.App.main = {...};
     m = re.search(r"root\.App\.main\s*=\s*({.*?})\s*;\s*\n", html, flags=re.DOTALL)
     if not m:
         m = re.search(r"window\.__APOLLO_STATE__\s*=\s*({.*?});", html, flags=re.DOTALL)
     if not m: return {}
     blob = m.group(1)
-    # чистим странные trailing-комментарии
     try:
         return json.loads(blob)
     except Exception:
-        # иногда там JSON с JS-комментариями — удалим /**/ и т.п.
         cleaned = re.sub(r"/\*.*?\*/", "", blob, flags=re.DOTALL)
         cleaned = re.sub(r"//.*?$", "", cleaned, flags=re.MULTILINE)
         try:
@@ -263,13 +274,11 @@ def _extract_app_json_from_html(html: str) -> dict:
 
 def fetch_scoreboard_yahoo(day: date) -> list[dict]:
     dstr = day.strftime("%Y-%m-%d")
-    # 1) пробуем API-кандидаты
     for tmpl in Y_SCORES_API_CANDIDATES:
         j = _get_json(tmpl.format(date=dstr))
         games = _parse_scoreboard_json(j)
         if games:
             return games
-    # 2) HTML + встроенный JSON
     html = _get_text(Y_SCORE_HTML.format(date=dstr))
     j = _extract_app_json_from_html(html)
     games = _parse_scoreboard_json(j)
@@ -277,32 +286,24 @@ def fetch_scoreboard_yahoo(day: date) -> list[dict]:
 
 def _parse_scoreboard_json(j: dict) -> list[dict]:
     if not j: return []
-    # пробуем несколько возможных путей внутрь стора
     candidates = []
-    # вариант 1: context.dispatcher.stores.SportsScoresStore
     t = j
     for key in ("context","dispatcher","stores","SportsScoresStore"):
         if isinstance(t, dict) and key in t: t = t[key]
         else: t = None; break
     if isinstance(t, dict): candidates.append(t)
-
-    # вариант 2: уже список игр как есть
     if "events" in j or "games" in j: candidates.append(j)
-
-    # вариант 3: корневой список стора
     if "scoreboard" in j: candidates.append(j["scoreboard"])
 
     out = []
     for store in candidates:
-        # попытаемся найти массив игр глубиной до 3
         games_arrays = []
-        for k,v in (store.items() if isinstance(store, dict) else []):
-            if isinstance(v, list) and v and isinstance(v[0], dict) and ("gameId" in v[0] or "id" in v[0] or "status" in v[0]):
-                games_arrays.append(v)
-        if not games_arrays and isinstance(store, dict):
-            # часто лежит в store['games'] или store['events']
+        if isinstance(store, dict):
+            for k,v in store.items():
+                if isinstance(v, list) and v and isinstance(v[0], dict) and ("gameId" in v[0] or "id" in v[0] or "status" in v[0]):
+                    games_arrays.append(v)
             arr = store.get("games") or store.get("events") or []
-            if isinstance(arr, list): games_arrays.append(arr)
+            if isinstance(arr, list) and arr: games_arrays.append(arr)
 
         for arr in games_arrays:
             for g in arr:
@@ -358,7 +359,10 @@ def _parse_scoreboard_json(j: dict) -> list[dict]:
 
 # ---------------- YAHOO BOXES ----------------
 def fetch_box_yahoo(game_id: str) -> list[dict]:
-    """Возвращает список блоков по командам: [{teamId, players:[{id,first,last,name,pts,reb,ast,stl,blk}]}]"""
+    """
+    Возвращает список блоков по командам:
+    [{teamId, players:[{id,first,last,name,pts,reb,ast,stl,blk}]}]
+    """
     j = {}
     for tmpl in Y_BOX_API_CANDIDATES:
         j = _get_json(tmpl.format(gid=game_id))
@@ -367,7 +371,7 @@ def fetch_box_yahoo(game_id: str) -> list[dict]:
         return []
 
     teams = []
-    # Попробуем найти секции с игроками рекурсивно
+
     def norm_key(k: str) -> str:
         k = (k or "").lower()
         return {"points":"pts","pts":"pts","p":"pts",
@@ -377,29 +381,40 @@ def fetch_box_yahoo(game_id: str) -> list[dict]:
                 "blocks":"blk","blk":"blk","b":"blk"}.get(k, k)
 
     def to_int(x) -> int:
-        if x is None: return 0
-        if isinstance(x,(int,float)): return int(x)
-        if isinstance(x,str):
-            m = re.search(r"-?\d+", x); return int(m.group(0)) if m else 0
-        if isinstance(x,dict):
-            for k in ("value","val"): 
-                if k in x:
-                    try: return int(float(x[k])); except: return 0
-        return 0
+        try:
+            if x is None:
+                return 0
+            if isinstance(x, (int, float)):
+                return int(x)
+            if isinstance(x, str):
+                m = re.search(r"-?\d+", x)
+                return int(m.group(0)) if m else 0
+            if isinstance(x, dict):
+                for k in ("value", "val", "stat", "amount"):
+                    if k in x:
+                        try:
+                            return int(float(x[k]))
+                        except Exception:
+                            continue
+            return 0
+        except Exception:
+            return 0
 
-    # храним как tid->pid->player
     collected: dict[str, dict[str, dict]] = {}
 
     def ensure_player(tid: str, pid: str, first: str, last: str, name: str):
         if tid not in collected: collected[tid] = {}
-        m = collected[tid].setdefault(pid or name or "", {"id": pid or "", "first": first or "", "last": last or "", "name": name or (first+" "+last).strip(), "pts":0,"reb":0,"ast":0,"stl":0,"blk":0})
+        m = collected[tid].setdefault(pid or name or "", {
+            "id": pid or "", "first": first or "", "last": last or "",
+            "name": name or (first+" "+last).strip() or "Player",
+            "pts":0,"reb":0,"ast":0,"stl":0,"blk":0
+        })
         return m
 
     def walk(node):
         if isinstance(node, dict):
-            # потенциальные хедеры team/player
             tid = str(node.get("teamId") or node.get("teamID") or node.get("team_id") or node.get("tid") or "")
-            # структура вида { "playerStats": [ { "player":{"id":..,"firstName":..,"lastName":..,"fullName":..}, "statCategories":[{"name":"PTS","value":31}, ...] } ] }
+            # форма 1: playerStats + statCategories
             if "playerStats" in node and isinstance(node["playerStats"], list):
                 for it in node["playerStats"]:
                     pl = it.get("player") or it.get("athlete") or {}
@@ -416,7 +431,7 @@ def fetch_box_yahoo(game_id: str) -> list[dict]:
                         v = to_int(c.get("value"))
                         if k in ("pts","reb","ast","stl","blk"):
                             m[k] = max(m[k], v)
-            # иногда stats лежат как массив объектов {label,value}
+            # форма 2: node["stats"] — список объектов с label/value рядом с player|athlete
             if "stats" in node and isinstance(node["stats"], list) and any(isinstance(x, dict) for x in node["stats"]) and ("player" in node or "athlete" in node):
                 pl = node.get("player") or node.get("athlete") or {}
                 pid = str(pl.get("id") or "")
@@ -429,7 +444,7 @@ def fetch_box_yahoo(game_id: str) -> list[dict]:
                     v = to_int(c.get("value"))
                     if k in ("pts","reb","ast","stl","blk"):
                         m[k] = max(m[k], v)
-            # общий случай: пройти внутрь
+            # рекурсивно внутрь
             for v in node.values():
                 walk(v)
         elif isinstance(node, list):
@@ -454,7 +469,6 @@ def merge_with_leaders(players: list[dict], leaders: dict) -> list[dict]:
                                        "name":it.get("name",""),"pts":0,"reb":0,"ast":0,"stl":0,"blk":0})
             m[key] = max(m[key], val)
     apply("points","pts"); apply("rebounds","reb"); apply("assists","ast")
-    # у Yahoo на табло STL/BLK редко бывают — оставим как есть
     return list(by_id.values())
 
 def _flame(pts:int, reb:int, ast:int, stl:int, blk:int) -> str:
@@ -515,6 +529,7 @@ def _team_line_text(abbr: str, score: int, record: str, winner: bool, ot_suffix:
     use_custom = TEAM_CUSTOM_IDS.get(abbr)
     if use_custom:
         piece = f"■ {name}: {s}{rec}{ot_suffix}"
+        # entity: один символ '■' заменяется кастом-эмодзи
         entities.append({"type":"custom_emoji","offset":offset_ref[0],"length":1,"custom_emoji_id":use_custom})
         offset_ref[0] += len(piece) + 1
         return piece
@@ -538,7 +553,6 @@ def build_game_block(game: dict, entities, offset_ref) -> str:
     box_teams = fetch_box_yahoo(game["eventId"])  # [{teamId, players:[...]}]
     by_tid = {t["teamId"]: t.get("players", []) for t in box_teams}
 
-    # добавим лидеров с табло (pts/reb/ast), если бокс дал пусто
     def lines_for_team(c):
         arr = by_tid.get(c["teamId"], [])
         arr = merge_with_leaders(arr, game.get("leaders_by_abbr", {}).get(c["abbr"], {}))
@@ -577,7 +591,7 @@ def build_post_text_and_entities() -> tuple[str, list]:
             f"{SEP}\n\n"
 
     entities: list[dict] = []
-    offset_ref = [len(title)]
+    offset_ref = [len(title)]  # позиция для entities (учитывает видимые символы)
 
     blocks = []
     for i, g in enumerate(games, 1):
