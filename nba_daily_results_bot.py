@@ -46,7 +46,8 @@ def make_session():
     ad = _make_adapter()
     s.mount("https://", ad); s.mount("http://", ad)
     s.headers.update({
-        "User-Agent": "NBA-DailyResultsBot/3.3 (sports.ru primary, covers∪espn pairs, spoilers)",
+        # ВАЖНО: только ASCII в заголовках
+        "User-Agent": "NBA-DailyResultsBot/3.3 (sports.ru primary, covers+espn pairs, spoilers)",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
         "Connection": "close",
     })
@@ -560,7 +561,7 @@ def build_post() -> str:
         if p in seen: continue
         seen.add(p); ordered_pairs.append(p)
 
-    # Если обе пустые (крайне маловероятно) — fallback к sports.ru найденным парам
+    # Если обе пустые — fallback к sports.ru найденным парам
     if not ordered_pairs:
         ordered_pairs = list(sports_by_pair.keys())
 
@@ -580,7 +581,6 @@ def build_post() -> str:
         elif pair in espn_by_pair:
             blocks.append(build_block_from_espn(espn_by_pair[pair]))
         else:
-            # совсем редкий случай: ни один источник не дал матч
             a_abbr, b_abbr = tuple(pair)
             a_name = ABBR_TO_TEAM_RU.get(a_abbr, a_abbr); b_name = ABBR_TO_TEAM_RU.get(b_abbr, b_abbr)
             a_emo = team_emoji_by_abbr(a_abbr); b_emo = team_emoji_by_abbr(b_abbr)
@@ -598,7 +598,6 @@ def tg_send(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     r = S.post(url, json={
         "chat_id": CHAT_ID, "text": text,
-            # HTML-спойлеры
         "parse_mode": "HTML", "disable_web_page_preview": True,
     }, timeout=HTTP_TIMEOUT)
     if r.status_code != 200:
