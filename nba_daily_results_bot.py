@@ -1,149 +1,576 @@
-# --- НОВОЕ: источники пар и рекордов дня (BBR + ESPN site.api) ---
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
+"""
+NBA Daily Results → Telegram (RU)
+• Пары: ESPN site.api (основной) + BallDontLie (добавляем недостающие), по датам ET±1 и Europe/London.
+• Счёт/игроки/русские фамилии: приоритетно Sports.ru (боксскор), фоллбек — ESPN boxscore.
+• Рекорды (W-L) после матча: ESPN site.api.
+• Формат: названия команд и эмодзи видны, счёт и игроки завернуты в спойлеры. У победителя счёт жирным.
+• Правила выбора игроков:
+  – минимум один, максимум два на команду;
+  – второй добавляется, если ≥20 очков ИЛИ дабл-дабл ИЛИ ≥6 перехватов/блок-шотов;
+  – спец: если играл Егор Дёмин (BKN) или Влад Голдин (MIA) — показываем его с 3 максимальными метриками (жирным).
+"""
+
+import os, sys, re, json
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
+from urllib.parse import urlparse, urlunparse
+
+import requests
+from requests.adapters import HTTPAdapter
+try:
+    from urllib3.util.retry import Retry
+except Exception:
+    Retry = None
 from bs4 import BeautifulSoup
 
-# полные англ. названия -> аббревиатуры ESPN
-TEAM_ABBR = {
-    "Atlanta Hawks":"ATL","Boston Celtics":"BOS","Brooklyn Nets":"BKN","Charlotte Hornets":"CHA",
-    "Chicago Bulls":"CHI","Cleveland Cavaliers":"CLE","Dallas Mavericks":"DAL","Denver Nuggets":"DEN",
-    "Detroit Pistons":"DET","Golden State Warriors":"GSW","Houston Rockets":"HOU","Indiana Pacers":"IND",
-    "Los Angeles Clippers":"LAC","Los Angeles Lakers":"LAL","Memphis Grizzlies":"MEM","Miami Heat":"MIA",
-    "Milwaukee Bucks":"MIL","Minnesota Timberwolves":"MIN","New Orleans Pelicans":"NOP","New York Knicks":"NYK",
-    "Oklahoma City Thunder":"OKC","Orlando Magic":"ORL","Philadelphia 76ers":"PHI","Phoenix Suns":"PHX",
-    "Portland Trail Blazers":"POR","Sacramento Kings":"SAC","San Antonio Spurs":"SAS","Toronto Raptors":"TOR",
-    "Utah Jazz":"UTA","Washington Wizards":"WAS",
+# -------- ENV --------
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TEAM_EMOJI_JSON = os.getenv("TEAM_EMOJI_JSON", "").strip()  # опционально: {"BOS":"<custom_emoji>", ...}
+
+# -------- HTTP --------
+HTTP_TIMEOUT = 9
+
+def _mk_adapter():
+    if Retry is not None:
+        r = Retry(total=3, connect=3, read=3, backoff_factor=0.4,
+                  status_forcelist=[429,500,502,503,504],
+                  allowed_methods=["GET","POST"])
+        return HTTPAdapter(max_retries=r)
+    return HTTPAdapter(max_retries=2)
+
+def make_session():
+    s = requests.Session()
+    ad = _mk_adapter()
+    s.mount("https://", ad); s.mount("http://", ad)
+    s.headers.update({
+        "User-Agent": "NBA-DailyResultsBot/3.7 (espn+bdl pairs, sports.ru stats, spoilers)",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
+        "Connection": "close",
+    })
+    return s
+
+S = make_session()
+def log(*a): print(*a, file=sys.stderr)
+
+def _get_json(url: str) -> dict:
+    try:
+        r = S.get(url, timeout=HTTP_TIMEOUT)
+        if r.status_code != 200: return {}
+        return r.json()
+    except Exception:
+        return {}
+
+# -------- DATES --------
+RU_MONTHS = {1:"января",2:"февраля",3:"марта",4:"апреля",5:"мая",6:"июня",
+             7:"июля",8:"августа",9:"сентября",10:"октября",11:"ноября",12:"декабря"}
+def ru_date(d: date) -> str: return f"{d.day} {RU_MONTHS[d.month]}"
+def ru_plural(n: int, forms: tuple[str,str,str]) -> str:
+    n = abs(int(n)) % 100; n1 = n % 10
+    if 11 <= n <= 19: return forms[2]
+    if 2 <= n1 <= 4:  return forms[1]
+    if n1 == 1:      return forms[0]
+    return forms[2]
+
+def pick_report_date_london() -> date:
+    now = datetime.now(ZoneInfo("Europe/London"))
+    return now.date() if now.hour >= 11 else (now.date() - timedelta(days=1))
+
+def candidate_days() -> list[date]:
+    # Для ESPN/BDL гоняем несколько дат, чтобы поймать граничные игры
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    base_et = now_et.date() if now_et.hour >= 8 else (now_et.date() - timedelta(days=1))
+    lon = pick_report_date_london()
+    c = {base_et - timedelta(days=1), base_et, base_et + timedelta(days=1), lon}
+    return sorted(c)
+
+# -------- TEAMS / EMOJI --------
+TEAM_RU_TO_ABBR = {
+    "Атланта":"ATL","Бостон":"BOS","Бруклин":"BKN","Шарлотт":"CHA","Чикаго":"CHI",
+    "Кливленд":"CLE","Даллас":"DAL","Денвер":"DEN","Детройт":"DET","Голден Стэйт":"GSW",
+    "Хьюстон":"HOU","Индиана":"IND","Клипперс":"LAC","Лейкерс":"LAL","Мемфис":"MEM",
+    "Майами":"MIA","Милуоки":"MIL","Миннесота":"MIN","Новый Орлеан":"NOP","Нью-Йорк":"NYK",
+    "Оклахома-Сити":"OKC","Орландо":"ORL","Филадельфия":"PHI","Финикс":"PHX","Портленд":"POR",
+    "Сакраменто":"SAC","Сан-Антонио":"SAS","Торонто":"TOR","Юта":"UTA","Вашингтон":"WAS",
 }
+ABBR_TO_RU = {v:k for k,v in TEAM_RU_TO_ABBR.items()}
 
-def _bbr_schedule_url():
-    # Сезон 2025-26 — это NBA_2026_games.html
-    return "https://www.basketball-reference.com/leagues/NBA_2026_games.html"
+TEAM_EMOJI_DEFAULT = {
+    "ATL":"🦅","BOS":"☘️","BKN":"🕸️","CHA":"🐝","CHI":"🐂","CLE":"🛡️","DAL":"🐎","DEN":"⛏️","DET":"🔧",
+    "GSW":"🗡️","HOU":"🚀","IND":"💫","LAC":"✂️","LAL":"⭐","MEM":"🐻","MIA":"🔥","MIL":"🦌","MIN":"🐺",
+    "NOP":"🪶","NYK":"🗽","OKC":"⚡","ORL":"✨","PHI":"🔔","PHX":"☀️","POR":"🧭","SAC":"👑","SAS":"🪙",
+    "TOR":"🦖","UTA":"🎷","WAS":"🧙",
+}
+def load_team_emojis():
+    if TEAM_EMOJI_JSON:
+        try:
+            d = json.loads(TEAM_EMOJI_JSON)
+            if isinstance(d, dict):
+                return {k.upper(): str(v) for k,v in d.items()}
+        except Exception:
+            pass
+    return TEAM_EMOJI_DEFAULT
+TEAM_EMOJI = load_team_emojis()
+def emoji(abbr: str) -> str: return TEAM_EMOJI.get((abbr or "").upper(), "🏀")
 
-def _norm_txt(s: str) -> str:
-    return " ".join((s or "").replace("\xa0"," ").split())
+# -------- SPORTS.RU (день + боксскоры на русском) --------
+def day_url(d: date) -> str:
+    return f"https://www.sports.ru/stat/basketball/center/end/{d:%Y/%m/%d}.html"
 
-def fetch_pairs_from_bbr(day: date) -> list[dict]:
-    """
-    Читает таблицу расписания за день на Basketball-Reference и возвращает
-    финальные игры со счётом (12 для 24.10.2025).
-    Возврат: [{"home_en","away_en","home_abbr","away_abbr","home_score","away_score","ot"}]
-    """
-    url = _bbr_schedule_url()
-    r = S.get(url, timeout=25)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-    tbl = soup.find("table", id="schedule")
-    if not tbl:
-        return []
+def _normalize_match_url(u: str) -> str:
+    full = "https://www.sports.ru" + u if u.startswith("/") else u
+    p = urlparse(full); return urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
 
-    want_month = day.strftime("%b")       # Oct
-    want_day   = str(int(day.strftime("%d")))  # '24' без ведущего нуля
-    want_year  = day.strftime("%Y")       # 2025
+def _soup(url: str):
+    try:
+        r = S.get(url, timeout=HTTP_TIMEOUT)
+        if r.status_code != 200: return None
+        return BeautifulSoup(r.text, "html.parser")
+    except Exception:
+        return None
 
-    out = []
-    for tr in (tbl.select("tbody tr") or []):
-        # На некоторых строках могут быть заголовки/разделители
-        th = tr.find("th", attrs={"data-stat":"date_game"})
-        if not th: 
-            continue
-        dtxt = _norm_txt(th.get_text())
-        # Пример: 'Fri, Oct 24, 2025'
-        if (want_month not in dtxt) or (want_year not in dtxt) or (want_day not in dtxt):
-            continue
-
-        # Должен быть боксскор (финал), иначе пропускаем
-        bs = tr.find("td", attrs={"data-stat":"box_score_text"})
-        if not bs or not bs.find("a"):
-            continue
-
-        away_en = _norm_txt(tr.find("td", attrs={"data-stat":"visitor_team_name"}).get_text())
-        home_en = _norm_txt(tr.find("td", attrs={"data-stat":"home_team_name"}).get_text())
-        a_pts   = tr.find("td", attrs={"data-stat":"visitor_pts"})
-        h_pts   = tr.find("td", attrs={"data-stat":"home_pts"})
-        if not a_pts or not h_pts or not a_pts.get_text(strip=True) or not h_pts.get_text(strip=True):
-            continue  # не финал
-
-        away_pts = int(a_pts.get_text())
-        home_pts = int(h_pts.get_text())
-
-        ot = ""
-        ot_td = tr.find("td", attrs={"data-stat":"overtimes"})
-        if ot_td:
-            ot = _norm_txt(ot_td.get_text())  # '', 'OT', '2OT' ...
-
-        # маппим полные имена к ESPN-аббревиатурам (для рекордов)
-        away_abbr = TEAM_ABBR.get(away_en, "")
-        home_abbr = TEAM_ABBR.get(home_en, "")
-
-        out.append({
-            "home_en": home_en, "away_en": away_en,
-            "home_abbr": home_abbr, "away_abbr": away_abbr,
-            "home_score": home_pts, "away_score": away_pts,
-            "ot": ot,
-        })
+def collect_day_links(d: date) -> list[str]:
+    soup = _soup(day_url(d))
+    if not soup: return []
+    seen=set(); out=[]
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "/basketball/match/" not in href: continue
+        full = _normalize_match_url(href)
+        if full in seen: continue
+        seen.add(full); out.append(full)
     return out
 
-def fetch_team_records_from_espn(day: date) -> dict[tuple[str,str], dict]:
-    """
-    Берём «послематчевые» W-L у ESPN (ВАЖНО: используем site.api, а не site.web.api).
-    Возвращает словарь ключом (home_abbr, away_abbr) в любом порядке, значением:
-      {"home_abbr":..., "home_record": "2-0", "away_abbr":..., "away_record":"0-2"}
-    """
-    url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates={day.strftime('%Y%m%d')}"
-    j = _get_json(url)
-    rec_map = {}  # (H,A) или (A,H) -> data
+def _canonical_ru_team(raw: str) -> str | None:
+    if not raw: return None
+    t = raw.replace("«","").replace("»","").strip()
+    t = re.sub(r"\(.*?\)", "", t).strip()
+    for k in TEAM_RU_TO_ABBR:
+        if t.startswith(k) or k in t:
+            return k
+    return None
 
+def parse_sports_match(url: str) -> dict | None:
+    soup = _soup(url)
+    if not soup: return None
+    text = soup.get_text(" ", strip=True)
+
+    m = re.search(r"(\d+)\s:\s(\d+)", text)
+    if not m: return None
+    scoreA, scoreB = int(m.group(1)), int(m.group(2))
+
+    # OT по числу «периодов» рядом
+    tail = text[m.end():m.end()+240]
+    add = re.findall(r"\d+\s:\s\d+", tail)
+    ot = max(len(add)-4, 0) if add else 0
+
+    # команды через og:title и заголовки таблиц
+    meta = soup.find("meta", attrs={"property":"og:title"})
+    title = meta.get("content") if meta and meta.get("content") else (soup.title.string if soup.title else "")
+    teamA = teamB = None
+    if title and "—" in title:
+        left, right = [x.strip() for x in title.split("—", 1)]
+        teamA = _canonical_ru_team(left); teamB = _canonical_ru_team(right)
+    if not (teamA and teamB) or (teamA == teamB):
+        heads=[]
+        for h in soup.find_all(["h2","h3","h4"]):
+            t = h.get_text(" ", strip=True).lower()
+            if "статистика игроков" in t:
+                k = _canonical_ru_team(h.get_text(" ", strip=True).split(".")[0])
+                if k: heads.append(k)
+        if len(heads) >= 2:
+            teamA = teamA or heads[0]
+            teamB = teamB or next((x for x in heads[1:] if x != teamA), None)
+    if not (teamA and teamB) or teamA == teamB: return None
+
+    a_abbr = TEAM_RU_TO_ABBR.get(teamA,""); b_abbr = TEAM_RU_TO_ABBR.get(teamB,"")
+    if not a_abbr or not b_abbr: return None
+
+    def read_rows(team_ru_key: str) -> list[dict]:
+        rows=[]; stamp = team_ru_key.lower()
+        anchor=None
+        for h in soup.find_all(["h2","h3","h4"]):
+            t = h.get_text(" ", strip=True)
+            if "статистика игроков" in t.lower() and stamp in t.lower().split(".")[0]:
+                anchor=h; break
+        if not anchor: return rows
+        table = anchor.find_next("table")
+        if not table: return rows
+        for tr in table.find_all("tr"):
+            tds = [td.get_text(" ", strip=True) for td in tr.find_all(["td","th"])]
+            if not tds: continue
+            if any(x.lower().startswith("игрок") for x in tds): continue
+            # имя
+            name_idx=None
+            for i,cell in enumerate(tds[:3]):
+                if re.search(r"[^\d/:% ]", cell):
+                    name_idx=i; break
+            if name_idx is None: continue
+            name = tds[name_idx]
+            nums = tds[name_idx+1:]
+            if len(nums) < 14: continue
+            def as_int(x: str) -> int:
+                try: return int(x)
+                except:
+                    try: return int(float(x))
+                    except: return 0
+            pts = as_int(nums[0]); reb = as_int(nums[7]); ast = as_int(nums[8])
+            stl = as_int(nums[10]); blk = as_int(nums[12])
+            rows.append({"name": name, "pts": pts, "reb": reb, "ast": ast, "stl": stl, "blk": blk})
+        return rows
+
+    rowsA = read_rows(teamA); rowsB = read_rows(teamB)
+    finished = bool(rowsA or rowsB)
+
+    return {
+        "teamA": {"name": teamA, "abbr": a_abbr, "emoji": emoji(a_abbr), "score": scoreA},
+        "teamB": {"name": teamB, "abbr": b_abbr, "emoji": emoji(b_abbr), "score": scoreB},
+        "ot": ot, "finished": finished,
+        "players": {teamA: rowsA, teamB: rowsB},
+        "url": url,
+    }
+
+# -------- ESPN site.api (пары, рекорды, игроки фоллбек) --------
+ESPN_SB = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates={ymd}"
+ESPN_BOX = "https://site.web.api.espn.com/apis/v2/sports/basketball/nba/boxscore?event={eid}"
+
+def _espn_record(c: dict) -> str:
+    for r in c.get("records") or []:
+        if r.get("type") == "total" and r.get("summary"):
+            return r["summary"]
+    return ""
+
+def fetch_espn_events_for_day(d: date) -> list[dict]:
+    j = _get_json(ESPN_SB.format(ymd=d.strftime("%Y%m%d")))
+    out=[]
     for ev in (j.get("events") or []):
         try:
-            comp = (ev.get("competitions") or [])[0]
+            comp = (ev.get("competitions") or [None])[0] or {}
             comps = comp.get("competitors") or []
-            if len(comps) != 2:
-                continue
-            # ESPN может не отдавать «home/away» флаг одинаково, поэтому вытащим isHome
-            home_c = next(c for c in comps if c.get("homeAway") == "home")
-            away_c = next(c for c in comps if c.get("homeAway") == "away")
-            def rec_of(c):
-                for r in c.get("records") or []:
-                    if r.get("type") == "total" and r.get("summary"):
-                        return r["summary"]  # '2-0'
-                return ""
-            h_abbr = (home_c.get("team") or {}).get("abbreviation","")
-            a_abbr = (away_c.get("team") or {}).get("abbreviation","")
-            rec_map[(h_abbr, a_abbr)] = {
-                "home_abbr": h_abbr, "away_abbr": a_abbr,
-                "home_record": rec_of(home_c), "away_record": rec_of(away_c),
-            }
+            if len(comps) != 2: continue
+            # home/away
+            home = next(c for c in comps if c.get("homeAway")=="home")
+            away = next(c for c in comps if c.get("homeAway")=="away")
+            th = (home.get("team") or {}); ta = (away.get("team") or {})
+            abbr_h = (th.get("abbreviation") or "").upper()
+            abbr_a = (ta.get("abbreviation") or "").upper()
+            if abbr_h == "GS": abbr_h = "GSW"
+            if abbr_a == "GS": abbr_a = "GSW"
+
+            status = (ev.get("status") or {}).get("type") or {}
+            completed = bool(status.get("completed", False))
+            period = int(status.get("period") or 0)
+            ot = max(period - 4, 0) if completed and period>4 else 0
+
+            def as_int(x):
+                try: return int(float(x))
+                except: return 0
+
+            out.append({
+                "eventId": str(ev.get("id") or ""),
+                "home": {
+                    "abbr": abbr_h, "teamId": str(th.get("id") or ""),
+                    "score": as_int(home.get("score", 0)),
+                    "winner": bool(home.get("winner", False)),
+                    "record": _espn_record(home),
+                },
+                "away": {
+                    "abbr": abbr_a, "teamId": str(ta.get("id") or ""),
+                    "score": as_int(away.get("score", 0)),
+                    "winner": bool(away.get("winner", False)),
+                    "record": _espn_record(away),
+                },
+                "completed": completed,
+                "ot": ot,
+            })
         except Exception:
             continue
-    return rec_map
+    return out
 
-# --- НОВОЕ: замена прежнего «списка матчей» на BBR, с фоллбеком на прежний источник, если что-то пойдёт не так
-def collect_games_for_day(day: date) -> list[dict]:
-    """
-    Главный список матчей дня. Сперва берём Basketball-Reference (полный набор).
-    Если пусто — фоллбек на прежний метод (если он у тебя назывался иначе, скорректируй вызов).
-    Каждый элемент:
-      {
-        "home_en","away_en","home_abbr","away_abbr",
-        "home_score","away_score","ot",
-        # + "home_record","away_record" (добавим ниже)
-      }
-    """
-    games = fetch_pairs_from_bbr(day)
-    if not games:
-        # Fallback: если раньше у тебя был сбор пар из sports.ru, можешь подставить его здесь:
-        # games = fetch_pairs_from_sportsru(day)  # <- оставь как было у тебя
-        return []
+def fetch_espn_events_multi(days: list[date]) -> dict[frozenset, dict]:
+    # объединяем по парам; сохраняем только completed
+    seen={}
+    for d in days:
+        for e in fetch_espn_events_for_day(d):
+            if not e.get("completed"):  # нужны финалы
+                continue
+            key = frozenset([e["home"]["abbr"], e["away"]["abbr"]])
+            if key in seen:  # уже есть — ок
+                continue
+            seen[key] = e
+    return seen  # pair -> event
 
-    # приклеим W-L из ESPN (site.api)
-    rec_map = fetch_team_records_from_espn(day)
-    for g in games:
-        key = (g["home_abbr"], g["away_abbr"])
-        # иногда ESPN даёт другие аббревиатуры? Тогда попробуем и обратный ключ
-        data = rec_map.get(key) or rec_map.get((key[1], key[0]))
-        if data:
-            g["home_record"] = data.get("home_record","")
-            g["away_record"] = data.get("away_record","")
+def fetch_espn_players(event_id: str) -> dict:
+    j = _get_json(ESPN_BOX.format(eid=event_id))
+    out={}
+    for team_block in (j.get("players") or []):
+        team = team_block.get("team") or {}
+        tid = str(team.get("id") or "")
+        arr=[]
+        for grp in (team_block.get("statistics") or []):
+            for a in (grp.get("athletes") or []):
+                ath = a.get("athlete") or {}
+                nm = (ath.get("displayName") or "").strip()
+                stats={}
+                for k,v in (a.get("stats") or {}).items(): stats[k.lower()] = v
+                for k,v in (ath.get("stats") or {}).items(): stats.setdefault(k.lower(), v)
+                def iget(*keys, default=0):
+                    for k in keys:
+                        if k in stats:
+                            try: return int(stats[k])
+                            except:
+                                try: return int(float(stats[k]))
+                                except: pass
+                    return default
+                pts=iget("points","pts"); reb=iget("rebounds","reb","reboundstotal")
+                ast=iget("assists","ast"); stl=iget("steals","stl"); blk=iget("blocks","blk")
+                if any([pts,reb,ast,stl,blk]):
+                    arr.append({"name": nm, "pts": pts, "reb": reb, "ast": ast, "stl": stl, "blk": blk})
+        # merge by name (max)
+        merged={}
+        for p in arr:
+            if p["name"] not in merged: merged[p["name"]] = p
+            else:
+                m = merged[p["name"]]
+                for k in ("pts","reb","ast","stl","blk"): m[k] = max(m[k], p[k])
+        out[tid] = list(merged.values())
+    return out
+
+# -------- BallDontLie (страховка для списка пар) --------
+BDL = "https://www.balldontlie.io/api/v1/games?dates[]={ymd}&per_page=100"
+def fetch_bdl_pairs_multi(days: list[date]) -> list[frozenset]:
+    seen=set(); out=[]
+    for d in days:
+        j = _get_json(BDL.format(ymd=d.strftime("%Y-%m-%d")))
+        for g in (j.get("data") or []):
+            try:
+                h = (g.get("home_team") or {}).get("abbreviation") or ""
+                v = (g.get("visitor_team") or {}).get("abbreviation") or ""
+                if not (h and v): continue
+                if str(g.get("status","")).lower() not in {"final","ft","final/ot","final/2ot","final/3ot"}:
+                    continue
+                key = frozenset([h, v])
+                if key in seen: continue
+                seen.add(key); out.append(key)
+            except Exception:
+                continue
+    return out
+
+# -------- Игроки/линии --------
+def initials_ru(full: str) -> str:
+    parts = [p for p in re.split(r"\s+", (full or "").strip()) if p]
+    if not parts: return full or ""
+    if len(parts) == 1: return parts[0]
+    first = parts[0]; last = parts[-1]
+    # нормализуем «мл.»/«ст.»
+    if last.lower() in {"jr.","jr","мл.","ст.","sr.","sr"} and len(parts)>=3:
+        last = parts[-2] + " " + parts[-1]
+    return f"{first[0]}. {last}"
+
+def ru_forms(label: str, v: int) -> str:
+    if label=="pts": return f"{v} {ru_plural(v, ('очко','очка','очков'))}"
+    if label=="reb": return f"{v} {ru_plural(v, ('подбор','подбора','подборов'))}"
+    if label=="ast": return f"{v} {ru_plural(v, ('передача','передачи','передач'))}"
+    if label=="stl": return f"{v} {ru_plural(v, ('перехват','перехвата','перехватов'))}"
+    if label=="blk": return f"{v} {ru_plural(v, ('блок-шот','блок-шота','блок-шотов'))}"
+    return f"{v}"
+
+def hot_mark(p: dict) -> str:
+    if (p["pts"]>=35) or (p["reb"]>=15) or (p["ast"]>=12) or (p["stl"]>=5) or (p["blk"]>=5):
+        return " 🔥"
+    return ""
+
+def is_dd(p: dict) -> bool:
+    return sum(x>=10 for x in [p["pts"],p["reb"],p["ast"],p["stl"],p["blk"]]) >= 2
+
+def second_ok(p: dict) -> bool:
+    return (p["pts"]>=20) or is_dd(p) or (p["stl"]>=6) or (p["blk"]>=6)
+
+def score_key(p: dict): return (p["pts"], p["reb"]+p["ast"], p["stl"]+p["blk"])
+
+def pick_team_players(abbr: str, rows: list[dict]) -> list[tuple[dict,bool,bool]]:
+    # [(player, bold, special_detail)]
+    if not rows: return []
+    rows = sorted(rows, key=score_key, reverse=True)
+    special_keys = []
+    if abbr=="BKN": special_keys = ["дёмин","demin"]
+    if abbr=="MIA": special_keys = ["голдин","goldin"]
+    special=None
+    for p in rows:
+        nm = (p["name"] or "").lower()
+        if any(k in nm for k in special_keys):
+            special=p; break
+    out=[]
+    top = rows[0]
+    if special and special["name"] == top["name"]:
+        out.append((special, True, True))
+    elif special:
+        out.append((top, False, False)); out.append((special, True, True))
+    else:
+        out.append((top, False, False))
+    if len(out)<2:
+        for p in rows[1:]:
+            if p["name"] == top["name"]: continue
+            if second_ok(p): out.append((p, False, False)); break
+    return out[:2]
+
+def format_player_regular(p: dict, bold=False) -> str:
+    name = initials_ru(p["name"])
+    if bold: name = f"<b>{name}</b>"
+    parts=[("pts",p["pts"]),("reb",p["reb"]),("ast",p["ast"]),("stl",p["stl"]),("blk",p["blk"])]
+    out = [ru_forms("pts", p["pts"])]
+    if p["reb"]>=5: out.append(ru_forms("reb", p["reb"]))
+    if p["ast"]>=5: out.append(ru_forms("ast", p["ast"]))
+    if p["stl"]>=4: out.append(ru_forms("stl", p["stl"]))
+    if p["blk"]>=4: out.append(ru_forms("blk", p["blk"]))
+    return f"{name}: " + ", ".join(out) + hot_mark(p)
+
+def format_player_special(p: dict) -> str:
+    name = f"<b>{initials_ru(p['name'])}</b>"
+    stats=[("pts",p["pts"]),("reb",p["reb"]),("ast",p["ast"]),("stl",p["stl"]),("blk",p["blk"])]
+    stats=[(k,v) for k,v in stats if v>0]
+    stats.sort(key=lambda kv: kv[1], reverse=True)
+    chosen=stats[:3]
+    return f"{name}: " + ", ".join(ru_forms(k,v) for k,v in chosen) + hot_mark(p)
+
+# -------- Спойлер --------
+def sp(s: str) -> str: return f'<span class="tg-spoiler">{s}</span>'
+SEP = "–––––––––––––––––––––––"
+
+# -------- Блоки --------
+def format_score_line(name_ru: str, abbr: str, score: int, winner: bool, record: str, ot_str: str) -> str:
+    score_txt = f"<b>{score}</b>" if winner else f"{score}"
+    if ot_str and not winner: score_txt += ot_str
+    if record: score_txt += f" ({record})"
+    return f"{emoji(abbr)} {name_ru}: {sp(score_txt)}"
+
+def build_block_from_sports(info: dict, records: dict[str,str]) -> str:
+    A,B = info["teamA"], info["teamB"]
+    ot_str = "" if info["ot"]==0 else (" (ОТ)" if info["ot"]==1 else f" ({info['ot']} ОТ)")
+    a_win = A["score"] > B["score"]; b_win = B["score"] > A["score"]
+    head = (
+        f"{format_score_line(A['name'], A['abbr'], A['score'], a_win, records.get(A['abbr'],""), '')}\n"
+        f"{format_score_line(B['name'], B['abbr'], B['score'], b_win, records.get(B['abbr'],""), ot_str)}\n\n"
+    )
+    rowsA = info["players"].get(A["name"], []); rowsB = info["players"].get(B["name"], [])
+    al = [sp(format_player_special(p) if det else format_player_regular(p, bold))
+          for (p,bold,det) in pick_team_players(A["abbr"], rowsA)]
+    bl = [sp(format_player_special(p) if det else format_player_regular(p, bold))
+          for (p,bold,det) in pick_team_players(B["abbr"], rowsB)]
+    lines=[]
+    if al: lines.extend(al)
+    if al and bl: lines.append("")  # пустая строка между командами
+    if bl: lines.extend(bl)
+    return head + ("\n".join(lines) if lines else "")
+
+def build_block_from_espn(e: dict) -> str:
+    h, a = e["home"], e["away"]
+    name_h = ABBR_TO_RU.get(h["abbr"], h["abbr"]); name_a = ABBR_TO_RU.get(a["abbr"], a["abbr"])
+    ot_str = "" if e["ot"]==0 else (" (ОТ)" if e["ot"]==1 else f" ({e['ot']} ОТ)")
+    head = (
+        f"{format_score_line(name_h, h['abbr'], h['score'], h['winner'], h.get('record',''), '')}\n"
+        f"{format_score_line(name_a, a['abbr'], a['score'], a['winner'], a.get('record',''), ot_str)}\n\n"
+    )
+    players_by_tid = fetch_espn_players(e["eventId"])
+    rowsH = players_by_tid.get(h["teamId"], []); rowsA = players_by_tid.get(a["teamId"], [])
+    al = [sp(format_player_special(p) if det else format_player_regular(p, bold))
+          for (p,bold,det) in pick_team_players(h["abbr"], rowsH)]
+    bl = [sp(format_player_special(p) if det else format_player_regular(p, bold))
+          for (p,bold,det) in pick_team_players(a["abbr"], rowsA)]
+    lines=[]
+    if al: lines.extend(al)
+    if al and bl: lines.append("")
+    if bl: lines.extend(bl)
+    return head + ("\n".join(lines) if lines else "")
+
+# -------- Сбор матчей дня --------
+def fetch_sports_games_for_title_day(d_title: date) -> dict[frozenset, dict]:
+    # только те, что удалось распарсить как НБА (по карте названий)
+    games={}
+    for url in collect_day_links(d_title):
+        info = parse_sports_match(url)
+        if not info or not info["finished"]:  # берём только готовые боксскоры
+            continue
+        pair = frozenset([info["teamA"]["abbr"], info["teamB"]["abbr"]])
+        if pair in games:  # уникализируем
+            continue
+        games[pair] = info
+    return games  # pair -> sports.info
+
+def build_post() -> str:
+    d_title = pick_report_date_london()
+    days = candidate_days()
+
+    # 1) Пары и рекорды: ESPN (completed) по нескольким дням
+    espn_by_pair = fetch_espn_events_multi(days)  # pair -> event
+
+    # 2) Добавка недостающих пар через BallDontLie
+    bdl_pairs = fetch_bdl_pairs_multi(days)
+    for p in bdl_pairs:
+        if p not in espn_by_pair:
+            # создаём «пустышку» без рекордов/ивента — доберём контент дальше
+            a,b = tuple(p)
+            espn_by_pair[p] = {
+                "eventId": "",
+                "home": {"abbr": a, "teamId":"", "score": 0, "winner": False, "record": ""},
+                "away": {"abbr": b, "teamId":"", "score": 0, "winner": False, "record": ""},
+                "completed": True, "ot": 0
+            }
+
+    # 3) Контент: Sports.ru для даты заголовка (русские фамилии/статы/точные счёты)
+    sports_by_pair = fetch_sports_games_for_title_day(d_title)
+
+    # 4) Итоговый порядок: сначала ESPN пары (как более полная сетка), при наличии — заменяем блоком Sports.ru
+    ordered_pairs = list(espn_by_pair.keys())
+    title_count = len(ordered_pairs)
+    title = f"НБА • {ru_date(d_title)} • {title_count} {ru_plural(title_count, ('матч','матча','матчей'))}\n"
+    title += "Результаты надёжно спрятаны 👇\n"
+    title += SEP + "\n\n"
+
+    if title_count == 0:
+        return title.rstrip()
+
+    blocks=[]
+    for i, pair in enumerate(ordered_pairs, 1):
+        if pair in sports_by_pair:
+            # передаём карту рекордов abbr->record, если она есть в ESPN
+            ev = espn_by_pair.get(pair, {})
+            rec_map = {}
+            if ev:
+                rec_map[ev["home"]["abbr"]] = ev["home"].get("record","")
+                rec_map[ev["away"]["abbr"]] = ev["away"].get("record","")
+            blocks.append(build_block_from_sports(sports_by_pair[pair], rec_map))
         else:
-            g["home_record"] = ""
-            g["away_record"] = ""
-    return games
+            # фоллбек чисто на ESPN (счёт/игроки англ., но формат/спойлеры те же)
+            blocks.append(build_block_from_espn(espn_by_pair[pair]))
+        if i < title_count:
+            blocks.append("\n" + SEP + "\n\n")
+
+    return (title + "".join(blocks)).strip()
+
+# -------- Telegram --------
+def tg_send(text: str):
+    if not (BOT_TOKEN and CHAT_ID):
+        raise RuntimeError("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы")
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    r = S.post(url, json={
+        "chat_id": CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }, timeout=HTTP_TIMEOUT)
+    if r.status_code != 200:
+        raise RuntimeError(f"Telegram error {r.status_code}: {r.text}")
+
+# -------- MAIN --------
+if __name__ == "__main__":
+    try:
+        text = build_post()
+        tg_send(text)
+        print("OK")
+    except Exception as e:
+        print("ERROR:", repr(e), file=sys.stderr)
+        sys.exit(1)
