@@ -69,7 +69,7 @@ def make_session():
               allowed_methods=["GET","POST"])
     s.mount("https://", HTTPAdapter(max_retries=r))
     s.headers.update({
-        "User-Agent": "NBA-DailyResultsBot/2.5 (+espn; sports.ru resolver)",
+        "User-Agent": "NBA-DailyResultsBot/2.6 (+espn; sports.ru resolver)",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
     })
     return s
@@ -88,7 +88,26 @@ def _save_json(path: str, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
-# ---------- sports.ru: русское имя+фамилия ----------
+# ---------- transliteration (fallback when sports.ru not found) ----------
+_TR_MAP = [
+    ("sch","ш"),("sh","ш"),("ch","ч"),("kh","х"),("ts","ц"),("ya","я"),("yu","ю"),
+    ("ye","е"),("yo","ё"),("zh","ж"),("ph","ф"),
+]
+_TR_LET = {
+    "a":"а","b":"б","c":"к","d":"д","e":"е","f":"ф","g":"г","h":"х","i":"и","j":"дж","k":"к",
+    "l":"л","m":"м","n":"н","o":"о","p":"п","q":"к","r":"р","s":"с","t":"т","u":"у","v":"в",
+    "w":"в","x":"кс","y":"и","z":"з",
+}
+def translit_en_to_ru(s: str) -> str:
+    t = s.strip().lower()
+    for pat,rep in _TR_MAP:
+        t = re.sub(pat, rep, t)
+    out = "".join(_TR_LET.get(ch, ch) for ch in t)
+    # капитaлизация
+    if out: out = out[0].upper() + out[1:]
+    return out or s
+
+# ---------- sports.ru resolver ----------
 def _slugify(first: str, last: str) -> str:
     base = f"{first} {last}".strip()
     base = unicodedata.normalize("NFKD", base)
@@ -107,13 +126,11 @@ def _sportsru_try_profile(first: str, last: str) -> str | None:
     return None
 
 def _rus_first_last_from_header(text: str) -> tuple[str,str] | None:
-    # ожидаем "Имя Фамилия" (иногда 3 слова). Берём первое как имя, последнее как фамилию.
     full = " ".join(text.split())
     parts = [p for p in re.split(r"\s+", full) if p]
     if len(parts) >= 2:
         ru_first = parts[0]
         ru_last  = parts[-1]
-        # суффикс младший
         if ru_last.lower() in {"мл.", "младший"} and len(parts) >= 3:
             ru_last = parts[-2] + " мл."
         return ru_first, ru_last
@@ -168,19 +185,10 @@ def _queue_pending(pid: str, first: str, last: str):
     RU_PENDING.append({"id": pid, "first": first, "last": last})
     _session_pending_ids.add(pid)
 
-def _latin_initial_to_cyr(first_en: str) -> str:
-    if not first_en: return "?"
-    ch = first_en.strip()[0].upper()
-    table = {
-        "A":"А","B":"Б","C":"К","D":"Д","E":"Е","F":"Ф","G":"Г","H":"Х","I":"И",
-        "J":"Д","K":"К","L":"Л","M":"М","N":"Н","O":"О","P":"П","Q":"К","R":"Р",
-        "S":"С","T":"Т","U":"У","V":"В","W":"В","X":"К","Y":"Й","Z":"З"
-    }
-    return table.get(ch, ch)
-
 def resolve_ru_name(first_en: str, last_en: str, athlete_id: str) -> tuple[str,str]:
     """
-    Возвращает (ru_first, ru_last). Кэш RU_MAP допускает старый формат (только фамилия-строка).
+    Возвращает (ru_first, ru_last).
+    При неудаче: фамилию транслитерируем.
     """
     if athlete_id and athlete_id in RU_MAP:
         val = RU_MAP[athlete_id]
@@ -189,7 +197,6 @@ def resolve_ru_name(first_en: str, last_en: str, athlete_id: str) -> tuple[str,s
         else:
             return ("", str(val))
 
-    # 1) sports.ru прямой профиль
     url = _sportsru_try_profile(first_en or "", last_en or "")
     if url:
         got = _sportsru_from_profile(url)
@@ -198,16 +205,16 @@ def resolve_ru_name(first_en: str, last_en: str, athlete_id: str) -> tuple[str,s
             if athlete_id: RU_MAP[athlete_id] = {"first": ru_first, "last": ru_last}
             return ru_first, ru_last
 
-    # 2) sports.ru поиск
     got = _sportsru_search(first_en or "", last_en or "")
     if got:
         ru_first, ru_last = got
         if athlete_id: RU_MAP[athlete_id] = {"first": ru_first, "last": ru_last}
         return ru_first, ru_last
 
-    # 3) исключения/фоллбэк по фамилии
-    ru_last = EXCEPT_LAST.get(last_en or "", "") or (last_en or "")
+    # исключения или транслитерация
+    ru_last = EXCEPT_LAST.get(last_en or "", "") or translit_en_to_ru(last_en or "")
     if athlete_id: _queue_pending(athlete_id, first_en or "", last_en or "")
+    # имя нам нужно только для инициала: пусть останется пустым — инициал сделаем из EN.
     return ("", ru_last)
 
 # ---------- HTTP ----------
@@ -258,7 +265,7 @@ def fetch_scoreboard(day: date) -> list[dict]:
                 abbr = (team.get("abbreviation") or "").upper()
                 if abbr == "GS": abbr = "GSW"
 
-                # leaders (фоллбэк)
+                # leaders (фоллбэк/дополнение)
                 leaders_raw = c.get("leaders") or []
                 leaders = {}
                 for ld in leaders_raw:
@@ -359,6 +366,29 @@ def parse_players_from_box(box: dict) -> dict:
         out[tid] = list(col.values())
     return out
 
+# ---- merge box players with scoreboard leaders (fill missing stats) ----
+def merge_with_leaders(players: list[dict], leaders: dict) -> list[dict]:
+    if not players and not leaders: return players
+    by_id = {p["id"]: p for p in players}
+    def apply(cat, key):
+        for item in leaders.get(cat, []) or []:
+            pid = item.get("id","")
+            if not pid: continue
+            val = int(float(item.get("value") or 0))
+            if pid in by_id:
+                by_id[pid][key] = max(by_id[pid].get(key, 0), val)
+            else:
+                by_id[pid] = {
+                    "id": pid,
+                    "first": item.get("first",""),
+                    "last": item.get("last",""),
+                    "name": item.get("name",""),
+                    "pts": 0, "reb": 0, "ast": 0, "stl": 0, "blk": 0
+                }
+                by_id[pid][key] = val
+    apply("points","pts"); apply("rebounds","reb"); apply("assists","ast"); apply("steals","stl"); apply("blocks","blk")
+    return list(by_id.values())
+
 def _flame(pts:int, reb:int, ast:int, stl:int, blk:int) -> str:
     dd = sum(v>=10 for v in (pts,reb,ast))
     td = dd >= 3
@@ -366,14 +396,39 @@ def _flame(pts:int, reb:int, ast:int, stl:int, blk:int) -> str:
         return " 🔥"
     return ""
 
+def _latin_initial_to_cyr(first_en: str) -> str:
+    if not first_en:
+        return ""
+    ch = first_en.strip()[0].upper()
+    table = {
+        "A":"А","B":"Б","C":"К","D":"Д","E":"Е","F":"Ф","G":"Г","H":"Х","I":"И",
+        "J":"Д","K":"К","L":"Л","M":"М","N":"Н","O":"О","P":"П","Q":"К","R":"Р",
+        "S":"С","T":"Т","U":"У","V":"В","W":"В","X":"К","Y":"Й","Z":"З"
+    }
+    return table.get(ch, ch)
+
 def display_name_ru(p: dict, ru_first: str, ru_last: str) -> str:
-    # формируем "И. Фамилия"
+    # формируем "И. Фамилия" гарантированно по-русски
+    initial = ""
     if ru_first:
-        init = ru_first.strip()[0].upper()
+        initial = ru_first.strip()[0].upper()
     else:
-        init = _latin_initial_to_cyr(p.get("first",""))
-    surname = (ru_last or p.get("last") or p.get("name") or "Игрок").strip()
-    return f"{init}. {surname}"
+        # пробуем из EN first, иначе из display name
+        base_first = (p.get("first") or "")
+        if not base_first and p.get("name"):
+            base_first = p["name"].split()[0]
+        initial = _latin_initial_to_cyr(base_first) or "?"
+
+    surname = (ru_last or "").strip()
+    if not surname:
+        # берём EN last → транслитерация, если пусто — из name последний токен
+        last_en = (p.get("last") or "")
+        if not last_en and p.get("name"):
+            parts = p["name"].split()
+            last_en = parts[-1] if len(parts) >= 1 else ""
+        surname = translit_en_to_ru(last_en or "Игрок")
+
+    return f"{initial}. {surname}"
 
 def fmt_stat_line_ru(p: dict, ru_first: str, ru_last: str, bold: bool=False) -> str:
     name = display_name_ru(p, ru_first, ru_last)
@@ -421,25 +476,6 @@ def select_highlights(players: list[dict], abbr: str) -> list[tuple[dict,bool]]:
         out.append((p, bool(spec and p["id"] == spec["id"])))
     return out
 
-def leaders_to_players(leaders: dict) -> list[dict]:
-    by_id: dict[str, dict] = {}
-    def add(cat, key):
-        for item in leaders.get(cat, []) or []:
-            pid = item.get("id","")
-            if not pid: continue
-            m = by_id.setdefault(pid, {
-                "id": pid, "first": item.get("first",""), "last": item.get("last",""),
-                "name": item.get("name","") or f"{item.get('first','')} {item.get('last','')}".strip(),
-                "pts":0,"reb":0,"ast":0,"stl":0,"blk":0
-            })
-            try:
-                v = int(float(item.get("value") or 0))
-            except Exception:
-                v = 0
-            m[key] = max(m[key], v)
-    add("points","pts"); add("rebounds","reb"); add("assists","ast"); add("steals","stl"); add("blocks","blk")
-    return list(by_id.values())
-
 SEP = "–––––––––––––––––––––––"
 
 def _team_line_text(abbr: str, score: int, record: str, winner: bool, ot_suffix: str, entities, offset_ref) -> str:
@@ -462,6 +498,7 @@ def build_game_block(game: dict, entities, offset_ref) -> str:
     comp = game["competitors"]
     if len(comp) != 2: return ""
     a, b = comp[0], comp[1]
+
     head_a = _team_line_text(a["abbr"], a["score"], a["record"], a["winner"], "", entities, offset_ref)
     head_b = _team_line_text(b["abbr"], b["score"], b["record"], b["winner"], game.get("ot",""), entities, offset_ref)
     head = head_a + "\n" + head_b + "\n"
@@ -476,8 +513,8 @@ def build_game_block(game: dict, entities, offset_ref) -> str:
 
     def lines_for_team(c):
         arr = players_by_team.get(c["teamId"], [])
-        if not arr:
-            arr = leaders_to_players(game.get("leaders_by_abbr", {}).get(c["abbr"], {}))
+        # дополним недостающие значения из leaders (assists, rebounds, blocks…)
+        arr = merge_with_leaders(arr, game.get("leaders_by_abbr", {}).get(c["abbr"], {}))
         picks = select_highlights(arr, c["abbr"])
         out = []
         for p, bold in picks:
@@ -492,10 +529,8 @@ def build_game_block(game: dict, entities, offset_ref) -> str:
     if lb: lines.extend(lb)
 
     if added == 0:
-        all_players = (players_by_team.get(a["teamId"], []) or []) + (players_by_team.get(b["teamId"], []) or [])
-        if not all_players:
-            for ab in (a["abbr"], b["abbr"]):
-                all_players += leaders_to_players(game.get("leaders_by_abbr", {}).get(ab, {}))
+        all_players = merge_with_leaders(players_by_team.get(a["teamId"], []), game.get("leaders_by_abbr", {}).get(a["abbr"], {})) \
+                    + merge_with_leaders(players_by_team.get(b["teamId"], []), game.get("leaders_by_abbr", {}).get(b["abbr"], {}))
         if all_players:
             best = sorted(all_players, key=lambda p: (p.get("pts",0), p.get("reb",0)+p.get("ast",0), p.get("stl",0)+p.get("blk",0)), reverse=True)[0]
             ru_first, ru_last = resolve_ru_name(best.get("first",""), best.get("last",""), best.get("id",""))
