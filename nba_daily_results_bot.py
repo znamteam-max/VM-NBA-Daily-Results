@@ -2,11 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-NBA Daily Results → Telegram (RU), OFFICIAL NBA (cdn.nba.com)
+NBA Daily Results → Telegram (RU), OFFICIAL NBA (cdn.nba.com with data.nba.net fallback)
 
-• Табло:   https://cdn.nba.com/static/json/liveData/scoreboard/scoreboard_YYYYMMDD.json
-           (фоллбэк для «сегодня»: todaysScoreboard_00.json)
-• Бокскор: https://cdn.nba.com/static/json/liveData/boxscore/boxscore_{gameId}.json
+• Табло (основной): https://cdn.nba.com/static/json/liveData/scoreboard/scoreboard_YYYYMMDD.json
+  Фоллбэк:         https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json
+  Резерв:          https://data.nba.net/10s/prod/v1/YYYYMMDD/scoreboard.json
+
+• Бокскор (основной): https://cdn.nba.com/static/json/liveData/boxscore/boxscore_{gameId}.json
+  Резерв:            https://data.nba.net/10s/prod/v1/{YYYYMMDD}/{gameId}_boxscore.json
 
 • Игроки к показу (1–2 на команду):
     - очки ≥ 30, ИЛИ
@@ -17,13 +20,12 @@ NBA Daily Results → Telegram (RU), OFFICIAL NBA (cdn.nba.com)
 • Отображение стат: всегда очки; дополнительно выводим ТОЛЬКО если пороги пройдены:
     REB (≥5), AST (≥5), STL (≥4), BLK (≥4).
 
-• Команды: название на русском + эмодзи.
-  Обычные эмодзи — из словаря; кастом-эмодзи берём из team_emoji_ids.json ({ "LAL": "<custom_id>", ... }).
+• Команды: название на русском + эмодзи или кастом-эмодзи (из team_emoji_ids.json).
 
 • Сообщение отправляется ОДНИМ постом.
 """
 
-import os, sys, re, json, time, unicodedata
+import os, sys, re, json, time, unicodedata, random
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import quote_plus
@@ -41,6 +43,9 @@ CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 NBA_SB_DATE   = "https://cdn.nba.com/static/json/liveData/scoreboard/scoreboard_{date}.json"      # YYYYMMDD
 NBA_SB_TODAY  = "https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json"
 NBA_BOX       = "https://cdn.nba.com/static/json/liveData/boxscore/boxscore_{gid}.json"
+
+DATA_SB_DATE  = "https://data.nba.net/10s/prod/v1/{date}/scoreboard.json"                        # YYYYMMDD
+DATA_BOX      = "https://data.nba.net/10s/prod/v1/{date}/{gid}_boxscore.json"
 
 # ---------------- sports.ru ----------------
 SPORTS_RU   = "https://www.sports.ru"
@@ -71,31 +76,45 @@ def ru_plural(n: int, f: tuple[str,str,str]) -> str:
 # ---------------- HTTP ----------------
 def make_session():
     s = requests.Session()
-    r = Retry(total=6, connect=6, read=6, backoff_factor=0.7,
-              status_forcelist=[429,500,502,503,504],
-              allowed_methods=["GET","POST"])
+    r = Retry(
+        total=8, connect=8, read=8,
+        backoff_factor=1.1,
+        status_forcelist=[429,500,502,503,504],
+        allowed_methods=["GET","POST"],
+        raise_on_status=False,
+        respect_retry_after_header=True,
+    )
     s.mount("https://", HTTPAdapter(max_retries=r))
-    # важны заголовки для cdn.nba.com, чтобы не резало
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) NBA-DailyResultsBot/5.0",
+        # важны заголовки для cdn.nba.com, чтобы не резало/кэш не шалил
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) NBA-DailyResultsBot/6.0",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
         "Origin": "https://www.nba.com",
         "Referer": "https://www.nba.com/",
         "Accept": "application/json,text/plain,*/*",
         "Connection": "keep-alive",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     })
     return s
 S = make_session()
 def log(*a): print(*a, file=sys.stderr)
 
-def _get_json(url: str) -> dict:
-    r = S.get(url, timeout=25)
-    if r.status_code != 200:
-        return {}
-    try:
-        return r.json()
-    except Exception:
-        return {}
+def _get_json_with_retries(url: str, tries: int = 3, base_timeout: float = 40.0) -> dict:
+    """
+    Собственный (дополнительный) цикл попыток поверх urllib3.Retry:
+    - увеличиваем timeout (40 → 55 → 70)
+    - случайная пауза между попытками для обхода «шторма»
+    """
+    for i in range(tries):
+        try:
+            r = S.get(url + (("&_=" + str(int(time.time()*1000))) if "cdn.nba.com" in url else ""), timeout=base_timeout + 15*i)
+            if r.status_code == 200:
+                return r.json()
+        except Exception as e:
+            log(f"[GET fail try {i+1}/{tries}] {url} -> {e}")
+        time.sleep(0.6 + i*0.7 + random.random()*0.4)
+    return {}
 
 # ---------------- TEAMS ----------------
 TEAM_RU = {
@@ -258,20 +277,28 @@ def pick_candidate_days():
 # ---------------- NBA SCOREBOARD ----------------
 def fetch_scoreboard(day: date):
     dstr = day.strftime("%Y%m%d")
-    j = _get_json(NBA_SB_DATE.format(date=dstr))
-    games = _parse_scoreboard_json(j)
+
+    # 1) cdn.nba.com c расширенными таймаутами и cache-buster
+    j = _get_json_with_retries(NBA_SB_DATE.format(date=dstr), tries=3, base_timeout=40)
+    games = _parse_scoreboard_cdn(j, dstr)
     if games:
         return games
-    # фоллбэк: если день = сегодня по ET, попробуем todaysScoreboard
-    today_et = datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d")
-    if dstr == today_et:
-        j2 = _get_json(NBA_SB_TODAY)
-        g2 = _parse_scoreboard_json(j2)
-        if g2:
-            return g2
+
+    # 2) попытка today's scoreboard (на случай «сегодня» по ET)
+    j2 = _get_json_with_retries(NBA_SB_TODAY, tries=2, base_timeout=40)
+    g2 = _parse_scoreboard_cdn(j2, dstr)
+    if g2:
+        return g2
+
+    # 3) резервный официальный: data.nba.net
+    j3 = _get_json_with_retries(DATA_SB_DATE.format(date=dstr), tries=3, base_timeout=40)
+    g3 = _parse_scoreboard_data(j3, dstr)
+    if g3:
+        return g3
+
     return []
 
-def _parse_scoreboard_json(j):
+def _parse_scoreboard_cdn(j: dict, dstr: str):
     if not isinstance(j, dict): return []
     sb = j.get("scoreboard") or {}
     games = sb.get("games") or []
@@ -287,11 +314,10 @@ def _parse_scoreboard_json(j):
             m = re.search(r'(\d+)\s*ot', status)
             if "ot" in status:
                 ot = f" ({int(m.group(1))}ОТ)" if m else " (ОТ)"
-            # home/away
             ht = g.get("homeTeam") or {}
             at = g.get("awayTeam") or {}
             comp = []
-            for tm in (at, ht):  # держим порядок: гостевая — первая, домашняя — вторая
+            for tm in (at, ht):  # гости → хозяева
                 abbr = (tm.get("teamTricode") or "").upper()
                 if abbr == "GS": abbr = "GSW"
                 score = int(tm.get("score") or 0)
@@ -304,16 +330,75 @@ def _parse_scoreboard_json(j):
                     "teamId": str(tm.get("teamId") or ""),
                 })
             if len(comp) == 2:
-                out.append({"eventId": gid, "competitors": comp, "ot": ot})
+                out.append({"eventId": gid, "competitors": comp, "ot": ot, "date": dstr})
+        except Exception:
+            continue
+    return out
+
+def _parse_scoreboard_data(j: dict, dstr: str):
+    if not isinstance(j, dict): return []
+    games = j.get("games") or []
+    out = []
+    for g in games:
+        try:
+            gid = str(g.get("gameId") or g.get("gameId"))
+            status_num = int(g.get("statusNum") or 0)  # 3 = Final
+            if status_num != 3:
+                continue
+            periods = int((g.get("period") or {}).get("current") or 4)
+            ot = ""
+            if periods > 4:
+                ot = f" ({periods - 4}ОТ)"
+            v = g.get("vTeam") or {}
+            h = g.get("hTeam") or {}
+            comp = []
+            for tm in (v, h):  # гости → хозяева
+                abbr = (tm.get("triCode") or "").upper()
+                if abbr == "GS": abbr = "GSW"
+                score = int(tm.get("score") or 0)
+                wins  = tm.get("win") or tm.get("wins") or 0
+                losses= tm.get("loss") or tm.get("losses") or 0
+                winner = False
+                # определим победителя по счёту
+                # (в data.nba.net нет явного флага победы)
+                comp_score_tmp = [int(v.get("score",0) or 0), int(h.get("score",0) or 0)]
+                if tm is v:
+                    winner = score == max(comp_score_tmp)
+                else:
+                    winner = score == max(comp_score_tmp)
+                comp.append({
+                    "abbr": abbr,
+                    "score": score,
+                    "winner": bool(winner),
+                    "record": f"{wins}-{losses}",
+                    "teamId": str(tm.get("teamId") or tm.get("teamId")),
+                })
+            if len(comp) == 2:
+                out.append({"eventId": gid, "competitors": comp, "ot": ot, "date": dstr, "source": "data"})
         except Exception:
             continue
     return out
 
 # ---------------- NBA BOX ----------------
-def fetch_box(game_id: str):
-    j = _get_json(NBA_BOX.format(gid=game_id)) or {}
+def fetch_box(game_id: str, game_date: str):
+    """
+    Возвращает список команд:
+    [{teamId, players:[{id,first,last,name,pts,reb,ast,stl,blk}]}]
+    """
+    # 1) cdn.nba.com
+    j = _get_json_with_retries(NBA_BOX.format(gid=game_id), tries=3, base_timeout=40)
+    teams = _parse_box_cdn(j)
+    if teams:
+        return teams
+    # 2) data.nba.net (резерв)
+    j2 = _get_json_with_retries(DATA_BOX.format(date=game_date, gid=game_id), tries=3, base_timeout=40)
+    teams2 = _parse_box_data(j2)
+    return teams2
+
+def _parse_box_cdn(j: dict):
+    if not isinstance(j, dict): return []
     game = j.get("game") or {}
-    teams = []
+    out = []
     for side in ("awayTeam","homeTeam"):
         team = game.get(side) or {}
         tid = str(team.get("teamId") or "")
@@ -321,7 +406,6 @@ def fetch_box(game_id: str):
         for p in (team.get("players") or []):
             info = p.get("person") or {}
             st   = p.get("statistics") or {}
-            # фильтр «играл»: минуты или любые статы
             mins = st.get("minutes") or st.get("minutesCalculated") or ""
             if not any(st.get(k) for k in ("points","reboundsTotal","assists","steals","blocks")) and not mins:
                 continue
@@ -345,8 +429,39 @@ def fetch_box(game_id: str):
             blk = ig("blocks","blk")
             players.append({"id":pid,"first":first,"last":last,"name":name,
                             "pts":pts,"reb":reb,"ast":ast,"stl":stl,"blk":blk})
-        teams.append({"teamId": tid, "players": players})
-    return teams
+        out.append({"teamId": tid, "players": players})
+    return out
+
+def _parse_box_data(j: dict):
+    # data.nba.net: activePlayers
+    if not isinstance(j, dict): return []
+    stats = j.get("stats") or {}
+    acts = stats.get("activePlayers") or []
+    by_tid = {}
+    for a in acts:
+        try:
+            tid = str(a.get("teamId") or "")
+            pid = str(a.get("personId") or "")
+            first = (a.get("firstName") or "").strip()
+            last  = (a.get("lastName") or "").strip()
+            name  = (a.get("name") or f"{first} {last}").strip()
+            def ig(k):
+                v = a.get(k)
+                try: return int(v)
+                except: 
+                    try: return int(float(v or 0))
+                    except: return 0
+            pts = ig("points")
+            reb = ig("totReb")
+            ast = ig("assists")
+            stl = ig("steals")
+            blk = ig("blocks")
+            if tid not in by_tid: by_tid[tid] = []
+            by_tid[tid].append({"id":pid,"first":first,"last":last,"name":name,
+                                "pts":pts,"reb":reb,"ast":ast,"stl":stl,"blk":blk})
+        except Exception:
+            continue
+    return [{"teamId": tid, "players": lst} for tid, lst in by_tid.items()]
 
 # ---------------- HIGHLIGHTS & RENDER ----------------
 def _flame(pts, reb, ast, stl, blk):
@@ -359,10 +474,6 @@ def is_highlight(p):
     pts, reb, ast, stl, blk = p["pts"], p["reb"], p["ast"], p["stl"], p["blk"]
     dd = sum(v>=10 for v in (pts,reb,ast))
     return (pts >= 30) or (dd >= 2) or (reb >= 15) or (ast >= 12) or (stl >= 4) or (blk >= 4)
-
-def merge_lists(players):
-    # nothing to merge here (все из одного источника), но оставим для симметрии
-    return list(players or [])
 
 def _initial_ru(first_en, ru_first, fallback_name):
     if ru_first: return ru_first[:1].upper()
@@ -409,6 +520,8 @@ def select_highlights(players, abbr):
 # ---------------- RENDER ----------------
 SEP = "–––––––––––––––––––––––"
 
+TEAM_CUSTOM_IDS = _load_json(TEAM_CUSTOM_IDS_PATH, {})
+
 def _team_line_text(abbr, score, record, winner, ot_suffix, entities, offset_ref):
     name = TEAM_RU.get(abbr, abbr)
     s   = f"<b>{score}</b>" if winner else f"{score}"
@@ -429,16 +542,16 @@ def _team_line_text(abbr, score, record, winner, ot_suffix, entities, offset_ref
 def build_game_block(game, entities, offset_ref):
     comp = game["competitors"]
     if len(comp) != 2: return ""
-    a, b = comp[0], comp[1]  # порядок: «гости», затем «дом»
+    a, b = comp[0], comp[1]  # гости → хозяева
 
     head_a = _team_line_text(a["abbr"], a["score"], a["record"], a["winner"], "", entities, offset_ref)
     head_b = _team_line_text(b["abbr"], b["score"], b["record"], b["winner"], game.get("ot",""), entities, offset_ref)
     head = head_a + "\n" + head_b + "\n"
     offset_ref[0] += 1
 
-    # бокс с официального API
-    box_teams = fetch_box(game["eventId"])
-    by_tid = {t["teamId"]: merge_lists(t.get("players", [])) for t in box_teams}
+    # бокскор с оф. API (cdn) + резерв (data)
+    box_teams = fetch_box(game["eventId"], game.get("date",""))
+    by_tid = {t["teamId"]: (t.get("players") or []) for t in box_teams}
 
     def lines_for_team(c):
         arr = by_tid.get(c["teamId"], [])
@@ -459,9 +572,6 @@ def build_game_block(game, entities, offset_ref):
     return text.strip()
 
 def build_post_text_and_entities():
-    global TEAM_CUSTOM_IDS
-    TEAM_CUSTOM_IDS = _load_json(TEAM_CUSTOM_IDS_PATH, {})
-
     chosen_day = None
     games = []
     for d in pick_candidate_days():
@@ -478,6 +588,9 @@ def build_post_text_and_entities():
 
     entities = []
     offset_ref = [len(title)]
+
+    if not games:
+        return title.strip(), entities
 
     blocks = []
     for i, g in enumerate(games, 1):
@@ -496,7 +609,7 @@ def tg_send_single(text, entities):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
     if entities: payload["entities"] = entities
-    resp = S.post(url, json=payload, timeout=25)
+    resp = S.post(url, json=payload, timeout=40)
     if resp.status_code != 200:
         raise RuntimeError(f"Telegram error {resp.status_code}: {resp.text}")
 
