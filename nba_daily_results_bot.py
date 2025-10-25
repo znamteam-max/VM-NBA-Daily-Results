@@ -2,17 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-NBA Daily Results → Telegram (RU) — Sports.ru primary, Covers count/pairs, ESPN fallback, spoilers.
+NBA Daily Results → Telegram (RU) — Sports.ru primary, Covers∪ESPN pairs, spoilers.
 
 • Матчи и игроки: Sports.ru (русские фамилии), быстро и параллельно.
-• Кол-во матчей и пары команд: Covers (matchups, по дате). Если Covers недоступен — fallback на sports.ru, затем ESPN.
+• Кол-во матчей и пары команд: объединение Covers + ESPN (порядок от Covers).
 • Если по паре нет страницы на sports.ru — добираем счёт/игроков через ESPN (короткие таймауты).
 • Счёт и строки игроков — под HTML-спойлером. Видны только названия команд и эмодзи.
 • Спец-правила: Дёмин (BKN) и Голдин (MIA) — подробно (топ-3 метрики > 0), всегда, если играли.
 • Второй игрок добавляется, если: ≥20 очков ИЛИ дабл-дабл ИЛИ ≥6 перехватов/блок-шотов.
 """
 
-import os, sys, re, json, time
+import os, sys, re, json
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import urlparse, urlunparse
@@ -32,7 +32,7 @@ CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TEAM_EMOJI_JSON = os.getenv("TEAM_EMOJI_JSON", "").strip()  # опционально: {"BOS":"<emoji>",...}
 
 # ---------- HTTP ----------
-HTTP_TIMEOUT = 9  # общий таймаут на запрос, сек
+HTTP_TIMEOUT = 9
 def _make_adapter():
     if Retry is not None:
         r = Retry(total=3, connect=3, read=3, backoff_factor=0.4,
@@ -46,7 +46,7 @@ def make_session():
     ad = _make_adapter()
     s.mount("https://", ad); s.mount("http://", ad)
     s.headers.update({
-        "User-Agent": "NBA-DailyResultsBot/3.2 (sports.ru primary, covers count, espn fallback, spoilers)",
+        "User-Agent": "NBA-DailyResultsBot/3.3 (sports.ru primary, covers∪espn pairs, spoilers)",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
         "Connection": "close",
     })
@@ -117,12 +117,11 @@ def canonical_ru_team(raw: str) -> str | None:
         if key in txt: return key
     return None
 
-# ---------- ESPN (резерв) ----------
+# ---------- ESPN (резерв/пары) ----------
 ESPN_SB = "https://site.web.api.espn.com/apis/v2/sports/basketball/nba/scoreboard?dates={yyyy}{mm}{dd}"
 ESPN_BOX = "https://site.web.api.espn.com/apis/v2/sports/basketball/nba/boxscore?event={eid}"
 
 def fetch_espn_completed(center_day: date) -> list[dict]:
-    out = []
     url = ESPN_SB.format(yyyy=center_day.year, mm=str(center_day.month).zfill(2), dd=str(center_day.day).zfill(2))
     try:
         r = S.get(url, timeout=HTTP_TIMEOUT)
@@ -130,6 +129,7 @@ def fetch_espn_completed(center_day: date) -> list[dict]:
         j = r.json()
     except Exception:
         return []
+    out = []
     for ev in j.get("events") or []:
         st = ((ev.get("status") or {}).get("type") or {})
         if not bool(st.get("completed", False)):
@@ -155,11 +155,7 @@ def fetch_espn_completed(center_day: date) -> list[dict]:
             if period and period > 4: ot = period - 4
         except Exception:
             pass
-        out.append({
-            "eventId": str(ev.get("id") or ""),
-            "teams": teams,
-            "ot": ot,
-        })
+        out.append({"eventId": str(ev.get("id") or ""), "teams": teams, "ot": ot})
     # уникализация по паре
     seen=set(); uniq=[]
     for g in out:
@@ -214,14 +210,13 @@ def fetch_espn_players(event_id: str) -> dict:
         out[tid] = list(merged.values())
     return out
 
-# ---------- COVERS (источник пар/количества) ----------
+# ---------- COVERS (пары) ----------
 COVERS_URLS = [
     "https://www.covers.com/sports/nba/matchups?selectedDate={ymd}",   # YYYY-MM-DD
     "https://www.covers.com/sports/nba/matchups?selectedDate={mdy}",   # MM/DD/YYYY
     "https://www.covers.com/sports/nba/matchups",                       # «сегодня»
 ]
 
-# Маппинг англ. названий из Covers → NBA abbr
 COVERS_TEAM_TO_ABBR = {
     "Atlanta Hawks":"ATL","Boston Celtics":"BOS","Brooklyn Nets":"BKN","Charlotte Hornets":"CHA","Chicago Bulls":"CHI",
     "Cleveland Cavaliers":"CLE","Dallas Mavericks":"DAL","Denver Nuggets":"DEN","Detroit Pistons":"DET","Golden State Warriors":"GSW",
@@ -231,7 +226,6 @@ COVERS_TEAM_TO_ABBR = {
     "Sacramento Kings":"SAC","San Antonio Spurs":"SAS","Toronto Raptors":"TOR","Utah Jazz":"UTA","Washington Wizards":"WAS",
 }
 
-# Регекс ищет «Team1 at Team2» или «Team1 vs Team2» в тексте страницы
 TEAM_NAME_RE = "|".join(sorted(map(re.escape, COVERS_TEAM_TO_ABBR.keys()), key=len, reverse=True))
 COVERS_PAIR_RE = re.compile(rf"({TEAM_NAME_RE})\s+(?:at|vs\.?|@)\s+({TEAM_NAME_RE})", re.I)
 
@@ -256,7 +250,7 @@ def fetch_covers_pairs(day: date) -> list[frozenset]:
             if key in seen: continue
             seen.add(key); pairs.append(key)
         if pairs:
-            break  # как только нашли по одной из URL-схем — достаточно
+            break
     return pairs
 
 # ---------- SPORTS.RU ----------
@@ -325,7 +319,7 @@ def parse_match(url: str) -> dict | None:
     soup = get_html(url)
     if not soup: return None
     if not _is_nba_match(soup):
-        return None  # отбрасываем всё не-НБА
+        return None
 
     page_text = soup.get_text(" ", strip=True)
     m_score = re.search(r"(\d+)\s:\s(\d+)", page_text)
@@ -334,7 +328,6 @@ def parse_match(url: str) -> dict | None:
     low = page_text.lower()
     finished = ("заверш" in low) or ("итог" in low) or ("матч окончен" in low)
 
-    # овертаймы
     tail = page_text[m_score.end(): m_score.end()+240]
     pairs = re.findall(r"\d+\s:\s\d+", tail)
     ot = max(len(pairs) - 4, 0) if pairs else 0
@@ -354,7 +347,6 @@ def parse_match(url: str) -> dict | None:
     abbrA = TEAM_RU_TO_ABBR.get(teamA,""); abbrB = TEAM_RU_TO_ABBR.get(teamB,"")
     if not abbrA or not abbrB: return None
 
-    # таблицы «… статистика игроков»
     def take_team_rows(team_ru_key: str) -> list[dict]:
         rows=[]; key_low = team_ru_key.lower()
         hdr=None
@@ -475,13 +467,12 @@ def pick_players_for_team(abbr: str, rows: list[dict]) -> list[tuple[dict,bool,b
                 out.append((p, False, False)); break
     return out[:2]
 
-# ---------- SPOILERS / SEPARATOR ----------
+# ---------- SPOILERS ----------
 def sp(s: str) -> str: return f'<span class="tg-spoiler">{s}</span>'
 SEP = "–––––––––––––––––––––––"
 
-# ---------- BUILD ----------
+# ---------- FAST SPORTS.RU ----------
 def fetch_sports_day_fast(d: date, max_workers: int = 10) -> list[dict]:
-    """Параллельно парсим все ссылки sports.ru за день; возвращаем только завершённые НБА-матчи."""
     links = collect_day_match_links(d)
     if not links: return []
     out=[]
@@ -494,7 +485,7 @@ def fetch_sports_day_fast(d: date, max_workers: int = 10) -> list[dict]:
                     out.append(info)
             except Exception:
                 continue
-    # убрать дубли по паре аббревиатур
+    # убрать дубли
     seen=set(); uniq=[]
     for g in out:
         pair = (g["teamA"]["abbr"], g["teamB"]["abbr"])
@@ -502,6 +493,7 @@ def fetch_sports_day_fast(d: date, max_workers: int = 10) -> list[dict]:
         seen.add(pair); uniq.append(g)
     return uniq
 
+# ---------- BLOCK BUILDERS ----------
 def build_block_from_sports(info: dict) -> str:
     A, B = info["teamA"], info["teamB"]
     ot_str = "" if info["ot"] == 0 else (" (ОТ)" if info["ot"] == 1 else f" ({info['ot']} ОТ)")
@@ -544,80 +536,58 @@ def build_block_from_espn(e: dict) -> str:
     if b_lines: lines.extend(b_lines)
     return head + ("\n".join(lines) if lines else "")
 
+# ---------- BUILD ----------
 def build_post() -> str:
     d = pick_report_date()
 
-    # 1) Быстрый сбор sports.ru
+    # Sports.ru данные (игроки/счёты/русские фамилии)
     sports_games = fetch_sports_day_fast(d)
-    sports_by_pair = {}
-    for g in sports_games:
-        key = frozenset([g["teamA"]["abbr"], g["teamB"]["abbr"]])
-        sports_by_pair[key] = g
+    sports_by_pair = {frozenset([g["teamA"]["abbr"], g["teamB"]["abbr"]]): g for g in sports_games}
 
-    # 2) Пары/кол-во: Covers
+    # Пары дня: Covers + ESPN (объединение; порядок: сначала Covers, затем всё, чего не было — по ESPN)
     covers_pairs = fetch_covers_pairs(d)
-
-    # 3) ESPN для резервных блоков
     espn_list = fetch_espn_completed(d)
     espn_by_pair = {frozenset([g["teams"][0]["abbr"], g["teams"][1]["abbr"]]): g for g in espn_list}
+    espn_pairs = list(espn_by_pair.keys())
 
-    # Заголовок — сначала Covers, потом sports.ru, потом ESPN
-    if covers_pairs:
-        title_count = len(covers_pairs)
-    elif sports_games:
-        title_count = len(sports_games)
-    else:
-        title_count = len(espn_list)
+    # Объединение с сохранением порядка
+    ordered_pairs = []
+    seen = set()
+    for p in covers_pairs:
+        if p in seen: continue
+        seen.add(p); ordered_pairs.append(p)
+    for p in espn_pairs:
+        if p in seen: continue
+        seen.add(p); ordered_pairs.append(p)
 
+    # Если обе пустые (крайне маловероятно) — fallback к sports.ru найденным парам
+    if not ordered_pairs:
+        ordered_pairs = list(sports_by_pair.keys())
+
+    # Заголовок по количеству объединённых пар
+    title_count = len(ordered_pairs)
     title = f"НБА • {ru_date(d)} • {title_count} {ru_plural(title_count, ('матч','матча','матчей'))}\n"
     title += "Результаты надёжно спрятаны 👇\n"
     title += SEP + "\n\n"
 
-    blocks = []
-    used=set()
+    if not ordered_pairs:
+        return title.rstrip()
 
-    def add_sep_if_needed(idx, total):
-        if idx < total:
+    blocks=[]
+    for i, pair in enumerate(ordered_pairs, 1):
+        if pair in sports_by_pair:
+            blocks.append(build_block_from_sports(sports_by_pair[pair]))
+        elif pair in espn_by_pair:
+            blocks.append(build_block_from_espn(espn_by_pair[pair]))
+        else:
+            # совсем редкий случай: ни один источник не дал матч
+            a_abbr, b_abbr = tuple(pair)
+            a_name = ABBR_TO_TEAM_RU.get(a_abbr, a_abbr); b_name = ABBR_TO_TEAM_RU.get(b_abbr, b_abbr)
+            a_emo = team_emoji_by_abbr(a_abbr); b_emo = team_emoji_by_abbr(b_abbr)
+            blocks.append(f"{a_emo} {a_name}: {sp('—')}\n{b_emo} {b_name}: {sp('—')}\n")
+
+        if i < len(ordered_pairs):
             blocks.append("\n" + SEP + "\n")
-
-    if covers_pairs:
-        # Идём по парам из Covers — это «истина» по составу дня
-        total = len(covers_pairs)
-        for i, pair in enumerate(covers_pairs, 1):
-            if pair in used: 
-                add_sep_if_needed(i, total); continue
-            used.add(pair)
-            if pair in sports_by_pair:
-                blocks.append(build_block_from_sports(sports_by_pair[pair]))
-            elif pair in espn_by_pair:
-                blocks.append(build_block_from_espn(espn_by_pair[pair]))
-            else:
-                # крайней редкости заглушка (если оба источника не дали матч)
-                a_abbr, b_abbr = tuple(pair)
-                a_name = ABBR_TO_TEAM_RU.get(a_abbr, a_abbr); b_name = ABBR_TO_TEAM_RU.get(b_abbr, b_abbr)
-                a_emo = team_emoji_by_abbr(a_abbr); b_emo = team_emoji_by_abbr(b_abbr)
-                blocks.append(f"{a_emo} {a_name}: {sp('—')}\n{b_emo} {b_name}: {sp('—')}\n")
-            add_sep_if_needed(i, total)
-    elif sports_games:
-        # Covers нет — выкладываем sports.ru как есть
-        total = len(sports_games)
-        for i, info in enumerate(sports_games, 1):
-            pair = frozenset([info["teamA"]["abbr"], info["teamB"]["abbr"]])
-            if pair in used: 
-                add_sep_if_needed(i, total); continue
-            used.add(pair)
-            blocks.append(build_block_from_sports(info))
-            add_sep_if_needed(i, total)
-    else:
-        # Остался только ESPN
-        total = len(espn_list)
-        for i, e in enumerate(espn_list, 1):
-            pair = frozenset([e["teams"][0]["abbr"], e["teams"][1]["abbr"]])
-            if pair in used: 
-                add_sep_if_needed(i, total); continue
-            used.add(pair)
-            blocks.append(build_block_from_espn(e))
-            add_sep_if_needed(i, total)
 
     return (title + "".join(blocks)).strip()
 
@@ -628,6 +598,7 @@ def tg_send(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     r = S.post(url, json={
         "chat_id": CHAT_ID, "text": text,
+            # HTML-спойлеры
         "parse_mode": "HTML", "disable_web_page_preview": True,
     }, timeout=HTTP_TIMEOUT)
     if r.status_code != 200:
