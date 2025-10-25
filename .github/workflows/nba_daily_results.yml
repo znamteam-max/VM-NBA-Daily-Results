@@ -1,3 +1,4 @@
+# .github/workflows/nba_daily_results.yml
 name: NBA daily results to Telegram
 
 on:
@@ -51,7 +52,7 @@ jobs:
           print('Values that look like custom_emoji_id:', looks_like_ids, 'of', len(d))
           PY
 
-      # 2) Узнаёт ли Telegram эти ID (теперь через JSON body)
+      # 2) Узнаёт ли Telegram эти ID (JSON body)
       - name: Validate custom emoji IDs against Telegram
         continue-on-error: true
         env:
@@ -94,8 +95,7 @@ jobs:
               print('Unknown IDs (first 10):', ','.join(unknown[:10]))
           PY
 
-      # 3) Тест: отправим 1 custom emoji (NYK) через entities
-        # (оставляем JSON + печать тела ошибки; не ломаем весь ран)
+      # 3) Тест: отправим 1 custom emoji (NYK) через entities (emoji-плейсхолдер)
       - name: Send one test emoji (NYK) via entities
         continue-on-error: true
         if: ${{ always() }}
@@ -117,12 +117,12 @@ jobs:
           if not m:
               print('No NYK ID in secret'); raise SystemExit(0)
           cid = m.group(1)
-          text = "■ тест NYK"
+          text = "🙂 тест NYK"
           payload = {
             "chat_id": chat,
             "text": text,
             "entities": [
-              {"type": "custom_emoji", "offset": 0, "length": 1, "custom_emoji_id": cid}
+              {"type": "custom_emoji", "offset": 0, "length": 2, "custom_emoji_id": cid}
             ]
           }
           data = json.dumps(payload).encode('utf-8')
