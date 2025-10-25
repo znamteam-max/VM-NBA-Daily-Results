@@ -11,29 +11,81 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 
+# ---------------- ENV ----------------
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# ESPN endpoints
-ESPN_SCORE_BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba"
-ESPN_BOX_WEB    = "https://site.web.api.espn.com/apis/v2/sports/basketball/nba/boxscore?event="
-ESPN_BOX_SITE   = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/boxscore?event="
-ESPN_SUMMARY    = "https://site.web.api.espn.com/apis/v2/sports/basketball/nba/summary?event="
+# ---------------- YAHOO ----------------
+Y_SCORE_HTML   = "https://sports.yahoo.com/nba/scoreboard/?date={date}"  # 2025-10-24
+Y_SCORES_API_CANDIDATES = [
+    "https://sports.yahoo.com/_td/api/resource/sports.scores;leagues=nba;date={date}",
+    "https://sports.yahoo.com/_td/api/resource/sports.league.scoreboard;league=nba;date={date}",
+    "https://sports.yahoo.com/_td/api/resource/sports.scoreboard;leagues=nba;date={date}",
+]
+Y_BOX_API_CANDIDATES = [
+    # внутренние ресурсы с боксами/деталями
+    "https://sports.yahoo.com/_td/api/resource/sports.game.stats;gameId={gid}",
+    "https://sports.yahoo.com/_td/api/resource/sports.game.stats?gameId={gid}",
+    "https://sports.yahoo.com/_td/api/resource/sports.game.meta;gameId={gid}",
+    "https://sports.yahoo.com/_td/api/resource/sports.game.detail;gameId={gid}",
+    "https://sports.yahoo.com/_td/api/resource/sports.game;gameId={gid}",
+]
 
-# sports.ru
+# ---------------- sports.ru ----------------
 SPORTS_RU   = "https://www.sports.ru"
 SRU_PERSON  = SPORTS_RU + "/basketball/person/"
 SRU_PLAYER  = SPORTS_RU + "/basketball/player/"
 SRU_SEARCH  = SPORTS_RU + "/search/?q="
 
-# caches
-RU_MAP_PATH     = "ru_map_nba.json"      # { athleteId: {"first":"Имя(ru)","last":"Фамилия(ru)"} | "Фамилия(legacy)" }
-RU_PENDING_PATH = "ru_pending_nba.json"  # [{ id, first, last }]
+# ---------------- CACHE ----------------
+RU_MAP_PATH         = "ru_map_nba.json"       # { athleteId: {"first":"Имя-ru","last":"Фамилия-ru"} | "Фамилия-legacy" }
+RU_PENDING_PATH     = "ru_pending_nba.json"   # [{id, first, last}]
+TEAM_CUSTOM_IDS_PATH= "team_emoji_ids.json"   # { "LAL": "custom_emoji_id", ... }
 
 RU_MAP: dict[str, object] = {}
 RU_PENDING: list[dict] = []
+TEAM_CUSTOM_IDS: dict[str, str] = {}
 _session_pending_ids: set[str] = set()
 
+# ---------------- DATES ----------------
+RU_MONTHS = {1:"января",2:"февраля",3:"марта",4:"апреля",5:"мая",6:"июня",7:"июля",8:"августа",9:"сентября",10:"октября",11:"ноября",12:"декабря"}
+def ru_date(d: date) -> str: return f"{d.day} {RU_MONTHS[d.month]}"
+def ru_plural(n: int, f: tuple[str,str,str]) -> str:
+    n = abs(int(n)) % 100; n1 = n % 10
+    if 11 <= n <= 19: return f[2]
+    if 2 <= n1 <= 4:  return f[1]
+    if n1 == 1:      return f[0]
+    return f[2]
+
+# ---------------- HTTP ----------------
+def make_session():
+    s = requests.Session()
+    r = Retry(total=6, connect=6, read=6, backoff_factor=0.7,
+              status_forcelist=[429,500,502,503,504],
+              allowed_methods=["GET","POST"])
+    s.mount("https://", HTTPAdapter(max_retries=r))
+    s.headers.update({
+        "User-Agent": "NBA-DailyResultsBot/4.0 (Yahoo+sports.ru resolver)",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
+    })
+    return s
+S = make_session()
+def log(*a): print(*a, file=sys.stderr)
+
+def _get_json(url: str) -> dict:
+    r = S.get(url, timeout=25)
+    if r.status_code != 200:
+        return {}
+    try:
+        return r.json()
+    except Exception:
+        return {}
+
+def _get_text(url: str) -> str:
+    r = S.get(url, timeout=25)
+    return r.text if r.status_code == 200 else ""
+
+# ---------------- TEAMS ----------------
 TEAM_RU = {
     "ATL":"Атланта","BOS":"Бостон","BKN":"Бруклин","NY":"Нью-Йорк","NYK":"Нью-Йорк","PHI":"Филадельфия",
     "TOR":"Торонто","CHI":"Чикаго","CLE":"Кливленд","DET":"Детройт","IND":"Индиана","MIL":"Милуоки",
@@ -50,32 +102,8 @@ TEAM_EMOJI = {
     "MIA":"🔥","ORL":"✨","DAL":"🐎","HOU":"🚀","MEM":"🐻","NO":"🪶",
     "NOP":"🪶","SA":"🪙","SAS":"🪙","WSH":"🧙","WAS":"🧙",
 }
-TEAM_CUSTOM_IDS_PATH = "team_emoji_ids.json"
-TEAM_CUSTOM_IDS = {}
 
-RU_MONTHS = {1:"января",2:"февраля",3:"марта",4:"апреля",5:"мая",6:"июня",7:"июля",8:"августа",9:"сентября",10:"октября",11:"ноября",12:"декабря"}
-def ru_date(d: date) -> str: return f"{d.day} {RU_MONTHS[d.month]}"
-def ru_plural(n: int, f: tuple[str,str,str]) -> str:
-    n = abs(int(n)) % 100; n1 = n % 10
-    if 11 <= n <= 19: return f[2]
-    if 2 <= n1 <= 4:  return f[1]
-    if n1 == 1:      return f[0]
-    return f[2]
-def log(*a): print(*a, file=sys.stderr)
-
-def make_session():
-    s = requests.Session()
-    r = Retry(total=6, connect=6, read=6, backoff_factor=0.6,
-              status_forcelist=[429,500,502,503,504],
-              allowed_methods=["GET","POST"])
-    s.mount("https://", HTTPAdapter(max_retries=r))
-    s.headers.update({
-        "User-Agent": "NBA-DailyResultsBot/3.2 (+espn; sports.ru resolver)",
-        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
-    })
-    return s
-S = make_session()
-
+# ---------------- CACHE I/O ----------------
 def _load_json(path: str, default):
     if not os.path.exists(path): return default
     try:
@@ -89,9 +117,9 @@ def _save_json(path: str, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
-# ---------- utils ----------
+# ---------------- RU NAMES (sports.ru) ----------------
 def is_cyrillic(s: str) -> bool:
-    return bool(s) and all(('А' <= ch <= 'я') or ch in " .-’ʼ'" for ch in s)
+    return bool(s) and any("А" <= ch <= "я" for ch in s)
 
 def _latin_initial_to_cyr(first_en: str) -> str:
     if not first_en: return "И"
@@ -109,7 +137,6 @@ def _slugify(first: str, last: str) -> str:
     base = re.sub(r"[^a-z0-9]+", "-", base).strip("-")
     return base
 
-# ---------- sports.ru resolver ----------
 def _sportsru_try_profile(first: str, last: str) -> str | None:
     slug = _slugify(first, last)
     for root in (SRU_PERSON, SRU_PLAYER):
@@ -155,7 +182,6 @@ def _sportsru_search(first: str, last: str) -> tuple[str,str] | None:
         return None
 
 EXCEPT_LAST = {
-    # case-insensitive ключи
     "ingram":"Ингрэм","barrett":"Барретт","antetokounmpo":"Адетокумбо","anthony":"Энтони",
     "wagner":"Вагнер","bane":"Бэйн","young":"Янг","alexander-walker":"Александер-Уокер",
     "brunson":"Брансон","towns":"Таунс","brown":"Браун","hauser":"Хаузер","thomas":"Томас",
@@ -169,7 +195,6 @@ EXCEPT_LAST = {
     "brooks":"Брукс","booker":"Букер","porzingis":"Порзингис","gilgeous-alexander":"Гилджес-Александер",
     "demin":"Дёмин","goldin":"Голдин",
 }
-
 def _queue_pending(pid: str, first: str, last: str):
     if not pid or pid in _session_pending_ids: return
     if pid in RU_MAP: return
@@ -185,46 +210,30 @@ def _improve_cached_if_needed(pid: str, first: str, last: str):
     if not need: return
     url = _sportsru_try_profile(first, last)
     got = _sportsru_from_profile(url) if url else None
-    if not got:
-        got = _sportsru_search(first, last)
+    if not got: got = _sportsru_search(first, last)
     if got:
-        RU_MAP[pid] = {"first": got[0], "last": got[1]}
-        return
+        RU_MAP[pid] = {"first": got[0], "last": got[1]}; return
     low_last = (last or "").strip().lower()
     if low_last in EXCEPT_LAST:
-        RU_MAP[pid] = {"first": "", "last": EXCEPT_LAST[low_last]}
-        return
-    RU_MAP[pid] = {"first": "", "last": (last or "").strip()}  # ← если ничего не нашли — оставляем латиницу
+        RU_MAP[pid] = {"first":"", "last": EXCEPT_LAST[low_last]}; return
+    RU_MAP[pid] = {"first":"", "last": (last or "").strip()}
 
 def resolve_ru_name(first_en: str, last_en: str, athlete_id: str) -> tuple[str,str]:
     if athlete_id:
         _improve_cached_if_needed(athlete_id, first_en or "", last_en or "")
         val = RU_MAP.get(athlete_id)
         if isinstance(val, dict): return (val.get("first",""), val.get("last",""))
-        if isinstance(val, str):  return ("", val)  # legacy
-    # без id — on-the-fly
+        if isinstance(val, str):  return ("", val)
     url = _sportsru_try_profile(first_en or "", last_en or "")
     got = _sportsru_from_profile(url) if url else None
-    if not got:
-        got = _sportsru_search(first_en or "", last_en or "")
+    if not got: got = _sportsru_search(first_en or "", last_en or "")
     if got: return got
     low_last = (last_en or "").strip().lower()
-    ru_last = EXCEPT_LAST.get(low_last) or (last_en or "").strip()  # ← латиница, если неизвестно
+    ru_last = EXCEPT_LAST.get(low_last) or (last_en or "").strip()
     if athlete_id: _queue_pending(athlete_id, first_en or "", last_en or "")
     return ("", ru_last)
 
-# ---------- HTTP ----------
-def _get_json(url: str) -> dict:
-    r = S.get(url, timeout=25)
-    if r.status_code != 200:
-        log("HTTP", r.status_code, url[:160])
-        return {}
-    try:
-        return r.json()
-    except Exception:
-        return {}
-
-# ---------- dates ----------
+# ---------------- DATE PICK ----------------
 def pick_report_date() -> date:
     now_et = datetime.now(ZoneInfo("America/New_York"))
     return (now_et.date() - timedelta(days=1)) if now_et.hour < 8 else now_et.date()
@@ -232,229 +241,208 @@ def pick_candidate_days() -> list[date]:
     base = pick_report_date()
     return [base, base - timedelta(days=1), base - timedelta(days=2)]
 
-# ---------- ESPN helpers ----------
-def fetch_scoreboard(day: date) -> list[dict]:
-    dates = day.strftime("%Y%m%d")
-    j = _get_json(f"{ESPN_SCORE_BASE}/scoreboard?dates={dates}")
-    events = j.get("events") or []
-    out = []
-    for ev in events:
+# ---------------- YAHOO SCOREBOARD ----------------
+def _extract_app_json_from_html(html: str) -> dict:
+    # ищем root.App.main = {...};
+    m = re.search(r"root\.App\.main\s*=\s*({.*?})\s*;\s*\n", html, flags=re.DOTALL)
+    if not m:
+        m = re.search(r"window\.__APOLLO_STATE__\s*=\s*({.*?});", html, flags=re.DOTALL)
+    if not m: return {}
+    blob = m.group(1)
+    # чистим странные trailing-комментарии
+    try:
+        return json.loads(blob)
+    except Exception:
+        # иногда там JSON с JS-комментариями — удалим /**/ и т.п.
+        cleaned = re.sub(r"/\*.*?\*/", "", blob, flags=re.DOTALL)
+        cleaned = re.sub(r"//.*?$", "", cleaned, flags=re.MULTILINE)
         try:
-            t = (ev.get("status") or {}).get("type") or {}
-            completed = bool(t.get("completed"))
-            state = str(t.get("state") or "").lower()
-            if not (completed or state in {"post","final"}):  # только завершённые
-                continue
-            comp = (ev.get("competitions") or [])[0]
-            competitors = comp.get("competitors") or []
-            status_comp = (comp.get("status") or {}).get("type") or {}
-            short = (status_comp.get("shortDetail") or t.get("shortDetail") or "").lower()
-            ot_label = ""
-            if "ot" in short:
-                m = re.search(r'(\d+)\s*ot', short) or re.search(r'(\d)ot', short)
-                ot_label = f" ({int(m.group(1))}ОТ)" if m else " (ОТ)"
-            game = {"eventId": ev.get("id"), "competitors": [], "ot": ot_label, "leaders_by_abbr": {}}
-            for c in competitors:
-                team = c.get("team") or {}
-                abbr = (team.get("abbreviation") or "").upper()
-                if abbr == "GS": abbr = "GSW"
-                # leaders этой команды
-                leaders_raw = c.get("leaders") or []
-                leaders = {}
-                for ld in leaders_raw:
-                    cat = (ld.get("name") or "").lower()
-                    for item in (ld.get("leaders") or []):
-                        ath = item.get("athlete") or {}
-                        leaders.setdefault(cat, []).append({
-                            "id": str(ath.get("id") or ""),
-                            "first": (ath.get("firstName") or "").strip(),
-                            "last": (ath.get("lastName") or "").strip(),
-                            "value": float(item.get("value") or 0),
-                            "name": (ath.get("displayName") or ath.get("fullName") or "").strip()
-                        })
-                score = int(float(c.get("score", 0) or 0))
-                win = bool(c.get("winner", False))
-                rec = ""
-                for recobj in c.get("records") or []:
-                    if recobj.get("type") == "total" and recobj.get("summary"):
-                        rec = recobj["summary"]
-                game["competitors"].append({
-                    "abbr": abbr, "score": score, "winner": win,
-                    "record": rec or "", "teamId": str(team.get("id") or ""),
-                })
-                game["leaders_by_abbr"][abbr] = leaders
-            if len(game["competitors"]) == 2:
-                out.append(game)
-        except Exception as e:
-            log("[scoreboard parse] skip:", e)
+            return json.loads(cleaned)
+        except Exception:
+            return {}
+
+def fetch_scoreboard_yahoo(day: date) -> list[dict]:
+    dstr = day.strftime("%Y-%m-%d")
+    # 1) пробуем API-кандидаты
+    for tmpl in Y_SCORES_API_CANDIDATES:
+        j = _get_json(tmpl.format(date=dstr))
+        games = _parse_scoreboard_json(j)
+        if games:
+            return games
+    # 2) HTML + встроенный JSON
+    html = _get_text(Y_SCORE_HTML.format(date=dstr))
+    j = _extract_app_json_from_html(html)
+    games = _parse_scoreboard_json(j)
+    return games
+
+def _parse_scoreboard_json(j: dict) -> list[dict]:
+    if not j: return []
+    # пробуем несколько возможных путей внутрь стора
+    candidates = []
+    # вариант 1: context.dispatcher.stores.SportsScoresStore
+    t = j
+    for key in ("context","dispatcher","stores","SportsScoresStore"):
+        if isinstance(t, dict) and key in t: t = t[key]
+        else: t = None; break
+    if isinstance(t, dict): candidates.append(t)
+
+    # вариант 2: уже список игр как есть
+    if "events" in j or "games" in j: candidates.append(j)
+
+    # вариант 3: корневой список стора
+    if "scoreboard" in j: candidates.append(j["scoreboard"])
+
+    out = []
+    for store in candidates:
+        # попытаемся найти массив игр глубиной до 3
+        games_arrays = []
+        for k,v in (store.items() if isinstance(store, dict) else []):
+            if isinstance(v, list) and v and isinstance(v[0], dict) and ("gameId" in v[0] or "id" in v[0] or "status" in v[0]):
+                games_arrays.append(v)
+        if not games_arrays and isinstance(store, dict):
+            # часто лежит в store['games'] или store['events']
+            arr = store.get("games") or store.get("events") or []
+            if isinstance(arr, list): games_arrays.append(arr)
+
+        for arr in games_arrays:
+            for g in arr:
+                try:
+                    gid = str(g.get("gameId") or g.get("id") or g.get("gid") or "")
+                    status = (g.get("status") or g.get("statusDisplay") or g.get("statusType") or "").lower()
+                    completed = ("final" in status) or (g.get("completed") is True)
+                    if not completed: continue
+                    ot = ""
+                    st = (g.get("statusDisplay") or g.get("status") or "")
+                    st_l = str(st).lower()
+                    if "ot" in st_l:
+                        m = re.search(r'(\d+)\s*ot', st_l) or re.search(r'(\d)ot', st_l)
+                        ot = f" ({int(m.group(1))}ОТ)" if m else " (ОТ)"
+                    teams = g.get("teams") or g.get("participants") or g.get("competitors") or []
+                    comp = []
+                    leaders_by_abbr = {}
+                    for tm in teams:
+                        team = tm.get("team") or tm.get("info") or tm
+                        abbr = (team.get("abbreviation") or team.get("abbr") or team.get("code") or "").upper()
+                        if abbr == "GS": abbr = "GSW"
+                        score = int(float(tm.get("score") or team.get("score") or 0))
+                        win = bool(tm.get("winner") or team.get("winner") or False)
+                        record = ""
+                        rec = tm.get("record") or team.get("record")
+                        if isinstance(rec, dict):
+                            w = rec.get("wins") or rec.get("w") or ""
+                            l = rec.get("losses") or rec.get("l") or ""
+                            record = f"{w}-{l}" if (w != "" and l != "") else ""
+                        elif isinstance(rec, str):
+                            record = rec
+                        comp.append({"abbr": abbr, "score": score, "winner": win, "record": record, "teamId": str(team.get("id") or tm.get("id") or "")})
+                        # leaders (PTS/REB/AST) — если есть
+                        leaders = {}
+                        for catkey in ("leaders","statLeaders"):
+                            if catkey in tm and isinstance(tm[catkey], list):
+                                for ld in tm[catkey]:
+                                    cat = str(ld.get("name") or ld.get("category") or "").lower()
+                                    ath = ld.get("athlete") or ld.get("player") or {}
+                                    leaders.setdefault(cat, []).append({
+                                        "id": str(ath.get("id") or ""),
+                                        "first": (ath.get("firstName") or "").strip(),
+                                        "last":  (ath.get("lastName")  or "").strip(),
+                                        "value": float(ld.get("value") or 0),
+                                        "name":  (ath.get("displayName") or ath.get("fullName") or "").strip(),
+                                    })
+                        leaders_by_abbr[abbr] = leaders
+                    if len(comp) == 2:
+                        out.append({"eventId": gid, "competitors": comp, "ot": ot, "leaders_by_abbr": leaders_by_abbr})
+                except Exception:
+                    continue
     return out
 
-def fetch_boxscore(event_id: str) -> dict:
-    j = _get_json(ESPN_BOX_WEB + str(event_id))
-    if not j or not (j.get("boxscore") or j.get("players") or j.get("gamepackageJSON")):
-        j = _get_json(ESPN_BOX_SITE + str(event_id))
-    return j or {}
+# ---------------- YAHOO BOXES ----------------
+def fetch_box_yahoo(game_id: str) -> list[dict]:
+    """Возвращает список блоков по командам: [{teamId, players:[{id,first,last,name,pts,reb,ast,stl,blk}]}]"""
+    j = {}
+    for tmpl in Y_BOX_API_CANDIDATES:
+        j = _get_json(tmpl.format(gid=game_id))
+        if j: break
+    if not j:
+        return []
 
-def fetch_summary(event_id: str) -> dict:
-    return _get_json(ESPN_SUMMARY + str(event_id)) or {}
+    teams = []
+    # Попробуем найти секции с игроками рекурсивно
+    def norm_key(k: str) -> str:
+        k = (k or "").lower()
+        return {"points":"pts","pts":"pts","p":"pts",
+                "rebounds":"reb","reb":"reb","r":"reb",
+                "assists":"ast","ast":"ast","a":"ast",
+                "steals":"stl","stl":"stl","s":"stl",
+                "blocks":"blk","blk":"blk","b":"blk"}.get(k, k)
 
-def _to_int_any(x, default=0) -> int:
-    if x is None: return default
-    if isinstance(x, (int, float)): return int(x)
-    if isinstance(x, str):
-        m = re.search(r"-?\d+", x)
-        return int(m.group(0)) if m else default
-    if isinstance(x, dict):
-        for k in ("value","val"):
-            if k in x:
-                try: return int(float(x[k]))
-                except Exception: pass
-    return default
+    def to_int(x) -> int:
+        if x is None: return 0
+        if isinstance(x,(int,float)): return int(x)
+        if isinstance(x,str):
+            m = re.search(r"-?\d+", x); return int(m.group(0)) if m else 0
+        if isinstance(x,dict):
+            for k in ("value","val"): 
+                if k in x:
+                    try: return int(float(x[k])); except: return 0
+        return 0
 
-def _norm_key(k: str) -> str:
-    k = (k or "").strip().lower()
-    aliases = {
-        "p":"pts","pts":"pts","points":"pts","point":"pts",
-        "r":"reb","reb":"reb","rebs":"reb","totreb":"reb","rebounds":"reb","reboundstotal":"reb",
-        "a":"ast","ast":"ast","assists":"ast","assist":"ast",
-        "s":"stl","stl":"stl","steals":"stl","steal":"stl",
-        "b":"blk","blk":"blk","blocks":"blk","block":"blk",
-    }
-    return aliases.get(k, k)
+    # храним как tid->pid->player
+    collected: dict[str, dict[str, dict]] = {}
 
-def _merge_statmap(dst: dict, src: dict | list | None, keys: list[str] | None = None):
-    if not src: return
-    if isinstance(src, list) and keys:
-        n = min(len(keys), len(src))
-        for i in range(n):
-            nk = _norm_key(keys[i])
-            dst[nk] = max(dst.get(nk, 0), _to_int_any(src[i], 0))
-    elif isinstance(src, dict):
-        for k, v in src.items():
-            nk = _norm_key(k)
-            dst[nk] = max(dst.get(nk, 0), _to_int_any(v, 0))
+    def ensure_player(tid: str, pid: str, first: str, last: str, name: str):
+        if tid not in collected: collected[tid] = {}
+        m = collected[tid].setdefault(pid or name or "", {"id": pid or "", "first": first or "", "last": last or "", "name": name or (first+" "+last).strip(), "pts":0,"reb":0,"ast":0,"stl":0,"blk":0})
+        return m
 
-def _harvest_from_group(statmap: dict, grp: dict, athlete_item: dict | None = None):
-    keys = [ _norm_key(k) for k in (grp.get("keys") or grp.get("labels") or []) ]
-    stats_obj = grp.get("stats")
-    if stats_obj is None and athlete_item is not None:
-        stats_obj = athlete_item.get("stats")
-    _merge_statmap(statmap, stats_obj, keys)
-    # totals/extra
-    _merge_statmap(statmap, grp.get("totals") or {})
-    if athlete_item:
-        ath = athlete_item.get("athlete") or {}
-        _merge_statmap(statmap, ath.get("stats") or {})
-        _merge_statmap(statmap, ath.get("totals") or {})
-        _merge_statmap(statmap, athlete_item.get("totals") or {})
+    def walk(node):
+        if isinstance(node, dict):
+            # потенциальные хедеры team/player
+            tid = str(node.get("teamId") or node.get("teamID") or node.get("team_id") or node.get("tid") or "")
+            # структура вида { "playerStats": [ { "player":{"id":..,"firstName":..,"lastName":..,"fullName":..}, "statCategories":[{"name":"PTS","value":31}, ...] } ] }
+            if "playerStats" in node and isinstance(node["playerStats"], list):
+                for it in node["playerStats"]:
+                    pl = it.get("player") or it.get("athlete") or {}
+                    pid = str(pl.get("id") or "")
+                    first = (pl.get("firstName") or "").strip()
+                    last  = (pl.get("lastName") or "").strip()
+                    name  = (pl.get("fullName") or pl.get("displayName") or "").strip()
+                    m = ensure_player(tid, pid, first, last, name)
+                    cats = it.get("statCategories") or it.get("stats") or []
+                    if isinstance(cats, dict):
+                        cats = [{"name":k,"value":v} for k,v in cats.items()]
+                    for c in cats:
+                        k = norm_key(str(c.get("name") or c.get("label") or c.get("abbr") or ""))
+                        v = to_int(c.get("value"))
+                        if k in ("pts","reb","ast","stl","blk"):
+                            m[k] = max(m[k], v)
+            # иногда stats лежат как массив объектов {label,value}
+            if "stats" in node and isinstance(node["stats"], list) and any(isinstance(x, dict) for x in node["stats"]) and ("player" in node or "athlete" in node):
+                pl = node.get("player") or node.get("athlete") or {}
+                pid = str(pl.get("id") or "")
+                first = (pl.get("firstName") or "").strip()
+                last  = (pl.get("lastName") or "").strip()
+                name  = (pl.get("fullName") or pl.get("displayName") or "").strip()
+                m = ensure_player(tid, pid, first, last, name)
+                for c in node["stats"]:
+                    k = norm_key(str(c.get("name") or c.get("label") or c.get("abbr") or ""))
+                    v = to_int(c.get("value"))
+                    if k in ("pts","reb","ast","stl","blk"):
+                        m[k] = max(m[k], v)
+            # общий случай: пройти внутрь
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
 
-def parse_players_from_box(box: dict) -> dict:
-    """ teamId -> [{"id","first","last","name","pts","reb","ast","stl","blk"}] """
-    if "gamepackageJSON" in box:
-        box = box["gamepackageJSON"]
-    out: dict[str, list[dict]] = {}
-    players_section = (box.get("boxscore", {}) or {}).get("players") or box.get("players") or []
-    for team_block in players_section:
-        team = team_block.get("team") or {}
-        tid = str(team.get("id") or "")
-        col: dict[str, dict] = {}
+    walk(j)
 
-        # стандартные группы
-        stats_groups = team_block.get("statistics") or []
-        # иногда есть athletes на верхнем уровне блока
-        athletes_direct = team_block.get("athletes") or []
+    for tid, players in collected.items():
+        teams.append({"teamId": tid, "players": list(players.values())})
+    return teams
 
-        # 1) из groups -> athletes
-        for grp in stats_groups:
-            for a in (grp.get("athletes") or []):
-                ath = a.get("athlete") or {}
-                pid = str(ath.get("id") or a.get("id") or "")
-                if not pid: continue
-                first = (ath.get("firstName") or a.get("firstName") or "").strip()
-                last  = (ath.get("lastName")  or a.get("lastName")  or "").strip()
-                name_full = (ath.get("displayName") or a.get("displayName") or ath.get("fullName") or "").strip()
-                if not (first and last):
-                    parts = [p for p in re.split(r"\s+", name_full) if p]
-                    if not first and parts: first = parts[0]
-                    if not last:  last  = " ".join(parts[1:]) if len(parts) > 1 else (parts[0] if parts else "")
-                m = col.setdefault(pid, {"id": pid, "first": first, "last": last,
-                                         "name": name_full or (first + (" " + last if last else "")) or "Игрок",
-                                         "pts":0,"reb":0,"ast":0,"stl":0,"blk":0})
-                statmap = {}
-                _harvest_from_group(statmap, grp, a)
-                for k in ("pts","reb","ast","stl","blk"):
-                    m[k] = max(m[k], int(statmap.get(k, 0)))
-
-        # 2) athletes_direct (редкие структуры)
-        for a in athletes_direct:
-            pid = str(a.get("id") or a.get("athlete", {}).get("id") or "")
-            if not pid: continue
-            ath = a.get("athlete") or a
-            first = (ath.get("firstName") or "").strip()
-            last  = (ath.get("lastName")  or "").strip()
-            name_full = (ath.get("displayName") or ath.get("fullName") or "").strip()
-            if not (first and last):
-                parts = [p for p in re.split(r"\s+", name_full) if p]
-                if not first and parts: first = parts[0]
-                if not last:  last  = " ".join(parts[1:]) if len(parts) > 1 else (parts[0] if parts else "")
-            m = col.setdefault(pid, {"id": pid, "first": first, "last": last,
-                                     "name": name_full or (first + (" " + last if last else "")) or "Игрок",
-                                     "pts":0,"reb":0,"ast":0,"stl":0,"blk":0})
-            statmap = {}
-            _merge_statmap(statmap, a.get("stats") or {})
-            _merge_statmap(statmap, a.get("totals") or {})
-            _merge_statmap(statmap, ath.get("stats") or {})
-            _merge_statmap(statmap, ath.get("totals") or {})
-            for k in ("pts","reb","ast","stl","blk"):
-                m[k] = max(m[k], int(statmap.get(k, 0)))
-
-        out[tid] = list(col.values())
-    return out
-
-def augment_from_summary(players_by_team: dict, summary: dict):
-    """Дополняем недостающие значения (pts,reb,ast,stl,blk) из summary."""
-    box = (summary.get("boxscore") or {})
-    teams = box.get("players") or []  # такая же структура, как в boxscore
-    for team_block in teams:
-        team = team_block.get("team") or {}
-        tid = str(team.get("id") or "")
-        if not tid: continue
-        col = {p["id"]: p for p in players_by_team.get(tid, [])}
-        # как в parse_players_from_box
-        stats_groups = team_block.get("statistics") or []
-        athletes_direct = team_block.get("athletes") or []
-        for grp in stats_groups:
-            for a in (grp.get("athletes") or []):
-                ath = a.get("athlete") or {}
-                pid = str(ath.get("id") or a.get("id") or "")
-                if not pid: continue
-                if pid not in col:
-                    col[pid] = {"id": pid, "first": (ath.get("firstName") or "").strip(),
-                                "last": (ath.get("lastName") or "").strip(),
-                                "name": (ath.get("displayName") or ath.get("fullName") or "").strip(),
-                                "pts":0,"reb":0,"ast":0,"stl":0,"blk":0}
-                m = col[pid]
-                statmap = {}
-                _harvest_from_group(statmap, grp, a)
-                for k in ("pts","reb","ast","stl","blk"):
-                    m[k] = max(m[k], int(statmap.get(k, 0)))
-        for a in athletes_direct:
-            pid = str(a.get("id") or a.get("athlete", {}).get("id") or "")
-            if not pid: continue
-            b = col.setdefault(pid, {"id": pid, "first": (a.get("firstName") or "").strip(),
-                                     "last": (a.get("lastName") or "").strip(),
-                                     "name": (a.get("displayName") or "").strip(),
-                                     "pts":0,"reb":0,"ast":0,"stl":0,"blk":0})
-            statmap = {}
-            _merge_statmap(statmap, a.get("stats") or {})
-            _merge_statmap(statmap, a.get("totals") or {})
-            aa = a.get("athlete") or {}
-            _merge_statmap(statmap, aa.get("stats") or {})
-            _merge_statmap(statmap, aa.get("totals") or {})
-            for k in ("pts","reb","ast","stl","blk"):
-                b[k] = max(b[k], int(statmap.get(k, 0)))
-        players_by_team[tid] = list(col.values())
-
+# ---------------- HIGHLIGHTS & RENDER ----------------
 def merge_with_leaders(players: list[dict], leaders: dict) -> list[dict]:
     by_id = {p["id"]: p for p in (players or [])}
     def apply(cat, key):
@@ -465,24 +453,28 @@ def merge_with_leaders(players: list[dict], leaders: dict) -> list[dict]:
             m = by_id.setdefault(pid, {"id":pid,"first":it.get("first",""),"last":it.get("last",""),
                                        "name":it.get("name",""),"pts":0,"reb":0,"ast":0,"stl":0,"blk":0})
             m[key] = max(m[key], val)
-    apply("points","pts"); apply("rebounds","reb"); apply("assists","ast"); apply("steals","stl"); apply("blocks","blk")
+    apply("points","pts"); apply("rebounds","reb"); apply("assists","ast")
+    # у Yahoo на табло STL/BLK редко бывают — оставим как есть
     return list(by_id.values())
 
 def _flame(pts:int, reb:int, ast:int, stl:int, blk:int) -> str:
     dd = sum(v>=10 for v in (pts,reb,ast))
     td = dd >= 3
-    if pts >= 35 or td or (pts>=30 and dd>=2):
-        return " 🔥"
+    if pts >= 35 or td or (pts>=30 and dd>=2): return " 🔥"
     return ""
 
+def _initial_ru(first_en: str, ru_first: str, fallback_name: str) -> str:
+    if ru_first: return ru_first[:1].upper()
+    base = first_en or (fallback_name.split()[0] if fallback_name else "")
+    return _latin_initial_to_cyr(base)
+
 def display_name_ru(p: dict, ru_first: str, ru_last: str) -> str:
-    # «И. Фамилия»; если русской фамилии нет — оставляем латиницу как есть
-    initial = ru_first.strip()[:1].upper() if ru_first else _latin_initial_to_cyr(p.get("first") or (p.get("name","").split()[:1] or [""])[0])
+    init = _initial_ru(p.get("first",""), ru_first, p.get("name",""))
     surname = (ru_last or "").strip()
     if not surname:
         last_en = (p.get("last") or (p.get("name","").split()[-1] if p.get("name") else ""))
-        surname = (last_en or "").strip()  # ← латиница, без транслита
-    return f"{initial}. {surname}"
+        surname = (last_en or "").strip()
+    return f"{init}. {surname}"
 
 def fmt_stat_line_ru(p: dict, ru_first: str, ru_last: str, bold: bool=False) -> str:
     name = display_name_ru(p, ru_first, ru_last)
@@ -503,8 +495,7 @@ def is_highlight(p: dict) -> bool:
 def select_highlights(players: list[dict], abbr: str) -> list[tuple[dict,bool]]:
     if not players: return []
     want_special = "demin" if abbr=="BKN" else ("goldin" if abbr=="MIA" else None)
-    def score_key(p):
-        return (p.get("pts",0), p.get("reb",0)+p.get("ast",0), p.get("stl",0)+p.get("blk",0))
+    def score_key(p): return (p.get("pts",0), p.get("reb",0)+p.get("ast",0), p.get("stl",0)+p.get("blk",0))
     sorted_all = sorted(players, key=score_key, reverse=True)
     picks = [p for p in sorted_all if is_highlight(p)][:2] or sorted_all[:1]
     spec = None
@@ -543,19 +534,13 @@ def build_game_block(game: dict, entities, offset_ref) -> str:
     head = head_a + "\n" + head_b + "\n"
     offset_ref[0] += 1
 
-    # игроки
-    box = fetch_boxscore(game["eventId"])
-    players_by_team = parse_players_from_box(box)
+    # игроки: тянем из боксов Yahoo
+    box_teams = fetch_box_yahoo(game["eventId"])  # [{teamId, players:[...]}]
+    by_tid = {t["teamId"]: t.get("players", []) for t in box_teams}
 
-    # усиливаем из summary, чтобы добрать «пропавшие» AST/REB/STL/BLK
-    try:
-        summary = fetch_summary(game["eventId"])
-        augment_from_summary(players_by_team, summary)
-    except Exception as e:
-        log("[summary fallback error]", e)
-
+    # добавим лидеров с табло (pts/reb/ast), если бокс дал пусто
     def lines_for_team(c):
-        arr = players_by_team.get(c["teamId"], [])
+        arr = by_tid.get(c["teamId"], [])
         arr = merge_with_leaders(arr, game.get("leaders_by_abbr", {}).get(c["abbr"], {}))
         picks = select_highlights(arr, c["abbr"])
         lines = []
@@ -570,13 +555,6 @@ def build_game_block(game: dict, entities, offset_ref) -> str:
     if la: lines.extend(la + [""])
     if lb: lines.extend(lb)
 
-    if not any(l.strip() for l in lines):
-        allp = (players_by_team.get(a["teamId"], []) or []) + (players_by_team.get(b["teamId"], []) or [])
-        if allp:
-            best = sorted(allp, key=lambda p:(p.get("pts",0), p.get("reb",0)+p.get("ast",0), p.get("stl",0)+p.get("blk",0)), reverse=True)[0]
-            ru_first, ru_last = resolve_ru_name(best.get("first",""), best.get("last",""), best.get("id",""))
-            lines.append(fmt_stat_line_ru(best, ru_first, ru_last, False))
-
     text = head + ("\n".join(l for l in lines if l.strip()))
     offset_ref[0] += len(text) - len(head)
     return text.strip()
@@ -588,7 +566,7 @@ def build_post_text_and_entities() -> tuple[str, list]:
     chosen_day = None
     games = []
     for d in pick_candidate_days():
-        games = fetch_scoreboard(d)
+        games = fetch_scoreboard_yahoo(d)
         if games:
             chosen_day = d
             break
@@ -611,7 +589,8 @@ def build_post_text_and_entities() -> tuple[str, list]:
 
     return (title + "\n".join(blocks)).strip(), entities
 
-def tg_send(text: str, entities: list[dict]):
+# ---------------- TELEGRAM ----------------
+def tg_send_single(text: str, entities: list[dict]):
     if not (BOT_TOKEN and CHAT_ID):
         raise RuntimeError("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы")
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -621,15 +600,17 @@ def tg_send(text: str, entities: list[dict]):
     if resp.status_code != 200:
         raise RuntimeError(f"Telegram error {resp.status_code}: {resp.text}")
 
+# ---------------- MAIN ----------------
 if __name__ == "__main__":
     try:
         loaded_map = _load_json(RU_MAP_PATH, {})
         loaded_pending = _load_json(RU_PENDING_PATH, [])
+        TEAM_CUSTOM_IDS.update(_load_json(TEAM_CUSTOM_IDS_PATH, {}))
         if isinstance(loaded_map, dict): RU_MAP.update(loaded_map)
         if isinstance(loaded_pending, list): RU_PENDING.extend(loaded_pending)
 
         text, entities = build_post_text_and_entities()
-        tg_send(text, entities)
+        tg_send_single(text, entities)
 
         _save_json(RU_PENDING_PATH, RU_PENDING)
         _save_json(RU_MAP_PATH, RU_MAP)
