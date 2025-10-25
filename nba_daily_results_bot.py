@@ -7,11 +7,9 @@ NBA Daily Results → Telegram (RU)
 • Пары: ESPN site.api (основной) + BallDontLie (добавляем недостающие), по датам ET±1 и Europe/London.
 • Счёт/игроки/русские фамилии: приоритетно Sports.ru (боксскор), фоллбек — ESPN boxscore.
 • Рекорды (W-L) после матча: ESPN site.api.
-• Формат: названия команд и эмодзи видны, счёт и игроки завернуты в спойлеры. У победителя счёт жирным.
-• Правила выбора игроков:
-  – минимум один, максимум два на команду;
-  – второй добавляется, если ≥20 очков ИЛИ дабл-дабл ИЛИ ≥6 перехватов/блок-шотов;
-  – спец: если играл Егор Дёмин (BKN) или Влад Голдин (MIA) — показываем его с 3 максимальными метриками (жирным).
+• Формат: названия команд и эмодзи видны, счёт и игроки — в спойлерах. У победителя счёт жирным.
+• Выбор игроков: ≥1, максимум 2 на команду; второй если ≥20 PTS или дабл-дабл или ≥6 STL/BLK.
+• Спец: Дёмин (BKN), Голдин (MIA) — всегда, жирным, 3 лучшие метрики.
 """
 
 import os, sys, re, json
@@ -30,7 +28,7 @@ from bs4 import BeautifulSoup
 # -------- ENV --------
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-TEAM_EMOJI_JSON = os.getenv("TEAM_EMOJI_JSON", "").strip()  # JSON: {"BOS":"<unicode or custom_emoji_id>", ...}
+TEAM_EMOJI_JSON = os.getenv("TEAM_EMOJI_JSON", "").strip()  # {"BOS":"<unicode or custom_emoji_id>", ...}
 
 # -------- HTTP --------
 HTTP_TIMEOUT = 9
@@ -48,7 +46,7 @@ def make_session():
     ad = _mk_adapter()
     s.mount("https://", ad); s.mount("http://", ad)
     s.headers.update({
-        "User-Agent": "NBA-DailyResultsBot/4.2 (entities+UTF16 custom-emoji, sportsru+espn)",
+        "User-Agent": "NBA-DailyResultsBot/4.3 (HTML <tg-emoji>, sportsru+espn)",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
         "Connection": "close",
     })
@@ -114,13 +112,17 @@ TEAM_EMOJI_DEFAULT = {
 }
 
 def _as_tg_emoji(val) -> str:
-    # Unicode -> вернуть как есть; ID -> оборачиваем в тег, который позже конвертнём в entity
+    """
+    val:
+      • Unicode-эмодзи — вернём как есть;
+      • ID кастом-эмодзи (строка/число, можно с префиксом id:) — завернём в <tg-emoji emoji-id="...">🙂</tg-emoji>.
+    """
     if val is None: return ""
     s = str(val).strip()
     m = re.fullmatch(r'(?:id:)?(\d{10,})', s)
     if m:
         cid = m.group(1)
-        return f'<tg-emoji emoji-id="{cid}">🏀</tg-emoji>'
+        return f'<tg-emoji emoji-id="{cid}">🙂</tg-emoji>'
     return s
 
 def load_team_emojis():
@@ -135,7 +137,7 @@ def load_team_emojis():
 
 TEAM_EMOJI = load_team_emojis()
 def emoji(abbr: str) -> str:
-    return TEAM_EMOJI.get(norm_abbr(abbr), _as_tg_emoji("🏀"))
+    return TEAM_EMOJI.get(norm_abbr(abbr), "🏀")
 
 # -------- SPORTS.RU --------
 def day_url(d: date) -> str:
@@ -471,69 +473,11 @@ def format_player_special(p: dict) -> str:
     chosen=stats[:3]
     return f"{name}: " + ", ".join(ru_forms(k,v) for k,v in chosen) + hot_mark(p)
 
-# -------- Спойлер / Разделитель / HTML→entities / UTF-16 --------
+# -------- Спойлер / Разделитель --------
 def sp(s: str) -> str: return f'<span class="tg-spoiler">{s}</span>'
 SEP = "–––––––––––––––––––––––"
 
-# ловим <b>, </b>, <span class="tg-spoiler">, </span>, <tg-emoji emoji-id="...">…</tg-emoji>
-_TAG = re.compile(r'(<b>|</b>|<span class="tg-spoiler">|</span>|<tg-emoji emoji-id="(\d{10,})">.*?</tg-emoji>)', re.S)
-
-def html_to_plain_entities(text: str) -> tuple[str, list[dict]]:
-    out = []
-    entities = []
-    bold_stack = []
-    spoiler_stack = []
-
-    i = 0
-    for m in _TAG.finditer(text):
-        out.append(text[i:m.start()])
-        pos = len("".join(out))
-
-        token = m.group(0)
-        cid = m.group(2)
-
-        if token == "<b>":
-            bold_stack.append(pos)
-        elif token == "</b>":
-            if bold_stack:
-                start = bold_stack.pop()
-                if pos > start:
-                    entities.append({"type":"bold","offset":start,"length":pos-start})
-        elif token == '<span class="tg-spoiler">':
-            spoiler_stack.append(pos)
-        elif token == "</span>":
-            if spoiler_stack:
-                start = spoiler_stack.pop()
-                if pos > start:
-                    entities.append({"type":"spoiler","offset":start,"length":pos-start})
-        else:
-            # Вставляем обычный emoji-плейсхолдер (важно: не произвольный символ)
-            out.append("🙂")  # длина = 1 code point (2 UTF-16 units)
-            entities.append({"type":"custom_emoji","offset":pos,"length":1,"custom_emoji_id":cid})
-
-        i = m.end()
-
-    out.append(text[i:])
-    plain = "".join(out)
-    return plain, entities
-
-def to_utf16_entities(plain: str, entities: list[dict]) -> list[dict]:
-    # Переводим offset/length из code points в UTF-16 code units (требование Telegram)
-    pref = [0]*(len(plain)+1)
-    for i,ch in enumerate(plain):
-        pref[i+1] = pref[i] + (2 if ord(ch) > 0xFFFF else 1)
-    fixed=[]
-    for e in entities:
-        off = int(e["offset"]); ln = int(e["length"])
-        off16 = pref[off]
-        end16 = pref[off+ln]
-        ne = dict(e)
-        ne["offset"] = off16
-        ne["length"] = end16 - off16
-        fixed.append(ne)
-    return fixed
-
-# -------- Блоки вывода --------
+# -------- Блоки --------
 def format_score_line(name_ru: str, abbr: str, score: int, winner: bool, record: str, ot_str: str) -> str:
     score_txt = f"<b>{score}</b>" if winner else f"{score}"
     if ot_str and not winner: score_txt += ot_str
@@ -639,17 +583,15 @@ def build_post() -> str:
 
     return (title + "".join(blocks)).strip()
 
-# -------- Telegram (entities с UTF-16) --------
+# -------- Telegram --------
 def tg_send(text: str):
     if not (BOT_TOKEN and CHAT_ID):
         raise RuntimeError("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы")
-    plain, ents = html_to_plain_entities(text)
-    ents_utf16 = to_utf16_entities(plain, ents)
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     r = S.post(url, json={
         "chat_id": CHAT_ID,
-        "text": plain,
-        "entities": ents_utf16,
+        "text": text,
+        "parse_mode": "HTML",           # используем HTML, чтобы <tg-emoji> работал
         "disable_web_page_preview": True,
     }, timeout=HTTP_TIMEOUT)
     if r.status_code != 200:
