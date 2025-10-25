@@ -31,7 +31,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4 lxml
 
-      # 1) Быстрая проверка секрета (не выводим сами ID)
+      # 1) Проверяем секрет (не выводим ID)
       - name: Sanity check TEAM_EMOJI_JSON
         env:
           TEAM_EMOJI_JSON: ${{ secrets.TEAM_EMOJI_JSON }}
@@ -52,14 +52,14 @@ jobs:
           print('Values that look like custom_emoji_id:', looks_like_ids, 'of', len(d))
           PY
 
-      # 2) Спросим у Telegram, сколько из этих ID он реально узнаёт
+      # 2) Узнаёт ли Telegram эти ID
       - name: Validate custom emoji IDs against Telegram
         env:
           TEAM_EMOJI_JSON:    ${{ secrets.TEAM_EMOJI_JSON }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
           python - <<'PY'
-          import os, json, re, urllib.parse, urllib.request
+          import os, json, re, urllib.parse, urllib.request, urllib.error
           s = os.getenv('TEAM_EMOJI_JSON'); token = os.getenv('TELEGRAM_BOT_TOKEN')
           if not (s and token):
               print('Skip: no TEAM_EMOJI_JSON or TELEGRAM_BOT_TOKEN'); raise SystemExit(0)
@@ -74,8 +74,13 @@ jobs:
               print('No numeric IDs found'); raise SystemExit(0)
           data = urllib.parse.urlencode({'custom_emoji_ids': ','.join(uniq)}).encode()
           url = f"https://api.telegram.org/bot{token}/getCustomEmojiStickers"
-          with urllib.request.urlopen(url, data=data, timeout=20) as r:
-              j = json.loads(r.read().decode('utf-8'))
+          try:
+              with urllib.request.urlopen(url, data=data, timeout=20) as r:
+                  j = json.loads(r.read().decode('utf-8'))
+          except urllib.error.HTTPError as e:
+              print('HTTPError', e.code, e.reason)
+              print(e.read().decode('utf-8'))
+              raise
           ok = j.get('ok'); res = j.get('result') or []
           print('Bot API ok:', ok, '| recognized IDs:', len(res), 'of', len(uniq))
           if not ok or len(res) == 0:
@@ -84,7 +89,7 @@ jobs:
               print('⚠️ Часть ID не распознана — проверь источник этих ID.')
           PY
 
-      # 3) Отправим одно тестовое сообщение с NYK через entities (без HTML)
+      # 3) Пробуем отправить 1 custom emoji (NYK) через entities и печатаем тело ошибки при 400
       - name: Send one test emoji (NYK) via entities
         if: ${{ always() }}
         env:
@@ -93,7 +98,7 @@ jobs:
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python - <<'PY'
-          import os, json, re, urllib.request
+          import os, json, re, urllib.request, urllib.error
           token = os.getenv('TELEGRAM_BOT_TOKEN')
           chat  = os.getenv('TELEGRAM_CHAT_ID')
           d = json.loads(os.getenv('TEAM_EMOJI_JSON','{}'))
@@ -117,8 +122,13 @@ jobs:
             data=data,
             headers={"Content-Type": "application/json"}
           )
-          with urllib.request.urlopen(req, timeout=20) as r:
-              print('Test message status:', r.status)
+          try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                print('Test message status:', r.status)
+          except urllib.error.HTTPError as e:
+            print('HTTPError', e.code, e.reason)
+            print(e.read().decode('utf-8'))
+            raise
           PY
 
       # 4) Запускаем бота — сюда прокидываем секрет!
