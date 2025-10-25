@@ -3,10 +3,12 @@
 
 """
 NBA Daily Results → Telegram (RU) — Sports.ru primary, ESPN cross-check (+spoilers)
-Правки:
-  • Сбор всех матчей со страницы дня sports.ru (без требования "X : Y" в тексте ссылки) + нормализация URL.
-  • ESPN cross-check по трём датам (day-1, day, day+1). Если после фильтрации пропало >2 матчей — оставляем sports.ru.
-  • Спойлеры: счёт/ОТ и строки игроков скрыты; видны эмодзи и названия команд.
+
+• Сбор всех матчей со страницы дня sports.ru (нормализация URL, без дубликатов).
+• ESPN cross-check по трём датам (day-1, day, day+1). Если после фильтрации пропало >2 матчей — оставляем sports.ru.
+• Спойлеры: счёт/ОТ и строки игроков скрыты; видны эмодзи и названия команд.
+• Фикс импорта Retry (без 'urllib3.util_retry'); запасной адаптер, если Retry недоступен.
+• Используем BeautifulSoup с "html.parser" (без зависимости от lxml).
 """
 
 import os, sys, re, json, time
@@ -16,11 +18,10 @@ from urllib.parse import urlparse, urlunparse
 
 import requests
 from requests.adapters import HTTPAdapter
-from urllib3.util_retry import Retry as _Retry  # PyPI alias sometimes differs
 try:
-    from urllib3.util.retry import Retry
+    from urllib3.util.retry import Retry  # корректный путь импорта
 except Exception:
-    Retry = _Retry
+    Retry = None
 from bs4 import BeautifulSoup
 
 # ---------- ENV ----------
@@ -29,19 +30,29 @@ CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TEAM_EMOJI_JSON = os.getenv("TEAM_EMOJI_JSON", "").strip()  # опционально
 
 # ---------- HTTP ----------
+def _make_adapter():
+    if Retry is not None:
+        r = Retry(
+            total=6, connect=6, read=6, backoff_factor=0.6,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST"]
+        )
+        return HTTPAdapter(max_retries=r)
+    # запасной вариант, если Retry недоступен
+    return HTTPAdapter(max_retries=3)
+
 def make_session():
     s = requests.Session()
-    r = Retry(total=6, connect=6, read=6, backoff_factor=0.6,
-              status_forcelist=[429,500,502,503,504],
-              allowed_methods=["GET","POST"])
-    s.mount("https://", HTTPAdapter(max_retries=r))
+    ad = _make_adapter()
+    s.mount("https://", ad)
+    s.mount("http://", ad)
     s.headers.update({
-        "User-Agent": "NBA-DailyResultsBot/2.6 (Sports.ru + ESPN cross-check, spoilers)",
+        "User-Agent": "NBA-DailyResultsBot/2.6.1 (Sports.ru + ESPN cross-check, spoilers)",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
     })
     return s
-S = make_session()
 
+S = make_session()
 def log(*a): print(*a, file=sys.stderr)
 
 # ---------- DATE / RU ----------
@@ -63,6 +74,7 @@ def pick_report_date() -> date:
     if now.hour < 11:  # утро -> вчерашний игровой день
         base = base - timedelta(days=1)
     return base
+
 def pick_candidate_days():
     d = pick_report_date()
     return [d, d - timedelta(days=1), d - timedelta(days=2)]
@@ -91,6 +103,7 @@ def load_team_emoji_map():
         except Exception:
             pass
     return TEAM_EMOJI_FALLBACK
+
 TEAM_EMOJI = load_team_emoji_map()
 def team_emoji_by_abbr(abbr: str) -> str:
     return TEAM_EMOJI.get((abbr or "").upper(), "🏀")
@@ -152,7 +165,8 @@ def day_url(d: date) -> str:
 def get_html(url: str):
     r = S.get(url, timeout=25)
     if r.status_code != 200: return None
-    return BeautifulSoup(r.text, "lxml")
+    # без зависимости от lxml
+    return BeautifulSoup(r.text, "html.parser")
 
 def _normalize_match_url(u: str) -> str:
     full = "https://www.sports.ru" + u if u.startswith("/") else u
