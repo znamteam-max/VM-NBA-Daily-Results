@@ -4,14 +4,13 @@
 """
 NBA Daily Results → Telegram (RU)
 
-• Один пост на день. В строке матча: эмодзи-логотип + русское название + счёт + (ОТ/2ОТ/...).
+• Один пост на день. В строке матча: эмодзи-логотип/кастом-эмодзи + русское название + счёт + (ОТ/2ОТ/...).
 • Игроки: только «выдающиеся» (1–2 на команду). Критерии:
     ≥30 PTS  | дабл-дабл (PTS/REB/AST) | ≥15 REB | ≥12 AST | ≥4 STL | ≥4 BLK.
   В строке показываем очки всегда; REB/AST — если ≥5; STL/BLK — если ≥4; добавляем 🔥 для супер-игр.
 • BKN: всегда включаем Дёмина (если играл), MIA: Голдина — выделяем жирным.
 • Источники: ESPN API (scoreboard/boxscore). Если boxscore пуст — берём leaders из scoreboard.
-• Лого: стабильная таблица эмодзи. Если рядом положить team_emoji_ids.json с custom_emoji_id — бот начнёт
-  использовать кастом-эмодзи через Telegram entities (ничего менять в коде не нужно).
+• Кастом-эмодзи: если есть team_emoji_ids.json { "LAL": "custom_emoji_id", ... }, бот подставит их через entities.
 """
 
 import os, sys, re, json, time, unicodedata
@@ -54,7 +53,7 @@ TEAM_RU = {
     "MIA":"Майами","ORL":"Орландо","DAL":"Даллас","HOU":"Хьюстон","MEM":"Мемфис","NO":"Новый Орлеан",
     "NOP":"Новый Орлеан","SA":"Сан-Антонио","SAS":"Сан-Антонио","WSH":"Вашингтон","WAS":"Вашингтон",
 }
-TEAM_EMOJI = {  # компактные логотип-эмодзи
+TEAM_EMOJI = {  # компактные эмодзи-логотипы по умолчанию
     "ATL":"🦅","BOS":"☘️","BKN":"🕸️","NY":"🗽","NYK":"🗽","PHI":"🔔",
     "TOR":"🦖","CHI":"🐂","CLE":"🛡️","DET":"🔧","IND":"💫","MIL":"🦌",
     "DEN":"⛏️","MIN":"🐺","OKC":"⚡","POR":"🧭","UTA":"🎷","UTAH":"🎷",
@@ -62,8 +61,7 @@ TEAM_EMOJI = {  # компактные логотип-эмодзи
     "MIA":"🔥","ORL":"✨","DAL":"🐎","HOU":"🚀","MEM":"🐻","NO":"🪶",
     "NOP":"🪶","SA":"🪙","SAS":"🪙","WSH":"🧙","WAS":"🧙",
 }
-# Опционально: кастом-эмодзи Telegram из локального JSON { "LAL": "custom_emoji_id", ... }
-TEAM_CUSTOM_IDS_PATH = "team_emoji_ids.json"
+TEAM_CUSTOM_IDS_PATH = "team_emoji_ids.json"  # опционально
 TEAM_CUSTOM_IDS = {}
 
 # --------- RUS DATES ----------
@@ -86,7 +84,7 @@ def make_session():
               allowed_methods=["GET","POST"])
     s.mount("https://", HTTPAdapter(max_retries=r))
     s.headers.update({
-        "User-Agent": "NBA-DailyResultsBot/2.3 (+espn; sports.ru resolver)",
+        "User-Agent": "NBA-DailyResultsBot/2.4 (+espn; sports.ru resolver)",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
     })
     return s
@@ -173,26 +171,27 @@ def _queue_pending(pid: str, first: str, last: str):
 def resolve_ru_surname(first: str, last: str, athlete_id: str) -> str:
     if athlete_id and athlete_id in RU_MAP:
         return RU_MAP[athlete_id]
-    last_clean = last.strip()
+    last_clean = (last or "").strip()
     if last_clean in {"Jr.","Jr","III","II"}:
-        last_clean = f"{first.strip()} {last_clean}"
-    url = _sportsru_try_profile(first, last)
+        last_clean = f"{(first or '').strip()} {last_clean}"
+    url = _sportsru_try_profile(first or "", last or "")
     if url:
         ru = _sportsru_from_profile(url)
         if ru:
             if athlete_id: RU_MAP[athlete_id] = ru
             return ru
-    ru = _sportsru_search(first, last)
+    ru = _sportsru_search(first or "", last or "")
     if ru:
         if athlete_id: RU_MAP[athlete_id] = ru
         return ru
     if last_clean in EXCEPT_LAST: ru = EXCEPT_LAST[last_clean]
-    elif last in EXCEPT_LAST:    ru = EXCEPT_LAST[last]
-    else:                        ru = last or first
-    if athlete_id: _queue_pending(athlete_id, first, last)
+    elif (last or "") in EXCEPT_LAST: ru = EXCEPT_LAST[last]
+    else: ru = last or first or ""
+    if athlete_id and not RU_MAP.get(athlete_id):
+        _queue_pending(athlete_id, first or "", last or "")
     return ru
 
-# --------- HTTP JSON ----------
+# --------- JSON fetch ----------
 def _get_json(url: str) -> dict:
     r = S.get(url, timeout=25)
     if r.status_code != 200:
@@ -239,6 +238,7 @@ def fetch_scoreboard(day: date) -> list[dict]:
                 team = c.get("team") or {}
                 abbr = (team.get("abbreviation") or "").upper()
                 if abbr == "GS": abbr = "GSW"
+
                 # leaders из scoreboard (фоллбэк)
                 leaders_raw = c.get("leaders") or []
                 leaders = {}
@@ -252,6 +252,7 @@ def fetch_scoreboard(day: date) -> list[dict]:
                                 "first": (ath.get("firstName") or "").strip(),
                                 "last": (ath.get("lastName") or "").strip(),
                                 "value": float(item.get("value") or 0),
+                                "name": (ath.get("displayName") or ath.get("fullName") or "").strip()
                             })
                         except Exception:
                             pass
@@ -264,7 +265,7 @@ def fetch_scoreboard(day: date) -> list[dict]:
                 rec = ""
                 for recobj in c.get("records") or []:
                     if recobj.get("type") == "total" and recobj.get("summary"):
-                        rec = recobj["summary"]  # "2-0"
+                        rec = recobj["summary"]
                 game["competitors"].append({
                     "abbr": abbr,
                     "score": score,
@@ -292,7 +293,8 @@ def _to_int(x, default=0) -> int:
 
 def parse_players_from_box(box: dict) -> dict:
     """
-    Возвращаем: teamId -> [{"id","first","last","pts","reb","ast","stl","blk"}]
+    teamId -> [{"id","first","last","name","pts","reb","ast","stl","blk"}]
+    (имена берём надёжно: firstName/lastName -> fullName/displayName -> разбор)
     """
     out: dict[str, list[dict]] = {}
     players_section = (box.get("boxscore", {}) or {}).get("players") or box.get("players") or []
@@ -307,15 +309,25 @@ def parse_players_from_box(box: dict) -> dict:
                 ath = a.get("athlete") or {}
                 pid = str(ath.get("id") or "")
                 if not pid: continue
-                name = ath.get("displayName") or ath.get("shortName") or ""
-                parts = [p for p in re.split(r"\s+", name.strip()) if p]
-                first = parts[0] if parts else ""
-                last  = " ".join(parts[1:]) if len(parts) > 1 else (parts[0] if parts else "")
+
+                # НОРМАЛИЗУЕМ ИМЕНА НАДЁЖНО
+                first = (ath.get("firstName") or "").strip()
+                last  = (ath.get("lastName")  or "").strip()
+                name_full = (ath.get("displayName") or ath.get("fullName") or "").strip()
+                if not (first and last):
+                    parts = [p for p in re.split(r"\s+", name_full) if p]
+                    if not first and parts:
+                        first = parts[0]
+                    if not last:
+                        last = " ".join(parts[1:]) if len(parts) > 1 else (parts[0] if parts else "")
+                name_fallback = name_full or (first + (" " + last if last else "")) or "Игрок"
+
                 stats_list = a.get("stats") or []
                 statmap = {}
                 n = min(len(keys), len(stats_list))
                 for i in range(n):
                     statmap[keys[i]] = stats_list[i]
+
                 pts = _to_int(statmap.get("pts") or statmap.get("points") or 0)
                 reb = _to_int(statmap.get("reb") or statmap.get("rebs") or statmap.get("totreb") or statmap.get("rebounds") or 0)
                 ast = _to_int(statmap.get("ast") or statmap.get("assists") or 0)
@@ -323,7 +335,7 @@ def parse_players_from_box(box: dict) -> dict:
                 blk = _to_int(statmap.get("blk") or statmap.get("blocks") or 0)
 
                 if pid not in col:
-                    col[pid] = {"id": pid, "first": first, "last": last,
+                    col[pid] = {"id": pid, "first": first, "last": last, "name": name_fallback,
                                 "pts": pts, "reb": reb, "ast": ast, "stl": stl, "blk": blk}
                 else:
                     m = col[pid]
@@ -344,9 +356,12 @@ def _flame(pts:int, reb:int, ast:int, stl:int, blk:int) -> str:
         return " 🔥"
     return ""
 
-def fmt_stat_line_ru(p: dict, ru_surname: str, bold: bool=False) -> str:
+def fmt_stat_line_ru(p: dict, ru_surname: str | None, bold: bool=False) -> str:
+    # надёжный фоллбэк имени, если по какой-то причине пусто
+    base_name = (ru_surname or "").strip() or (p.get("last") or "").strip() or (p.get("first") or "").strip() or (p.get("name") or "Игрок")
+    name = f"<b>{base_name}</b>" if bold else base_name
+
     pts, reb, ast, stl, blk = p["pts"], p["reb"], p["ast"], p["stl"], p["blk"]
-    name = f"<b>{ru_surname}</b>" if bold else ru_surname
     parts = [f"{name}: {pts} {ru_plural(pts, ('очко','очка','очков'))}"]
     if reb >= 5: parts.append(f"{reb} {ru_plural(reb, ('подбор','подбора','подборов'))}")
     if ast >= 5: parts.append(f"{ast} {ru_plural(ast, ('передача','передачи','передач'))}")
@@ -364,9 +379,6 @@ def is_highlight(p: dict) -> bool:
     return False
 
 def select_highlights(players: list[dict], abbr: str) -> list[tuple[dict,bool]]:
-    """
-    Возвращает 1–2 игрока, добавляя спец-игроков (Дёмин/MIA Голдин) при наличии.
-    """
     if not players: return []
     want_special = "demin" if abbr=="BKN" else ("goldin" if abbr=="MIA" else None)
 
@@ -380,7 +392,7 @@ def select_highlights(players: list[dict], abbr: str) -> list[tuple[dict,bool]]:
 
     spec = None
     if want_special:
-        spec = next((p for p in players_sorted if p.get("last","").strip().lower().endswith(want_special)), None)
+        spec = next((p for p in players_sorted if (p.get("last","") or p.get("name","")).strip().lower().endswith(want_special)), None)
         if spec and all(spec["id"] != x["id"] for x in picks):
             if len(picks) == 2:
                 picks[1] = spec
@@ -392,12 +404,8 @@ def select_highlights(players: list[dict], abbr: str) -> list[tuple[dict,bool]]:
         out.append((p, bool(spec and p["id"] == spec["id"])))
     return out
 
-# --------- SCOREBOARD leaders → fake players (фоллбэк) ----------
+# --------- leaders → fake players (фоллбэк) ----------
 def leaders_to_players(leaders: dict) -> list[dict]:
-    """
-    leaders: {"points":[{id,first,last,value},...], "rebounds":[...], "assists":[...], "steals":[...], "blocks":[...]}
-    -> список игроков с агрегированными значениями pts, reb, ast, stl, blk.
-    """
     by_id: dict[str, dict] = {}
     def add(cat, key):
         for item in leaders.get(cat, []) or []:
@@ -405,9 +413,14 @@ def leaders_to_players(leaders: dict) -> list[dict]:
             if not pid: continue
             m = by_id.setdefault(pid, {
                 "id": pid, "first": item.get("first",""), "last": item.get("last",""),
+                "name": item.get("name","") or f"{item.get('first','')} {item.get('last','')}".strip(),
                 "pts":0,"reb":0,"ast":0,"stl":0,"blk":0
             })
-            m[key] = max(m[key], int(item.get("value") or 0))
+            try:
+                v = int(float(item.get("value") or 0))
+            except Exception:
+                v = 0
+            m[key] = max(m[key], v)
     add("points","pts"); add("rebounds","reb"); add("assists","ast"); add("steals","stl"); add("blocks","blk")
     return list(by_id.values())
 
@@ -415,29 +428,22 @@ def leaders_to_players(leaders: dict) -> list[dict]:
 SEP = "–––––––––––––––––––––––"
 
 def _team_line_text(abbr: str, score: int, record: str, winner: bool, ot_suffix: str, entities, offset_ref) -> str:
-    """
-    Возвращает текст для одной строки команды и (при наличии custom emoji id) добавляет entity.
-    """
     name = TEAM_RU.get(abbr, abbr)
     s   = f"<b>{score}</b>" if winner else f"{score}"
     rec = f" ({record})" if record else ""
-    emo = TEAM_EMOJI.get(abbr, "🏀")
     use_custom = TEAM_CUSTOM_IDS.get(abbr)
     if use_custom:
-        # вставим один placeholder '■' и оформим его custom_emoji
-        start = offset_ref[0]
-        # текст до эмодзи + сам символ + пробел
         piece = f"■ {name}: {s}{rec}{ot_suffix}"
-        # entity: единственный символ '■' заменить на custom emoji
         entities.append({
             "type": "custom_emoji",
-            "offset": start,
+            "offset": offset_ref[0],
             "length": 1,
             "custom_emoji_id": use_custom
         })
-        offset_ref[0] += len(piece) + 1  # + '\n' позже
+        offset_ref[0] += len(piece) + 1  # + '\n' дальше
         return piece
     else:
+        emo = TEAM_EMOJI.get(abbr, "🏀")
         piece = f"{emo} {name}: {s}{rec}{ot_suffix}"
         offset_ref[0] += len(piece) + 1
         return piece
@@ -446,13 +452,14 @@ def build_game_block(game: dict, entities, offset_ref) -> str:
     comp = game["competitors"]
     if len(comp) != 2: return ""
     a, b = comp[0], comp[1]
-    # заголовок матча (две строки)
+
+    # Заголовок матча (две строки)
     head_a = _team_line_text(a["abbr"], a["score"], a["record"], a["winner"], "", entities, offset_ref)
     head_b = _team_line_text(b["abbr"], b["score"], b["record"], b["winner"], game.get("ot",""), entities, offset_ref)
     head = head_a + "\n" + head_b + "\n"
-    offset_ref[0] += 1  # за дополнительный \n перед игроками
+    offset_ref[0] += 1  # пустая строка перед игроками
 
-    # игроки
+    # Игроки
     box = fetch_boxscore(game["eventId"])
     players_by_team = parse_players_from_box(box)
 
@@ -461,8 +468,7 @@ def build_game_block(game: dict, entities, offset_ref) -> str:
 
     def lines_for_team(c):
         arr = players_by_team.get(c["teamId"], [])
-        # если boxscore пуст у этой команды — используем leaders из scoreboard
-        if not arr:
+        if not arr:  # boxscore пуст — берём leaders
             arr = leaders_to_players(game.get("leaders_by_abbr", {}).get(c["abbr"], {}))
         picks = select_highlights(arr, c["abbr"])
         out = []
@@ -477,11 +483,9 @@ def build_game_block(game: dict, entities, offset_ref) -> str:
     if la: lines.extend(la + [""])
     if lb: lines.extend(lb)
 
-    # общий резерв, если внезапно пусто
     if added == 0:
         all_players = (players_by_team.get(a["teamId"], []) or []) + (players_by_team.get(b["teamId"], []) or [])
         if not all_players:
-            # последний резерв — взять топ по очкам из leaders обеих команд
             for ab in (a["abbr"], b["abbr"]):
                 all_players += leaders_to_players(game.get("leaders_by_abbr", {}).get(ab, {}))
         if all_players:
@@ -490,12 +494,11 @@ def build_game_block(game: dict, entities, offset_ref) -> str:
             lines.append(fmt_stat_line_ru(best, ru, False))
 
     text = head + ("\n".join(l for l in lines if l.strip()))
-    offset_ref[0] += len(text) - len(head)  # только за часть «игроки»
+    offset_ref[0] += len(text) - len(head)
     return text.strip()
 
-# --------- POST (одним сообщением; при необходимости — делим аккуратно) ----------
+# --------- POST ----------
 def build_post_text_and_entities() -> tuple[str, list]:
-    # загрузка кастом-emoji ID если есть
     global TEAM_CUSTOM_IDS
     TEAM_CUSTOM_IDS = _load_json(TEAM_CUSTOM_IDS_PATH, {})
 
@@ -514,7 +517,7 @@ def build_post_text_and_entities() -> tuple[str, list]:
             f"{SEP}\n\n"
 
     entities: list[dict] = []
-    offset_ref = [len(title)]  # текущий смещение текста для entities
+    offset_ref = [len(title)]
 
     blocks = []
     for i, g in enumerate(games, 1):
@@ -522,7 +525,7 @@ def build_post_text_and_entities() -> tuple[str, list]:
         blocks.append(blk.strip())
         if i < len(games):
             blocks.append(f"\n{SEP}\n")
-            offset_ref[0] += len(SEP) + 2  # за разделитель + две переводы строк
+            offset_ref[0] += len(SEP) + 2
 
     return (title + "\n".join(blocks)).strip(), entities
 
@@ -532,9 +535,8 @@ def tg_send(text: str, entities: list[dict]):
         raise RuntimeError("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы")
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-    # стараемся уложиться в одно сообщение (Telegram лимит ~4096)
+    # стараемся уложиться в одно сообщение
     if len(text) > 3900:
-        # деление по разделителю, чтобы всё равно было мало частей
         parts = []
         t = text
         while len(t) > 3900:
@@ -544,7 +546,7 @@ def tg_send(text: str, entities: list[dict]):
             parts.append(t[:cut].rstrip())
             t = t[cut:].lstrip()
         parts.append(t)
-        # отправим первую часть с entities, остальные без (лого были только в заголовках матчей)
+
         first = True
         for part in parts:
             payload = {
@@ -572,7 +574,6 @@ def tg_send(text: str, entities: list[dict]):
 # --------- MAIN ----------
 if __name__ == "__main__":
     try:
-        # кэши: фамилии и очередь на проверку
         loaded_map = _load_json(RU_MAP_PATH, {})
         loaded_pending = _load_json(RU_PENDING_PATH, [])
         if isinstance(loaded_map, dict):
