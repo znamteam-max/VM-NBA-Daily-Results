@@ -2,12 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-NBA Daily Results → Telegram (RU) — Sports.ru primary, Covers∪ESPN pairs, spoilers.
+NBA Daily Results → Telegram (RU) — Sports.ru primary, Covers+ESPN+Sports.ru pairs, spoilers.
 
-• Матчи и игроки: Sports.ru (русские фамилии), быстро и параллельно.
-• Кол-во матчей и пары команд: объединение Covers + ESPN (порядок от Covers).
-• Если по паре нет страницы на sports.ru — добираем счёт/игроков через ESPN (короткие таймауты).
-• Счёт и строки игроков — под HTML-спойлером. Видны только названия команд и эмодзи.
+• Матчи/игроки: Sports.ru (русские фамилии), параллельно.
+• Пары дня: объединение Covers + ESPN + найденных матчей Sports.ru (порядок: Covers → ESPN → Sports.ru).
+• Если по паре нет страницы на Sports.ru — добираем счёт/игроков через ESPN.
+• Счёт и строки игроков — под HTML-спойлером; видны только названия команд и эмодзи.
+• В счёте: жирным число у победителя; после счёта — сезонный рекорд команды в скобках.
 • Спец-правила: Дёмин (BKN) и Голдин (MIA) — подробно (топ-3 метрики > 0), всегда, если играли.
 • Второй игрок добавляется, если: ≥20 очков ИЛИ дабл-дабл ИЛИ ≥6 перехватов/блок-шотов.
 """
@@ -46,8 +47,8 @@ def make_session():
     ad = _make_adapter()
     s.mount("https://", ad); s.mount("http://", ad)
     s.headers.update({
-        # ВАЖНО: только ASCII в заголовках
-        "User-Agent": "NBA-DailyResultsBot/3.3 (sports.ru primary, covers+espn pairs, spoilers)",
+        # Важно: только ASCII в заголовках
+        "User-Agent": "NBA-DailyResultsBot/3.4 (sports.ru primary, covers+espn pairs, spoilers)",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
         "Connection": "close",
     })
@@ -67,11 +68,17 @@ def ru_plural(n: int, forms: tuple[str,str,str]) -> str:
     if n1 == 1:      return forms[0]
     return forms[2]
 
-def pick_report_date() -> date:
+def pick_report_date_london() -> date:
     now = datetime.now(ZoneInfo("Europe/London"))
-    d = now.date()
-    if now.hour < 11: d = d - timedelta(days=1)
-    return d
+    return now.date() if now.hour >= 11 else (now.date() - timedelta(days=1))
+
+def candidate_days_for_feeds() -> list[date]:
+    # даём запас по дням в ET и в Лондоне, чтобы не терять «поздние» игры
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    base_et = now_et.date() if now_et.hour >= 8 else (now_et.date() - timedelta(days=1))
+    d_lon = pick_report_date_london()
+    cands = {base_et, base_et - timedelta(days=1), base_et + timedelta(days=1), d_lon}
+    return sorted(cands)
 
 # ---------- TEAMS / EMOJI ----------
 TEAM_RU_TO_ABBR = {
@@ -99,7 +106,6 @@ def load_team_emoji_map():
         except Exception:
             pass
     return TEAM_EMOJI_FALLBACK
-
 TEAM_EMOJI = load_team_emoji_map()
 def team_emoji_by_abbr(abbr: str) -> str:
     return TEAM_EMOJI.get((abbr or "").upper(), "🏀")
@@ -118,12 +124,26 @@ def canonical_ru_team(raw: str) -> str | None:
         if key in txt: return key
     return None
 
-# ---------- ESPN (резерв/пары) ----------
+# ---------- ESPN (резерв/пары/рекорды) ----------
 ESPN_SB = "https://site.web.api.espn.com/apis/v2/sports/basketball/nba/scoreboard?dates={yyyy}{mm}{dd}"
 ESPN_BOX = "https://site.web.api.espn.com/apis/v2/sports/basketball/nba/boxscore?event={eid}"
 
-def fetch_espn_completed(center_day: date) -> list[dict]:
-    url = ESPN_SB.format(yyyy=center_day.year, mm=str(center_day.month).zfill(2), dd=str(center_day.day).zfill(2))
+def _extract_record(rec_list) -> str:
+    # ищем summary вида "2-1"; если нет — собираем wins/losses
+    try:
+        for r in rec_list or []:
+            if r.get("type") == "total" and r.get("summary"):
+                return str(r["summary"])
+        wins = next((int(r.get("value")) for r in rec_list or [] if r.get("type")=="wins"), None)
+        loss = next((int(r.get("value")) for r in rec_list or [] if r.get("type")=="losses"), None)
+        if wins is not None and loss is not None:
+            return f"{wins}-{loss}"
+    except Exception:
+        pass
+    return ""
+
+def fetch_espn_completed_for_day(the_day: date) -> list[dict]:
+    url = ESPN_SB.format(yyyy=the_day.year, mm=str(the_day.month).zfill(2), dd=str(the_day.day).zfill(2))
     try:
         r = S.get(url, timeout=HTTP_TIMEOUT)
         if r.status_code != 200: return []
@@ -143,11 +163,13 @@ def fetch_espn_completed(center_day: date) -> list[dict]:
             t = c.get("team") or {}
             ab = (t.get("abbreviation") or "").upper()
             if ab == "GS": ab = "GSW"
+            record = _extract_record(c.get("records") or [])
             teams.append({
                 "abbr": ab,
                 "score": int(float(c.get("score", 0))),
                 "winner": bool(c.get("winner", False)),
                 "teamId": str(t.get("id") or ""),
+                "record": record,
             })
         if len(teams) != 2: continue
         ot = 0
@@ -164,6 +186,17 @@ def fetch_espn_completed(center_day: date) -> list[dict]:
         if pair in seen: continue
         seen.add(pair); uniq.append(g)
     return uniq
+
+def fetch_espn_completed_multi(days: list[date]) -> list[dict]:
+    all_events=[]
+    seen=set()
+    for d in days:
+        evs = fetch_espn_completed_for_day(d)
+        for e in evs:
+            pair = frozenset([e["teams"][0]["abbr"], e["teams"][1]["abbr"]])
+            if pair in seen: continue
+            seen.add(pair); all_events.append(e)
+    return all_events
 
 def fetch_espn_players(event_id: str) -> dict:
     try:
@@ -217,7 +250,6 @@ COVERS_URLS = [
     "https://www.covers.com/sports/nba/matchups?selectedDate={mdy}",   # MM/DD/YYYY
     "https://www.covers.com/sports/nba/matchups",                       # «сегодня»
 ]
-
 COVERS_TEAM_TO_ABBR = {
     "Atlanta Hawks":"ATL","Boston Celtics":"BOS","Brooklyn Nets":"BKN","Charlotte Hornets":"CHA","Chicago Bulls":"CHI",
     "Cleveland Cavaliers":"CLE","Dallas Mavericks":"DAL","Denver Nuggets":"DEN","Detroit Pistons":"DET","Golden State Warriors":"GSW",
@@ -226,11 +258,10 @@ COVERS_TEAM_TO_ABBR = {
     "Oklahoma City Thunder":"OKC","Orlando Magic":"ORL","Philadelphia 76ers":"PHI","Phoenix Suns":"PHX","Portland Trail Blazers":"POR",
     "Sacramento Kings":"SAC","San Antonio Spurs":"SAS","Toronto Raptors":"TOR","Utah Jazz":"UTA","Washington Wizards":"WAS",
 }
-
 TEAM_NAME_RE = "|".join(sorted(map(re.escape, COVERS_TEAM_TO_ABBR.keys()), key=len, reverse=True))
 COVERS_PAIR_RE = re.compile(rf"({TEAM_NAME_RE})\s+(?:at|vs\.?|@)\s+({TEAM_NAME_RE})", re.I)
 
-def fetch_covers_pairs(day: date) -> list[frozenset]:
+def fetch_covers_pairs_for_day(day: date) -> list[frozenset]:
     txt_variants = [day.strftime("%Y-%m-%d"), day.strftime("%m/%d/%Y")]
     pairs=[]
     seen=set()
@@ -253,6 +284,15 @@ def fetch_covers_pairs(day: date) -> list[frozenset]:
         if pairs:
             break
     return pairs
+
+def fetch_covers_pairs_multi(days: list[date]) -> list[frozenset]:
+    out=[]; seen=set()
+    for d in days:
+        ps = fetch_covers_pairs_for_day(d)
+        for p in ps:
+            if p in seen: continue
+            seen.add(p); out.append(p)
+    return out
 
 # ---------- SPORTS.RU ----------
 def day_url(d: date) -> str:
@@ -449,11 +489,17 @@ def pick_players_for_team(abbr: str, rows: list[dict]) -> list[tuple[dict,bool,b
     rows = sorted(rows, key=_score_key, reverse=True)
     out=[]
     top = rows[0]
-    special_key = "дёмин" if abbr == "BKN" else ("голдин" if abbr == "MIA" else None)
+    # спец-игроки: поддерживаем и кириллицу, и латиницу (на случай ESPN fallback)
+    special_keys = []
+    if abbr == "BKN":
+        special_keys = ["дёмин", "demin"]
+    elif abbr == "MIA":
+        special_keys = ["голдин", "goldin"]
     special=None
-    if special_key:
+    if special_keys:
         for p in rows:
-            if special_key in (p["name"] or "").lower():
+            nm = (p["name"] or "").lower()
+            if any(k in nm for k in special_keys):
                 special = p; break
     if special and special["name"] == top["name"]:
         out.append((special, True, True))
@@ -494,12 +540,25 @@ def fetch_sports_day_fast(d: date, max_workers: int = 10) -> list[dict]:
         seen.add(pair); uniq.append(g)
     return uniq
 
+# ---------- HEADERS ----------
+def format_score_line(name_ru: str, abbr: str, score: int, is_winner: bool, record: str, ot_str: str) -> str:
+    score_txt = f"<b>{score}</b>" if is_winner else f"{score}"
+    if ot_str and not is_winner:
+        score_txt = f"{score_txt}{ot_str}"
+    if record:
+        score_txt = f"{score_txt} ({record})"
+    return f"{TEAM_EMOJI.get(abbr,'🏀')} {name_ru}: {sp(score_txt)}"
+
 # ---------- BLOCK BUILDERS ----------
-def build_block_from_sports(info: dict) -> str:
+def build_block_from_sports(info: dict, rec_by_abbr: dict[str,str]) -> str:
     A, B = info["teamA"], info["teamB"]
     ot_str = "" if info["ot"] == 0 else (" (ОТ)" if info["ot"] == 1 else f" ({info['ot']} ОТ)")
-    head = f"{A['emoji']} {A['name']}: {sp(str(A['score']))}\n" \
-           f"{B['emoji']} {B['name']}: {sp(str(B['score']) + ot_str)}\n\n"
+    a_win = A["score"] > B["score"]
+    b_win = B["score"] > A["score"]
+    lineA = format_score_line(A["name"], A["abbr"], A["score"], a_win, rec_by_abbr.get(A["abbr"], ""), "")
+    lineB = format_score_line(B["name"], B["abbr"], B["score"], b_win, rec_by_abbr.get(B["abbr"], ""), ot_str)
+    head = f"{lineA}\n{lineB}\n\n"
+
     rowsA = info["players"].get(A["name"], [])
     rowsB = info["players"].get(B["name"], [])
     a_lines = [sp(format_player_line_special_detail(p, True) if det else format_player_line_regular(p, bold))
@@ -510,7 +569,7 @@ def build_block_from_sports(info: dict) -> str:
     b_lines = [x for x in b_lines if x.strip()]
     lines=[]
     if a_lines: lines.extend(a_lines)
-    if a_lines and b_lines: lines.append("")
+    if a_lines and b_lines: lines.append("")  # отступ между командами
     if b_lines: lines.extend(b_lines)
     return head + ("\n".join(lines) if lines else "")
 
@@ -518,10 +577,11 @@ def build_block_from_espn(e: dict) -> str:
     t1, t2 = e["teams"][0], e["teams"][1]
     a_abbr, b_abbr = t1["abbr"], t2["abbr"]
     a_name = ABBR_TO_TEAM_RU.get(a_abbr, a_abbr); b_name = ABBR_TO_TEAM_RU.get(b_abbr, b_abbr)
-    a_emo = team_emoji_by_abbr(a_abbr); b_emo = team_emoji_by_abbr(b_abbr)
     ot_str = "" if e.get("ot",0) == 0 else (" (ОТ)" if e["ot"] == 1 else f" ({e['ot']} ОТ)")
-    head = f"{a_emo} {a_name}: {sp(str(t1['score']))}\n" \
-           f"{b_emo} {b_name}: {sp(str(t2['score']) + ot_str)}\n\n"
+    lineA = format_score_line(a_name, a_abbr, t1["score"], bool(t1["winner"]), t1.get("record",""), "")
+    lineB = format_score_line(b_name, b_abbr, t2["score"], bool(t2["winner"]), t2.get("record",""), ot_str)
+    head = f"{lineA}\n{lineB}\n\n"
+
     players_by_tid = fetch_espn_players(e["eventId"])
     rowsA = players_by_tid.get(t1["teamId"], [])
     rowsB = players_by_tid.get(t2["teamId"], [])
@@ -539,19 +599,29 @@ def build_block_from_espn(e: dict) -> str:
 
 # ---------- BUILD ----------
 def build_post() -> str:
-    d = pick_report_date()
+    # Дата заголовка
+    d_title = pick_report_date_london()
+    # Кандидаты для фидов (ET ±1 и Лондон)
+    days = candidate_days_for_feeds()
 
-    # Sports.ru данные (игроки/счёты/русские фамилии)
-    sports_games = fetch_sports_day_fast(d)
+    # Sports.ru (игроки/счёты/русские фамилии) — берём по дню заголовка
+    sports_games = fetch_sports_day_fast(d_title)
     sports_by_pair = {frozenset([g["teamA"]["abbr"], g["teamB"]["abbr"]]): g for g in sports_games}
 
-    # Пары дня: Covers + ESPN (объединение; порядок: сначала Covers, затем всё, чего не было — по ESPN)
-    covers_pairs = fetch_covers_pairs(d)
-    espn_list = fetch_espn_completed(d)
+    # Пары дня: Covers + ESPN на множестве дат
+    covers_pairs = fetch_covers_pairs_multi(days)
+    espn_list = fetch_espn_completed_multi(days)
     espn_by_pair = {frozenset([g["teams"][0]["abbr"], g["teams"][1]["abbr"]]): g for g in espn_list}
     espn_pairs = list(espn_by_pair.keys())
 
-    # Объединение с сохранением порядка
+    # Карта рекордов из ESPN (abbr -> record) на пару
+    records_by_pair = {}
+    for pair, ev in espn_by_pair.items():
+        recs = {ev["teams"][0]["abbr"]: ev["teams"][0].get("record",""),
+                ev["teams"][1]["abbr"]: ev["teams"][1].get("record","")}
+        records_by_pair[pair] = recs
+
+    # Объединение пар с сохранением порядка: Covers → ESPN → Sports.ru
     ordered_pairs = []
     seen = set()
     for p in covers_pairs:
@@ -560,14 +630,13 @@ def build_post() -> str:
     for p in espn_pairs:
         if p in seen: continue
         seen.add(p); ordered_pairs.append(p)
+    for p in sports_by_pair.keys():
+        if p in seen: continue
+        seen.add(p); ordered_pairs.append(p)
 
-    # Если обе пустые — fallback к sports.ru найденным парам
-    if not ordered_pairs:
-        ordered_pairs = list(sports_by_pair.keys())
-
-    # Заголовок по количеству объединённых пар
+    # Заголовок по количеству окончательных пар
     title_count = len(ordered_pairs)
-    title = f"НБА • {ru_date(d)} • {title_count} {ru_plural(title_count, ('матч','матча','матчей'))}\n"
+    title = f"НБА • {ru_date(d_title)} • {title_count} {ru_plural(title_count, ('матч','матча','матчей'))}\n"
     title += "Результаты надёжно спрятаны 👇\n"
     title += SEP + "\n\n"
 
@@ -577,17 +646,20 @@ def build_post() -> str:
     blocks=[]
     for i, pair in enumerate(ordered_pairs, 1):
         if pair in sports_by_pair:
-            blocks.append(build_block_from_sports(sports_by_pair[pair]))
+            rec_map = records_by_pair.get(pair, {})
+            blocks.append(build_block_from_sports(sports_by_pair[pair], rec_map))
         elif pair in espn_by_pair:
             blocks.append(build_block_from_espn(espn_by_pair[pair]))
         else:
+            # редкий случай: пара есть, но ни один источник не дал контент
             a_abbr, b_abbr = tuple(pair)
             a_name = ABBR_TO_TEAM_RU.get(a_abbr, a_abbr); b_name = ABBR_TO_TEAM_RU.get(b_abbr, b_abbr)
-            a_emo = team_emoji_by_abbr(a_abbr); b_emo = team_emoji_by_abbr(b_abbr)
-            blocks.append(f"{a_emo} {a_name}: {sp('—')}\n{b_emo} {b_name}: {sp('—')}\n")
+            a_line = f"{TEAM_EMOJI.get(a_abbr,'🏀')} {a_name}: {sp('—')}"
+            b_line = f"{TEAM_EMOJI.get(b_abbr,'🏀')} {b_name}: {sp('—')}"
+            blocks.append(f"{a_line}\n{b_line}\n")
 
         if i < len(ordered_pairs):
-            blocks.append("\n" + SEP + "\n")
+            blocks.append("\n" + SEP + "\n\n")
 
     return (title + "".join(blocks)).strip()
 
