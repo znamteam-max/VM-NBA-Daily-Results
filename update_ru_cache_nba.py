@@ -3,11 +3,10 @@
 
 """
 Апдейтер ru_map_nba.json из ru_pending_nba.json через sports.ru (баскетбол).
-Логика:
- 1) /basketball/person/<slug>/  → фамилия (последний токен заголовка)
- 2) /basketball/player/<slug>/ → то же
- 3) Поиск sports.ru → первый профиль → фамилия
- 4) Фоллбэк: словарь EXCEPT_LAST и/или латиница как есть (не идеально)
+1) /basketball/person/<slug>/  → заголовок -> последнее слово (фамилия)
+2) /basketball/player/<slug>/ → то же
+3) Поиск sports.ru → первый профиль → фамилия
+4) Фоллбэк: словарь EXCEPT_LAST и/или латиница как временный вариант
 После успешного разрешения id уходит из очереди.
 """
 
@@ -34,7 +33,7 @@ EXCEPT_LAST = {
     "Markkanen":"Маркканен","Haliburton":"Халибертон","Wembanyama":"Вембаньяма","Edwards":"Эдвардс",
     "Siakam":"Сиакам","Anunoby":"Ануноби","Porzingis":"Порзингис","Gilgeous-Alexander":"Гилджес-Александер",
     "Fox":"Фокс","Maxey":"Макси","Holiday":"Холидэй","Lopez":"Лопес","Mobley":"Мобли","Allen":"Аллен",
-    "Vucevic":"Вучевич","Ayton":"Эйтон",
+    "Vucevic":"Вучевич","Ayton":"Эйтон","Demin":"Дёмин","Goldin":"Голдин",
 }
 
 def make_session():
@@ -128,7 +127,6 @@ def main():
         if not ru and first and last:
             ru = search_surname(first, last)
         if not ru:
-            # последний токен латиницей — как временная мера
             ru = last or first or pid
 
         if ru and any(ch.isalpha() for ch in ru):
