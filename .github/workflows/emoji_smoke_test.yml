@@ -1,0 +1,54 @@
+name: Emoji smoke test (Telegram custom emojis)
+
+on:
+  workflow_dispatch: {}   # запуск вручную из GitHub → Actions
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps (stdlib подходит, но пусть будет requests)
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      # Быстрая проверка формата секрета
+      - name: Sanity check TEAM_EMOJI_JSON
+        env:
+          TEAM_EMOJI_JSON: ${{ secrets.TEAM_EMOJI_JSON }}
+        run: |
+          python - <<'PY'
+          import os, json
+          s = os.getenv("TEAM_EMOJI_JSON")
+          print("TEAM_EMOJI_JSON present:", bool(s))
+          if not s: raise SystemExit(1)
+          try:
+              d = json.loads(s)
+          except Exception as e:
+              print("JSON error:", e); raise
+          print("Keys total:", len(d))
+          bad = [k for k in d if len(k)!=3]
+          if bad: print("Non-canonical keys:", ",".join(bad))
+          PY
+
+      - name: Run emoji smoke test (send only recognized)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEAM_EMOJI_JSON:    ${{ secrets.TEAM_EMOJI_JSON }}
+          # опционально: если хочешь фильтровать по имени набора
+          TEAM_EMOJI_SET_NAME: ${{ vars.TEAM_EMOJI_SET_NAME }}
+        run: |
+          python scripts/emoji_smoke_test.py
