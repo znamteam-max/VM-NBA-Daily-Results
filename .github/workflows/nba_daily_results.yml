@@ -30,33 +30,95 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4 lxml
 
-      # Не печатаем сам секрет — только его наличие и число ключей
+      # 1) Быстрая проверка секрета (не выводим сами ID)
       - name: Sanity check TEAM_EMOJI_JSON
         env:
-          TEAM_EMOJI_JSON: ${{ secrets.TEAM_EMOJI_JSON }} # или vars.TEAM_EMOJI_JSON, если храните как Variable
+          TEAM_EMOJI_JSON: ${{ secrets.TEAM_EMOJI_JSON }}
         run: |
           python - <<'PY'
-          import os, json
+          import os, json, re
           s = os.getenv('TEAM_EMOJI_JSON')
           print('TEAM_EMOJI_JSON present:', bool(s))
-          if s:
-              try:
-                  d = json.loads(s)
-                  print('Parsed OK. Keys total:', len(d))
-                  bad = [k for k in d if len(k) != 3]
-                  empty = [k for k,v in d.items() if not str(v).strip()]
-                  if bad:   print('Non-canonical keys (should be 3 letters):', ','.join(bad))
-                  if empty: print('Empty values for:', ','.join(empty))
-              except Exception as e:
-                  print('JSON error:', e)
-                  raise
+          if not s: raise SystemExit(0)
+          try:
+              d = json.loads(s)
+          except Exception as e:
+              print('JSON error:', e); raise
+          print('Keys total:', len(d))
+          bad = [k for k in d if len(k) != 3]
+          if bad: print('Non-canonical keys:', ','.join(bad))
+          looks_like_ids = sum(1 for v in d.values() if re.fullmatch(r'(?:id:)?\d{10,}', str(v).strip()))
+          print('Values that look like custom_emoji_id:', looks_like_ids, 'of', len(d))
           PY
 
+      # 2) Спросим у Telegram, сколько из этих ID он реально узнаёт
+      - name: Validate custom emoji IDs against Telegram
+        env:
+          TEAM_EMOJI_JSON:   ${{ secrets.TEAM_EMOJI_JSON }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os, json, re, urllib.parse, urllib.request
+          s = os.getenv('TEAM_EMOJI_JSON'); token = os.getenv('TELEGRAM_BOT_TOKEN')
+          if not (s and token):
+              print('Skip: no TEAM_EMOJI_JSON or TELEGRAM_BOT_TOKEN'); raise SystemExit(0)
+          d = json.loads(s)
+          ids = []
+          for v in d.values():
+              t = str(v).strip()
+              m = re.fullmatch(r'(?:id:)?(\d{10,})', t)
+              if m: ids.append(m.group(1))
+          uniq = list(dict.fromkeys(ids))
+          if not uniq:
+              print('No numeric IDs found'); raise SystemExit(0)
+          data = urllib.parse.urlencode({'custom_emoji_ids': ','.join(uniq)}).encode()
+          url = f"https://api.telegram.org/bot{token}/getCustomEmojiStickers"
+          with urllib.request.urlopen(url, data=data, timeout=20) as r:
+              j = json.loads(r.read().decode('utf-8'))
+          ok = j.get('ok'); res = j.get('result') or []
+          print('Bot API ok:', ok, '| recognized IDs:', len(res), 'of', len(uniq))
+          if not ok or len(res) == 0:
+              print('⚠️ Telegram не признал ни один ID — в сообщении будет fallback 🏀')
+          elif len(res) < len(uniq):
+              print('⚠️ Часть ID не распознана — проверь источник этих ID.')
+          PY
+
+      # 3) Отправим одно тестовое сообщение с NYK через <tg-emoji>
+      - name: Send one test emoji (NYK)
+        if: ${{ always() }}
+        env:
+          TEAM_EMOJI_JSON:    ${{ secrets.TEAM_EMOJI_JSON }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python - <<'PY'
+          import os, json, re, urllib.parse, urllib.request
+          try:
+              d = json.loads(os.getenv('TEAM_EMOJI_JSON','{}'))
+          except Exception:
+              d = {}
+          val = str(d.get('NYK','')).strip()
+          m = re.fullmatch(r'(?:id:)?(\d{10,})', val)
+          if m:
+              text = f'<tg-emoji emoji-id="{m.group(1)}">🏀</tg-emoji> Тест логотипа NYK'
+          else:
+              text = 'В секрете нет ID для NYK'
+          url = f"https://api.telegram.org/bot{os.getenv('TELEGRAM_BOT_TOKEN')}/sendMessage"
+          data = urllib.parse.urlencode({
+              'chat_id': os.getenv('TELEGRAM_CHAT_ID'),
+              'text': text,
+              'parse_mode': 'HTML'
+          }).encode()
+          with urllib.request.urlopen(url, data=data, timeout=20) as r:
+              print('Test message status:', r.status)
+          PY
+
+      # 4) Запускаем бота — сюда прокидываем секрет!
       - name: Run bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          TEAM_EMOJI_JSON:    ${{ secrets.TEAM_EMOJI_JSON }} # важно: прокидываем в процесс
+          TEAM_EMOJI_JSON:    ${{ secrets.TEAM_EMOJI_JSON }}
           PYTHONUNBUFFERED:   "1"
         run: |
           python nba_daily_results_bot.py
