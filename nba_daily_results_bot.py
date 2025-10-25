@@ -29,7 +29,7 @@ from bs4 import BeautifulSoup
 # -------- ENV --------
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-TEAM_EMOJI_JSON = os.getenv("TEAM_EMOJI_JSON", "").strip()  # опционально: {"BOS":"<custom_emoji>", ...}
+TEAM_EMOJI_JSON = os.getenv("TEAM_EMOJI_JSON", "").strip()  # JSON: {"BOS":"<unicode or custom_emoji_id>", ...}
 
 # -------- HTTP --------
 HTTP_TIMEOUT = 9
@@ -47,7 +47,7 @@ def make_session():
     ad = _mk_adapter()
     s.mount("https://", ad); s.mount("http://", ad)
     s.headers.update({
-        "User-Agent": "NBA-DailyResultsBot/3.8 (abbr-normalization, espn-abbr-fallback)",
+        "User-Agent": "NBA-DailyResultsBot/3.9 (custom-emoji, abbr-normalization, sportsru+espn)",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
         "Connection": "close",
     })
@@ -101,7 +101,7 @@ ABBR_TO_RU = {v:k for k,v in TEAM_RU_TO_ABBR.items()}
 # Нормализация аббревиатур из разнородных источников
 _ABBR_CANON = {
     "GS":"GSW","NY":"NYK","NO":"NOP","SA":"SAS","WSH":"WAS","UTAH":"UTA","PHO":"PHX",
-    "BRK":"BKN","CHO":"CHA","PHL":"PHI","CHH":"CHA","NJN":"BKN",  # исторические
+    "BRK":"BKN","CHO":"CHA","PHL":"PHI","CHH":"CHA","NJN":"BKN",
 }
 def norm_abbr(abbr: str) -> str:
     a = (abbr or "").upper().strip()
@@ -113,17 +113,34 @@ TEAM_EMOJI_DEFAULT = {
     "NOP":"🪶","NYK":"🗽","OKC":"⚡","ORL":"✨","PHI":"🔔","PHX":"☀️","POR":"🧭","SAC":"👑","SAS":"🪙",
     "TOR":"🦖","UTA":"🎷","WAS":"🧙",
 }
+
+def _as_tg_emoji(val) -> str:
+    """
+    val может быть:
+      • Unicode-эмодзи (☘️) — вернём как есть;
+      • ID кастом-эмодзи (строка/число) или 'id:123...' — завернём в <tg-emoji emoji-id="...">🏀</tg-emoji>.
+    """
+    if val is None: return ""
+    s = str(val).strip()
+    m = re.fullmatch(r'(?:id:)?(\d{10,})', s)
+    if m:
+        cid = m.group(1)
+        return f'<tg-emoji emoji-id="{cid}">🏀</tg-emoji>'
+    return s  # обычный Unicode
+
 def load_team_emojis():
     if TEAM_EMOJI_JSON:
         try:
             d = json.loads(TEAM_EMOJI_JSON)
             if isinstance(d, dict):
-                return {norm_abbr(k): str(v) for k,v in d.items()}
+                return { norm_abbr(k): _as_tg_emoji(v) for k, v in d.items() }
         except Exception:
             pass
-    return TEAM_EMOJI_DEFAULT
+    return { k: _as_tg_emoji(v) for k, v in TEAM_EMOJI_DEFAULT.items() }
+
 TEAM_EMOJI = load_team_emojis()
-def emoji(abbr: str) -> str: return TEAM_EMOJI.get(norm_abbr(abbr), "🏀")
+def emoji(abbr: str) -> str:
+    return TEAM_EMOJI.get(norm_abbr(abbr), _as_tg_emoji("🏀"))
 
 # -------- SPORTS.RU (день + боксскоры на русском) --------
 def day_url(d: date) -> str:
@@ -181,7 +198,7 @@ def parse_sports_match(url: str) -> dict | None:
     title = meta.get("content") if meta and meta.get("content") else (soup.title.string if soup.title else "")
     teamA = teamB = None
     if title and "—" in title:
-        left, right = [x.trim() if hasattr(x,'trim') else x.strip() for x in title.split("—", 1)]
+        left, right = [x.strip() for x in title.split("—", 1)]
         teamA = _canonical_ru_team(left); teamB = _canonical_ru_team(right)
     if not (teamA and teamB) or (teamA == teamB):
         heads=[]
@@ -302,10 +319,10 @@ def fetch_espn_events_multi(days: list[date]) -> dict[frozenset, dict]:
     seen={}
     for d in days:
         for e in fetch_espn_events_for_day(d):
-            if not e.get("completed"):
+            if not e.get("completed"):  # нужны финалы
                 continue
             key = frozenset([e["home"]["abbr"], e["away"]["abbr"]])
-            if key in seen:
+            if key in seen:  # уже есть — ок
                 continue
             seen[key] = e
     return seen  # pair -> event
@@ -479,7 +496,7 @@ def format_player_special(p: dict) -> str:
     chosen=stats[:3]
     return f"{name}: " + ", ".join(ru_forms(k,v) for k,v in chosen) + hot_mark(p)
 
-# -------- Спойлер --------
+# -------- Спойлер и разделитель --------
 def sp(s: str) -> str: return f'<span class="tg-spoiler">{s}</span>'
 SEP = "–––––––––––––––––––––––"
 
@@ -495,8 +512,8 @@ def build_block_from_sports(info: dict, records: dict[str,str]) -> str:
     ot_str = "" if info["ot"]==0 else (" (ОТ)" if info["ot"]==1 else f" ({info['ot']} ОТ)")
     a_win = A["score"] > B["score"]; b_win = B["score"] > A["score"]
     head = (
-        f"{format_score_line(A['name'], A['abbr'], A['score'], a_win, records.get(A['abbr'],'') , '')}\n"
-        f"{format_score_line(B['name'], B['abbr'], B['score'], b_win, records.get(B['abbr'],'') , ot_str)}\n\n"
+        f"{format_score_line(A['name'], A['abbr'], A['score'], a_win, records.get(A['abbr'],''), '')}\n"
+        f"{format_score_line(B['name'], B['abbr'], B['score'], b_win, records.get(B['abbr'],''), ot_str)}\n\n"
     )
     rowsA = info["players"].get(A["name"], []); rowsB = info["players"].get(B["name"], [])
     al = [sp(format_player_special(p) if det else format_player_regular(p, bold))
@@ -589,7 +606,8 @@ def build_post() -> str:
         else:
             blocks.append(build_block_from_espn(espn_by_pair[pair]))
         if i < title_count:
-            blocks.append("\n" + SEP + "\n\n")
+            # ДОПОЛНИТЕЛЬНЫЙ отступ перед разделителем
+            blocks.append("\n\n" + SEP + "\n\n")
 
     return (title + "".join(blocks)).strip()
 
@@ -601,7 +619,7 @@ def tg_send(text: str):
     r = S.post(url, json={
         "chat_id": CHAT_ID,
         "text": text,
-        "parse_mode": "HTML",
+        "parse_mode": "HTML",  # важно для <tg-emoji>
         "disable_web_page_preview": True,
     }, timeout=HTTP_TIMEOUT)
     if r.status_code != 200:
