@@ -2,22 +2,21 @@
 # -*- coding: utf-8 -*-
 
 """
-NBA Daily Results → Telegram (RU), с логотипами, овертаймами и выдающимися игроками.
-
-Источники:
-• Матчи/бокскор: ESPN — https://site.api.espn.com/apis/site/v2/sports/basketball/nba/...
-• Русские фамилии: sports.ru (профиль/поиск) + кэш ru_map_nba.json / ru_pending_nba.json
-• Логотипы: ESPN CDN — https://a.espncdn.com/combiner/i?img=/i/teamlogos/nba/500/{code}.png
-
-Критерии «выдающихся» игроков (1–2 за команду):
-• ≥30 очков, или
-• дабл-дабл по очкам/подборам/передачам, или
-• ≥15 подборов, или ≥12 передач, или
-• ≥4 перехвата, или ≥4 блок-шота.
-В строке игрока показываем: очки всегда; подборы/передачи — только если ≥5; перехваты/блоки — только если ≥4.
+NBA Daily Results → Telegram (RU)
+• Один пост на весь день.
+• В заголовке дата и число матчей.
+• По каждому матчу:
+  – Логотип-эмодзи рядом с названием и счётом (не фото).
+  – Отметка овертайма: (ОТ), (2ОТ) и т.д.
+  – Ниже 1–2 «выдающихся» игрока каждой команды:
+      ≥30 очков ИЛИ дабл-дабл (PTS/REB/AST) ИЛИ ≥15 REB ИЛИ ≥12 AST
+      ИЛИ ≥4 STL / ≥4 BLK.
+    Показываем очки всегда; REB/AST только если ≥5; STL/BLK только если ≥4.
+  – Для BKN всегда включаем Дёмина (если играл), для MIA — Голдина; выделяем жирным.
+• Источники: ESPN API (scoreboard/boxscore) + sports.ru для русских фамилий.
 """
 
-import os, sys, re, json, time, unicodedata, io
+import os, sys, re, json, time, unicodedata
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import quote_plus
@@ -27,27 +26,20 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 
-# --- Pillow для коллажа логотипов ---
-try:
-    from PIL import Image
-    PIL_OK = True
-except Exception:
-    PIL_OK = False
-
-# ---------- ENV ----------
+# --------- ENV ----------
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# ---------- ESPN ----------
+# --------- ESPN ----------
 ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba"  # scoreboard/boxscore
 
-# ---------- SPORTS.RU ----------
+# --------- sports.ru ----------
 SPORTS_RU   = "https://www.sports.ru"
 SRU_PERSON  = SPORTS_RU + "/basketball/person/"
 SRU_PLAYER  = SPORTS_RU + "/basketball/player/"
 SRU_SEARCH  = SPORTS_RU + "/search/?q="
 
-# ---------- CACHE ----------
+# --------- CACHE ----------
 RU_MAP_PATH     = "ru_map_nba.json"      # { athleteId: "Фамилия" }
 RU_PENDING_PATH = "ru_pending_nba.json"  # [{ id, first, last }]
 
@@ -55,7 +47,7 @@ RU_MAP: dict[str, str] = {}
 RU_PENDING: list[dict] = []
 _session_pending_ids: set[str] = set()
 
-# ---------- RUS DATES ----------
+# --------- RUS DATES ----------
 RU_MONTHS = {1:"января",2:"февраля",3:"марта",4:"апреля",5:"мая",6:"июня",7:"июля",8:"августа",9:"сентября",10:"октября",11:"ноября",12:"декабря"}
 def ru_date(d: date) -> str: return f"{d.day} {RU_MONTHS[d.month]}"
 def ru_plural(n: int, forms: tuple[str,str,str]) -> str:
@@ -67,14 +59,17 @@ def ru_plural(n: int, forms: tuple[str,str,str]) -> str:
 
 def log(*a): print(*a, file=sys.stderr)
 
-# ---------- HTTP ----------
+# --------- HTTP ----------
 def make_session():
     s = requests.Session()
     r = Retry(total=6, connect=6, read=6, backoff_factor=0.6,
               status_forcelist=[429,500,502,503,504],
               allowed_methods=["GET","POST"])
     s.mount("https://", HTTPAdapter(max_retries=r))
-    s.headers.update({"User-Agent": "NBA-DailyResultsBot/1.5 (+espn; sports.ru resolver)", "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6"})
+    s.headers.update({
+        "User-Agent": "NBA-DailyResultsBot/2.0 (+espn; sports.ru resolver)",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
+    })
     return s
 S = make_session()
 
@@ -88,7 +83,7 @@ def _get_json(url: str) -> dict:
     except Exception:
         return {}
 
-# ---------- DATE PICK ----------
+# --------- DATE PICK ----------
 def pick_report_date() -> date:
     now_et = datetime.now(ZoneInfo("America/New_York"))
     return (now_et.date() - timedelta(days=1)) if now_et.hour < 8 else now_et.date()
@@ -97,31 +92,30 @@ def pick_candidate_days() -> list[date]:
     base = pick_report_date()
     return [base, base - timedelta(days=1), base - timedelta(days=2)]
 
-# ---------- TEAMS / RUS NAMES ----------
+# --------- TEAM NAMES + EMOJI (компактные «логотипы») ----------
 TEAM_RU = {
     "ATL":"Атланта","BOS":"Бостон","BKN":"Бруклин","NY":"Нью-Йорк","NYK":"Нью-Йорк","PHI":"Филадельфия",
     "TOR":"Торонто","CHI":"Чикаго","CLE":"Кливленд","DET":"Детройт","IND":"Индиана","MIL":"Милуоки",
     "DEN":"Денвер","MIN":"Миннесота","OKC":"Оклахома-Сити","POR":"Портленд","UTA":"Юта","UTAH":"Юта",
     "GS":"Голден Стэйт","GSW":"Голден Стэйт","LAC":"Клипперс","LAL":"Лейкерс","PHX":"Финикс","SAC":"Сакраменто",
     "MIA":"Майами","ORL":"Орландо","DAL":"Даллас","HOU":"Хьюстон","MEM":"Мемфис","NO":"Новый Орлеан",
-    "NOP":"Новый Орлеан","SA":"Сан-Антонио","SAS":"Сан-Антоонио","WSH":"Вашингтон","WAS":"Вашингтон",
+    "NOP":"Новый Орлеан","SA":"Сан-Антонио","SAS":"Сан-Антонио","WSH":"Вашингтон","WAS":"Вашингтон",
 }
-def team_ru_name(abbr: str) -> str:
+# Эмодзи-замены «логотипов» (компактные, не фото). При желании их можно заменить на кастомные из набора got_ball_team.
+TEAM_EMOJI = {
+    "ATL":"🦅","BOS":"☘️","BKN":"🕸️","NY":"🗽","NYK":"🗽","PHI":"🔔",
+    "TOR":"🦖","CHI":"🐂","CLE":"🛡️","DET":"🔧","IND":"💫","MIL":"🦌",
+    "DEN":"⛏️","MIN":"🐺","OKC":"⚡","POR":"🧭","UTA":"🎷","UTAH":"🎷",
+    "GS":"🗡️","GSW":"🗡️","LAC":"✂️","LAL":"⭐","PHX":"☀️","SAC":"👑",
+    "MIA":"🔥","ORL":"✨","DAL":"🐎","HOU":"🚀","MEM":"🐻","NO":"🪶",
+    "NOP":"🪶","SA":"🪙","SAS":"🪙","WSH":"🧙","WAS":"🧙",
+}
+def team_ru(abbr: str) -> str:
     return TEAM_RU.get((abbr or "").upper(), (abbr or ""))
+def team_emoji(abbr: str) -> str:
+    return TEAM_EMOJI.get((abbr or "").upper(), "🏀")
 
-# ЛОГО-коды ESPN CDN (/i/teamlogos/nba/500/{code}.png)
-LOGO_CODE = {
-    "ATL":"atl","BOS":"bos","BKN":"bkn","NY":"ny","NYK":"ny","PHI":"phi","TOR":"tor","CHI":"chi","CLE":"cle",
-    "DET":"det","IND":"ind","MIL":"mil","DEN":"den","MIN":"min","OKC":"okc","POR":"por","UTA":"utah","UTAH":"utah",
-    "GS":"gsw","GSW":"gsw","LAC":"lac","LAL":"lal","PHX":"phx","SAC":"sac","MIA":"mia","ORL":"orl","DAL":"dal",
-    "HOU":"hou","MEM":"mem","NO":"no","NOP":"no","SA":"sa","SAS":"sa","WSH":"wsh","WAS":"wsh",
-}
-def logo_url(abbr: str) -> str | None:
-    code = LOGO_CODE.get((abbr or "").upper())
-    if not code: return None
-    return f"https://a.espncdn.com/combiner/i?img=/i/teamlogos/nba/500/{code}.png"
-
-# ---------- CACHE I/O ----------
+# --------- CACHE I/O ----------
 def _load_json(path: str, default):
     if not os.path.exists(path): return default
     try:
@@ -136,7 +130,7 @@ def _save_json(path: str, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
-# ---------- sports.ru resolver ----------
+# --------- sports.ru resolver ----------
 def _slugify(first: str, last: str) -> str:
     base = f"{first} {last}".strip()
     base = unicodedata.normalize("NFKD", base)
@@ -230,7 +224,7 @@ def resolve_ru_surname(first: str, last: str, athlete_id: str) -> str:
     if athlete_id: _queue_pending(athlete_id, first, last)
     return ru
 
-# ---------- ESPN helpers ----------
+# --------- ESPN helpers ----------
 def fetch_scoreboard(day: date) -> list[dict]:
     dates = day.strftime("%Y%m%d")
     j = _get_json(f"{ESPN_BASE}/scoreboard?dates={dates}")
@@ -250,14 +244,8 @@ def fetch_scoreboard(day: date) -> list[dict]:
             short = (status_comp.get("shortDetail") or t.get("shortDetail") or "").lower()
             ot_label = ""
             if "ot" in short:
-                m = re.search(r'(\d+)\s*ot', short)
-                m2 = re.search(r'(\d)ot', short)
-                if m:
-                    ot_label = f" ({int(m.group(1))}ОТ)"
-                elif m2:
-                    ot_label = f" ({int(m2.group(1))}ОТ)"
-                else:
-                    ot_label = " (ОТ)"
+                m = re.search(r'(\d+)\s*ot', short) or re.search(r'(\d)ot', short)
+                ot_label = f" ({int(m.group(1))}ОТ)" if m else " (ОТ)"
 
             game = {"eventId": ev.get("id"), "competitors": [], "ot": ot_label}
             for c in competitors:
@@ -297,6 +285,9 @@ def _to_int(x, default=0) -> int:
     return int(m.group(0)) if m else default
 
 def parse_players_from_box(box: dict) -> dict:
+    """
+    teamId -> [{"id","first","last","pts","reb","ast","stl","blk"}]
+    """
     out = {}
     teams = (box.get("players") or box.get("boxscore", {}).get("players") or [])
     for t in teams:
@@ -337,7 +328,7 @@ def parse_players_from_box(box: dict) -> dict:
         out[tid] = list(players.values())
     return out
 
-# ---------- highlights & format ----------
+# --------- highlights & format ----------
 def _flame(pts:int, reb:int, ast:int, stl:int, blk:int) -> str:
     dd = sum(v>=10 for v in (pts,reb,ast))
     td = dd >= 3
@@ -365,24 +356,26 @@ def is_highlight(p: dict) -> bool:
     return False
 
 def select_highlights(players: list[dict], abbr: str) -> list[tuple[dict,bool]]:
+    """
+    Возвращает 1–2 игрока.
+    • Если есть «выдающиеся» — берём их (до 2).
+    • Если нет — хотя бы одного лучшего по (PTS, REB+AST, STL+BLK).
+    • Для BKN добавляем Дёмина (если в бокскоре), для MIA — Голдина. Выделяем жирным.
+    """
     if not players: return []
-    # спец-игроки (по прежнему правилу)
     want_special = "demin" if abbr=="BKN" else ("goldin" if abbr=="MIA" else None)
 
-    def score(p):
-        pts, reb, ast, stl, blk = p["pts"], p["reb"], p["ast"], p["stl"], p["blk"]
-        dd = sum(v>=10 for v in (pts,reb,ast))
-        td = dd >= 3
-        return (is_highlight(p), pts, reb+ast, stl+blk, td, reb, ast)
-    players_sorted = sorted(players, key=score, reverse=True)
+    def key_score(p):
+        return (p.get("pts",0), p.get("reb",0)+p.get("ast",0), p.get("stl",0)+p.get("blk",0))
 
-    # только те, кто реально выдающиеся; максимум 2
+    players_sorted = sorted(players, key=key_score, reverse=True)
     picks = [p for p in players_sorted if is_highlight(p)][:2]
+    if not picks:
+        picks = [players_sorted[0]]
 
-    # включим спец-игрока, даже если он не попал в критерии (как исключение)
     spec = None
     if want_special:
-        spec = next((p for p in players_sorted if p["last"].strip().lower().endswith(want_special)), None)
+        spec = next((p for p in players_sorted if p.get("last","").strip().lower().endswith(want_special)), None)
         if spec and all(spec["id"] != x["id"] for x in picks):
             if len(picks) == 2:
                 picks[1] = spec
@@ -394,82 +387,40 @@ def select_highlights(players: list[dict], abbr: str) -> list[tuple[dict,bool]]:
         out.append((p, bool(spec and p["id"] == spec["id"])))
     return out
 
-# ---------- LOGO collage ----------
-def fetch_logo(abbr: str) -> Image.Image | None:
-    if not PIL_OK: return None
-    url = logo_url(abbr)
-    if not url: return None
-    try:
-        r = S.get(url, timeout=20)
-        if r.status_code != 200: return None
-        img = Image.open(io.BytesIO(r.content)).convert("RGBA")
-        return img
-    except Exception:
-        return None
+# --------- GAME → text block ----------
+SEP = "–––––––––––––––––––––––"
 
-def make_pair_banner(abbr_left: str, abbr_right: str) -> bytes | None:
-    if not PIL_OK: return None
-    L = fetch_logo(abbr_left)
-    R = fetch_logo(abbr_right)
-    if not L or not R: return None
-    H = 320
-    def fit(im: Image.Image, h=H):
-        w = int(im.width * (h / im.height))
-        return im.resize((w,h), Image.LANCZOS)
-    Lr = fit(L); Rr = fit(R)
-    gap = 40
-    W = Lr.width + gap + Rr.width
-    canvas = Image.new("RGBA", (W, H), (255,255,255,0))
-    canvas.paste(Lr, (0, 0), Lr)
-    canvas.paste(Rr, (Lr.width + gap, 0), Rr)
-    out = io.BytesIO()
-    canvas.save(out, format="PNG")
-    return out.getvalue()
+def build_game_block(game: dict) -> str:
+    comp = game["competitors"]
+    if len(comp) != 2: return ""
+    a, b = comp[0], comp[1]
 
-# ---------- GAME block → caption + (optional) photo ----------
-def build_game_render(game: dict) -> dict:
-    a, b = game["competitors"][0], game["competitors"][1]
-
-    def line(c, add_ot=False):
-        s = f"<b>{c['score']}</b>" if c["winner"] else f"{c['score']}"
+    def line(c, add_ot: bool):
+        emo = team_emoji(c["abbr"])
+        s   = f"<b>{c['score']}</b>" if c["winner"] else f"{c['score']}"
         rec = f" ({c['record']})" if c["record"] else ""
-        ot = game["ot"] if add_ot and game.get("ot") else ""
-        return f"{team_ru_name(c['abbr'])}: {s}{rec}{ot}"
+        ot  = game["ot"] if add_ot and game.get("ot") else ""
+        return f"{emo} {team_ru(c['abbr'])}: {s}{rec}{ot}"
 
-    caption = line(a, add_ot=False) + "\n" + line(b, add_ot=True) + "\n\n"
+    head = line(a, add_ot=False) + "\n" + line(b, add_ot=True) + "\n"
 
+    # игроки
     box = fetch_boxscore(game["eventId"])
     players_by_team = parse_players_from_box(box)
 
     lines = []
-    total_highlighted = 0
     for c in (a, b):
         arr = players_by_team.get(c["teamId"], [])
-        picks = select_highlights(arr, c["abbr"])
-        total_highlighted += len(picks)
-        for p, bold in picks:
+        for p, bold in select_highlights(arr, c["abbr"]):
             ru = resolve_ru_surname(p.get("first",""), p.get("last",""), p.get("id",""))
             lines.append(fmt_stat_line_ru(p, ru, bold))
-        if picks:
-            lines.append("")
+        if lines and not lines[-1].endswith("\n\n"):
+            lines.append("")  # пустая строка между командами
 
-    # если в матче совсем нет выдающихся игроков — минимум один общий лучший из обеих команд
-    if total_highlighted == 0:
-        all_players = (players_by_team.get(a["teamId"], []) or []) + (players_by_team.get(b["teamId"], []) or [])
-        if all_players:
-            best = sorted(all_players, key=lambda p: (p["pts"], p["reb"]+p["ast"], p["stl"]+p["blk"]), reverse=True)[0]
-            ru = resolve_ru_surname(best.get("first",""), best.get("last",""), best.get("id",""))
-            lines.append(fmt_stat_line_ru(best, ru, False))
+    return head + ("\n".join(l for l in lines if l.strip())).strip()
 
-    caption += "\n".join(l for l in lines if l.strip())
-
-    photo_bytes = make_pair_banner(a["abbr"], b["abbr"]) if PIL_OK else None
-    return {"mode": ("photo" if photo_bytes else "text"),
-            "caption": caption.strip(),
-            "photo": photo_bytes}
-
-# ---------- POST ----------
-def build_post() -> tuple[str, list[dict]]:
+# --------- POST (одним сообщением, с безопасным делением на части < 4096)
+def build_post_text() -> str:
     chosen_day = None
     games = []
     for d in pick_candidate_days():
@@ -482,46 +433,53 @@ def build_post() -> tuple[str, list[dict]]:
 
     title = f"НБА • {ru_date(chosen_day)} • {len(games)} {ru_plural(len(games), ('матч','матча','матчей'))}\n" \
             "Результаты надёжно спрятаны 👇\n" \
-            "–––––––––––––––––––––––"
+            f"{SEP}\n\n"
 
-    renders = []
-    for g in games:
-        try:
-            renders.append(build_game_render(g))
-        except Exception as e:
-            log("[game render error]", e)
-            renders.append({"mode":"text","caption":"— данные по матчу временно недоступны","photo":None})
-    return title, renders
+    blocks = []
+    for i, g in enumerate(games, 1):
+        blk = build_game_block(g)
+        blocks.append(blk.strip())
+        if i < len(games):
+            blocks.append(f"\n{SEP}\n")
 
-# ---------- TELEGRAM ----------
-def tg_send_text(text: str):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    resp = S.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=25)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Telegram error {resp.status_code}: {resp.text}")
-    time.sleep(0.25)
+    return (title + "\n".join(blocks)).strip()
 
-def tg_send_photo(caption: str, photo_bytes: bytes):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-    files = {"photo": ("logos.png", photo_bytes, "image/png")}
-    data = {"chat_id": CHAT_ID, "caption": caption, "parse_mode": "HTML"}
-    resp = S.post(url, data=data, files=files, timeout=30)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Telegram error {resp.status_code}: {resp.text}")
-    time.sleep(0.4)
-
-def tg_send_post():
+# --------- TELEGRAM (одним сообщением; при переполнении — разбиваем по разделителям)
+def tg_send(text: str):
     if not (BOT_TOKEN and CHAT_ID):
         raise RuntimeError("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы")
-    title, renders = build_post()
-    tg_send_text(title)
-    for r in renders:
-        if r["mode"] == "photo" and r["photo"]:
-            tg_send_photo(r["caption"], r["photo"])
-        else:
-            tg_send_text(r["caption"])
 
-# ---------- MAIN ----------
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    MAX = 3800  # запас под HTML и эмодзи
+    parts = []
+    t = text
+
+    # режем по разделителю блоков
+    while len(t) > MAX:
+        cut = t.rfind(SEP, 0, MAX)
+        if cut == -1:
+            cut = t.rfind("\n\n", 0, MAX)
+        if cut == -1:
+            cut = MAX
+        parts.append(t[:cut].rstrip())
+        t = t[cut:].lstrip()
+    parts.append(t)
+
+    # отправляем как одну «цепочку»: первое сообщение — основная часть, остальные — продолжение
+    first = True
+    for part in parts:
+        resp = S.post(url, json={
+            "chat_id": CHAT_ID,
+            "text": part,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }, timeout=25)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Telegram error {resp.status_code}: {resp.text}")
+        time.sleep(0.3)
+        first = False
+
+# --------- MAIN ----------
 if __name__ == "__main__":
     try:
         loaded_map = _load_json(RU_MAP_PATH, {})
@@ -531,7 +489,8 @@ if __name__ == "__main__":
         if isinstance(loaded_pending, list):
             RU_PENDING.clear(); RU_PENDING.extend(loaded_pending)
 
-        tg_send_post()
+        text = build_post_text()
+        tg_send(text)
 
         _save_json(RU_PENDING_PATH, RU_PENDING)
         _save_json(RU_MAP_PATH, RU_MAP)
