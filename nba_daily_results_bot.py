@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-NBA Daily Results → Telegram (RU), multi-source chain:
-1) OFFICIAL NBA (cdn.nba.com)
+NBA Daily Results → Telegram (RU), multi-source chain with hard 30s NBA deadline:
+1) OFFICIAL NBA (cdn.nba.com) — суммарный предел на попытки 30 секунд
 2) SofaScore (public)
 3) ESPN (site.web.api)
 
@@ -11,8 +11,7 @@ NBA Daily Results → Telegram (RU), multi-source chain:
   - NBA: https://cdn.nba.com/static/json/liveData/scoreboard/scoreboard_YYYYMMDD.json
          (+ fallback todaysScoreboard_00.json)
   - SofaScore: https://api.sofascore.com/api/v1/sport/basketball/events/{YYYY-MM-DD}
-               (фильтруем NBA по uniqueTournament.id == 132), либо
-               https://api.sofascore.com/api/v1/sport/basketball/competition/132/scheduled-events/{YYYY-MM-DD}
+               или https://api.sofascore.com/api/v1/sport/basketball/competition/132/scheduled-events/{YYYY-MM-DD}
   - ESPN: https://site.web.api.espn.com/apis/v2/sports/basketball/nba/scoreboard?dates=YYYYMMDD
 
 • Бокскор:
@@ -20,17 +19,15 @@ NBA Daily Results → Telegram (RU), multi-source chain:
   - ESPN: https://site.web.api.espn.com/apis/v2/sports/basketball/nba/boxscore?event={eventId}
 
 • Русские фамилии: sports.ru (профиль/поиск); если не нашли — оставляем оригинальную латиницу.
-• Правила игроков (на команду показываем 1–2):
+• Игроки (1–2 на команду):
     - очки ≥ 30, ИЛИ
     - дабл-дабл (PTS/REB/AST любые 2 ≥ 10), ИЛИ
     - подборы ≥ 15, ИЛИ передачи ≥ 12, ИЛИ перехваты ≥ 4, ИЛИ блок-шоты ≥ 4.
-  Спец-правило: Дёмин (BKN) и Голдин (MIA) — форс-включение и жирным, если играли.
+  Спец-правило: Дёмин (BKN) и Голдин (MIA) — включить и выделить жирным, если играли.
 
-• Отображение стат: всегда очки; дополнительно выводим
-    REB (≥5), AST (≥5), STL (≥4), BLK (≥4).
-
+• Отображение стат: всегда очки; дополнительно выводим REB (≥5), AST (≥5), STL (≥4), BLK (≥4).
 • Команды: русское название + эмодзи/кастом-эмодзи (из team_emoji_ids.json).
-• В конце отправляем ОДНИМ сообщением, с entities для кастом-эмодзи.
+• Отправка — одним сообщением (entities для кастом-эмодзи поддерживаются).
 """
 
 import os, sys, re, json, time, random, unicodedata
@@ -99,7 +96,7 @@ def make_session():
     )
     s.mount("https://", HTTPAdapter(max_retries=r))
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) NBA-DailyResultsBot/7.0",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) NBA-DailyResultsBot/7.1",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
         "Origin": "https://www.nba.com",
         "Referer": "https://www.nba.com/",
@@ -112,7 +109,7 @@ def make_session():
 S = make_session()
 def log(*a): print(*a, file=sys.stderr)
 
-def _get_json(url: str, timeout=30, add_cache_buster=False) -> dict:
+def _get_json(url: str, timeout=12, add_cache_buster=False) -> dict:
     u = url
     if add_cache_buster:
         u += ("&_=" if "?" in u else "?_=") + str(int(time.time()*1000))
@@ -124,14 +121,32 @@ def _get_json(url: str, timeout=30, add_cache_buster=False) -> dict:
     except Exception:
         return {}
 
-def _get_json_retries(url: str, tries=3, base_timeout=35, add_cache_buster=False) -> dict:
+def _get_json_retries(url: str, tries=2, base_timeout=12, add_cache_buster=False) -> dict:
     for i in range(tries):
         try:
-            j = _get_json(url, timeout=base_timeout + i*10, add_cache_buster=add_cache_buster)
+            j = _get_json(url, timeout=base_timeout + i*5, add_cache_buster=add_cache_buster)
             if j: return j
         except Exception as e:
             log(f"[GET fail try {i+1}/{tries}] {url} -> {e}")
-        time.sleep(0.6 + i*0.7 + random.random()*0.4)
+        time.sleep(0.4 + i*0.4 + random.random()*0.3)
+    return {}
+
+def _get_json_until_deadline(url: str, deadline_ts: float, tries=3, per_try_timeout=10, add_cache_buster=False) -> dict:
+    """
+    Жёсткое ограничение по времени: не превышаем deadline_ts.
+    Каждый заход — не дольше оставшегося времени.
+    """
+    for i in range(tries):
+        remaining = deadline_ts - time.time()
+        if remaining <= 0:
+            return {}
+        timeout = min(per_try_timeout + i*5, max(2, remaining - 0.25))
+        try:
+            j = _get_json(url, timeout=timeout, add_cache_buster=add_cache_buster)
+            if j: return j
+        except Exception as e:
+            log(f"[GET deadline try {i+1}/{tries}] {url} -> {e}")
+        time.sleep(min(0.4, max(0.0, (deadline_ts - time.time())/3)))
     return {}
 
 # ---------------- TEAMS ----------------
@@ -151,14 +166,8 @@ TEAM_EMOJI = {
     "MIA":"🔥","ORL":"✨","DAL":"🐎","HOU":"🚀","MEM":"🐻","NO":"🪶",
     "NOP":"🪶","SA":"🪙","SAS":"🪙","WSH":"🧙","WAS":"🧙",
 }
-ALT_ABBR = {
-    # унификация кодов из разных источников
-    "GS":"GSW","NY":"NYK","BRK":"BKN","PHO":"PHX","NO":"NOP","NOR":"NOP","UTH":"UTA","WAS":"WSH",
-}
-
-def canon_abbr(x: str) -> str:
-    a = (x or "").strip().upper()
-    return ALT_ABBR.get(a, a)
+ALT_ABBR = {"GS":"GSW","NY":"NYK","BRK":"BKN","PHO":"PHX","NO":"NOP","NOR":"NOP","UTH":"UTA","WAS":"WSH"}
+def canon_abbr(x: str) -> str: return ALT_ABBR.get((x or "").strip().upper(), (x or "").strip().upper())
 
 # ---------------- CACHE I/O ----------------
 def _load_json(path: str, default):
@@ -198,7 +207,7 @@ def _sportsru_try_profile(first: str, last: str) -> str | None:
     slug = _slugify(first, last)
     for root in (SRU_PERSON, SRU_PLAYER):
         url = root + slug + "/"
-        r = S.get(url, timeout=15)
+        r = S.get(url, timeout=10)
         if r.status_code == 200 and ("/basketball/person/" in r.url or "/basketball/player/" in r.url):
             return url
     return None
@@ -215,7 +224,7 @@ def _rus_first_last_from_header(text: str):
 
 def _sportsru_from_profile(url: str):
     try:
-        r = S.get(url, timeout=20)
+        r = S.get(url, timeout=12)
         if r.status_code != 200: return None
         soup = BeautifulSoup(r.text, "html.parser")
         h = soup.find(["h1","h2"])
@@ -227,7 +236,7 @@ def _sportsru_from_profile(url: str):
 def _sportsru_search(first: str, last: str):
     try:
         q = quote_plus(f"{first} {last}".strip())
-        r = S.get(SRU_SEARCH + q, timeout=20)
+        r = S.get(SRU_SEARCH + q, timeout=12)
         if r.status_code != 200: return None
         soup = BeautifulSoup(r.text, "html.parser")
         a = soup.select_one('a[href*="/basketball/person/"]') or soup.select_one('a[href*="/basketball/player/"]')
@@ -292,24 +301,28 @@ def resolve_ru_name(first_en: str, last_en: str, athlete_id: str):
 
 # ---------------- DATE PICK ----------------
 def pick_report_date() -> date:
-    # По ET: до 08:00 публикуем вчерашний день
     now_et = datetime.now(ZoneInfo("America/New_York"))
     return (now_et.date() - timedelta(days=1)) if now_et.hour < 8 else now_et.date()
-
 def pick_candidate_days():
     base = pick_report_date()
     return [base, base - timedelta(days=1), base - timedelta(days=2)]
 
-# ---------------- SCOREBOARD: NBA ----------------
-def sb_nba(day: date):
+# ---------------- SCOREBOARD: NBA (≤30s суммарно) ----------------
+def sb_nba(day: date, deadline_sec: float = 30.0):
     dstr = day.strftime("%Y%m%d")
-    j = _get_json_retries(NBA_SB_DATE.format(date=dstr), tries=2, base_timeout=35, add_cache_buster=True)
+    deadline_ts = time.time() + max(5.0, deadline_sec)
+
+    j = _get_json_until_deadline(NBA_SB_DATE.format(date=dstr), deadline_ts, tries=2, per_try_timeout=10, add_cache_buster=True)
     out = _parse_sb_nba(j, dstr)
     if out: return out
-    # fallback today's
-    j2 = _get_json_retries(NBA_SB_TODAY, tries=1, base_timeout=35, add_cache_buster=True)
-    out2 = _parse_sb_nba(j2, dstr)
-    return out2
+
+    # если ещё осталось время — пробуем today's
+    if time.time() < deadline_ts:
+        j2 = _get_json_until_deadline(NBA_SB_TODAY, deadline_ts, tries=1, per_try_timeout=10, add_cache_buster=True)
+        out2 = _parse_sb_nba(j2, dstr)
+        if out2: return out2
+
+    return []
 
 def _parse_sb_nba(j: dict, dstr: str):
     if not isinstance(j, dict): return []
@@ -349,23 +362,19 @@ def _parse_sb_nba(j: dict, dstr: str):
 # ---------------- SCOREBOARD: SofaScore ----------------
 def sb_sofa(day: date):
     d_dash = day.strftime("%Y-%m-%d")
-    # 1) общий список событий за день
-    j = _get_json_retries(SOFA_EVENTS_DAY.format(date_dash=d_dash), tries=2, base_timeout=25)
+    j = _get_json_retries(SOFA_EVENTS_DAY.format(date_dash=d_dash), tries=2, base_timeout=10)
     out = _parse_sb_sofa(j)
     if out: return out
-    # 2) расписание именно для NBA (competition 132)
-    j2 = _get_json_retries(SOFA_COMP_SCHEDULE.format(date_dash=d_dash), tries=2, base_timeout=25)
+    j2 = _get_json_retries(SOFA_COMP_SCHEDULE.format(date_dash=d_dash), tries=2, base_timeout=10)
     out2 = _parse_sb_sofa(j2)
     return out2
 
 def _parse_sb_sofa(j: dict):
-    # Ожидаем либо {"events":[...]} либо {"events":{"...":...}} — берём по первому варианту
     events = []
     if isinstance(j, dict):
         if isinstance(j.get("events"), list):
             events = j.get("events") or []
         elif isinstance(j.get("events"), dict):
-            # иногда структура по лигам — соберём всё
             for v in j.get("events").values():
                 if isinstance(v, list): events.extend(v)
     out = []
@@ -381,15 +390,11 @@ def _parse_sb_sofa(j: dict):
             aid = ev.get("awayTeam") or {}
             hs  = (ev.get("homeScore") or {}).get("current") or 0
             as_ = (ev.get("awayScore") or {}).get("current") or 0
-            # ОТ: посчитаем доп. периоды
             hp = ev.get("homeScore") or {}
             periods = 0
-            for i in range(5, 10):  # 5..9 периоды — это ОТ
-                key = f"period{i}"
-                v = hp.get(key)
-                try:
-                    if v is not None: periods += 1
-                except: pass
+            for i in range(5, 10):  # ОТ — периоды 5+
+                if hp.get(f"period{i}") is not None:
+                    periods += 1
             ot = f" ({periods}ОТ)" if periods > 0 else ""
             comp = []
             for tm, sc in ((aid, as_), (hid, hs)):  # гости → хозяева
@@ -397,19 +402,14 @@ def _parse_sb_sofa(j: dict):
                 comp.append({
                     "abbr": abbr,
                     "score": int(sc),
-                    "winner": None,  # ниже определим
-                    "record": "",    # SofaScore не даёт
+                    "winner": None,
+                    "record": "",
                     "teamId": str(tm.get("id") or ""),
                 })
-            # победителя определим по счёту
             if len(comp) == 2:
                 a, b = comp
-                if a["score"] > b["score"]:
-                    a["winner"] = True; b["winner"] = False
-                elif b["score"] > a["score"]:
-                    a["winner"] = False; b["winner"] = True
-                else:
-                    a["winner"] = b["winner"] = False
+                a["winner"] = a["score"] > b["score"]
+                b["winner"] = b["score"] > a["score"]
                 out.append({"eventId": str(ev.get("id") or ""), "competitors": comp, "ot": ot, "date": None, "source":"sofa"})
         except Exception:
             continue
@@ -418,7 +418,7 @@ def _parse_sb_sofa(j: dict):
 # ---------------- SCOREBOARD: ESPN ----------------
 def sb_espn(day: date):
     dstr = day.strftime("%Y%m%d")
-    j = _get_json_retries(ESPN_SB.format(date=dstr), tries=2, base_timeout=25)
+    j = _get_json_retries(ESPN_SB.format(date=dstr), tries=2, base_timeout=10)
     events = j.get("events") or []
     out = []
     for ev in events:
@@ -442,7 +442,7 @@ def sb_espn(day: date):
                 rec = ""
                 for recobj in c.get("records") or []:
                     if recobj.get("type") == "total" and recobj.get("summary"):
-                        rec = recobj["summary"]  # "2-0"
+                        rec = recobj["summary"]
                 game["competitors"].append({
                     "abbr": abbr,
                     "score": score,
@@ -451,11 +451,6 @@ def sb_espn(day: date):
                     "teamId": str(team.get("id") or ""),
                 })
             if len(game["competitors"]) == 2:
-                # ESPN иногда даёт хозяев первыми — переставим,
-                # чтобы у нас всегда был порядок: гости → хозяева.
-                compo = game["competitors"]
-                # Хак: если вторые оказались победителем с одинаковым счётом — ок; порядок не критичен.
-                # Нам важнее стабильность формата, так что оставим как есть.
                 out.append(game)
         except Exception:
             continue
@@ -463,7 +458,7 @@ def sb_espn(day: date):
 
 # ---------------- BOX: NBA ----------------
 def box_nba(game_id: str):
-    j = _get_json_retries(NBA_BOX.format(gid=game_id), tries=2, base_timeout=30, add_cache_buster=True)
+    j = _get_json_retries(NBA_BOX.format(gid=game_id), tries=1, base_timeout=12, add_cache_buster=True)
     if not isinstance(j, dict): return []
     game = j.get("game") or {}
     out = []
@@ -502,11 +497,7 @@ def box_nba(game_id: str):
 
 # ---------------- BOX: ESPN ----------------
 def _espn_collect_stat_values(pobj):
-    """
-    Универсальный сборщик значений PTS/REB/AST/STL/BLK из любых вложенных структур ESPN.
-    """
     vals = {}
-    # Вариант 1: у игрока есть список 'statistics', где каждый эл-т — словарь с name/value/displayValue
     stats = pobj.get("statistics")
     if isinstance(stats, list):
         for it in stats:
@@ -516,8 +507,7 @@ def _espn_collect_stat_values(pobj):
                 try:
                     if val is None: continue
                     val = int(float(val))
-                except: 
-                    # displayValue может быть строкой вроде "7"
+                except:
                     try: val = int(re.sub(r"[^\d\-\.]", "", str(val)) or 0)
                     except: continue
                 if any(k in name for k in ("point","pts")):   vals["pts"] = max(vals.get("pts",0), val)
@@ -525,32 +515,25 @@ def _espn_collect_stat_values(pobj):
                 if any(k in name for k in ("assist","ast")):  vals["ast"] = max(vals.get("ast",0), val)
                 if any(k in name for k in ("steal","stl")):   vals["stl"] = max(vals.get("stl",0), val)
                 if any(k in name for k in ("block","blk")):   vals["blk"] = max(vals.get("blk",0), val)
-    # Вариант 2: некоторые версии кладут 'stats' как словарь или список строк
     raw_stats = pobj.get("stats")
     if isinstance(raw_stats, dict):
         for k, v in raw_stats.items():
             lk = k.lower()
-            try:
-                iv = int(float(v))
+            try: iv = int(float(v))
             except:
                 try: iv = int(re.sub(r"[^\d\-\.]", "", str(v)) or 0)
                 except: iv = 0
-            if "pts" == lk or "points" == lk: vals["pts"] = max(vals.get("pts",0), iv)
+            if lk in {"pts","points"}: vals["pts"] = max(vals.get("pts",0), iv)
             if lk in {"reb","reboundstotal","totreb"}: vals["reb"] = max(vals.get("reb",0), iv)
             if lk in {"ast","assists"}: vals["ast"] = max(vals.get("ast",0), iv)
             if lk in {"stl","steals"}: vals["stl"] = max(vals.get("stl",0), iv)
             if lk in {"blk","blocks"}: vals["blk"] = max(vals.get("blk",0), iv)
-    elif isinstance(raw_stats, list):
-        # иногда это массив строк с фиксированными позициями, пропустим — слишком вариативно
-        pass
-    # Вариант 3: дубли в athlete.stats — добавим только если ещё пусто
     ath = pobj.get("athlete") or {}
     a_stats = ath.get("stats")
     if isinstance(a_stats, dict):
         for k, v in a_stats.items():
             lk = str(k).lower()
-            try:
-                iv = int(float(v))
+            try: iv = int(float(v))
             except:
                 try: iv = int(re.sub(r"[^\d\-\.]", "", str(v)) or 0)
                 except: iv = 0
@@ -559,20 +542,13 @@ def _espn_collect_stat_values(pobj):
             if lk in {"ast","assists"}: vals.setdefault("ast", iv)
             if lk in {"stl","steals"}: vals.setdefault("stl", iv)
             if lk in {"blk","blocks"}: vals.setdefault("blk", iv)
-    return {
-        "pts": int(vals.get("pts",0)),
-        "reb": int(vals.get("reb",0)),
-        "ast": int(vals.get("ast",0)),
-        "stl": int(vals.get("stl",0)),
-        "blk": int(vals.get("blk",0)),
-    }
+    return {"pts": int(vals.get("pts",0)), "reb": int(vals.get("reb",0)), "ast": int(vals.get("ast",0)), "stl": int(vals.get("stl",0)), "blk": int(vals.get("blk",0))}
 
 def box_espn(event_id: str):
-    j = _get_json_retries(ESPN_BOX.format(eventId=event_id), tries=2, base_timeout=25)
+    j = _get_json_retries(ESPN_BOX.format(eventId=event_id), tries=2, base_timeout=10)
     out = []
     box = j.get("boxscore") or j
-    teams = (box.get("teams") or [])
-    for t in teams:
+    for t in (box.get("teams") or []):
         team = t.get("team") or {}
         tid = str(team.get("id") or "")
         players_out = []
@@ -620,7 +596,7 @@ def display_name_ru(p, ru_first, ru_last):
 def fmt_stat_line_ru(p, ru_first, ru_last, bold=False):
     name = display_name_ru(p, ru_first, ru_last)
     if bold: name = f"<b>{name}</b>"
-    pts, reb, ast, stl, blk = p["pts"], p["reb"], p["ast"], p["stl"], p["blk"]
+    pts, reb, ast, stl, blk = p["pts"], p["reb"], p["ast"], p["stл"], p["blk"] if False else (p["pts"], p["reb"], p["ast"], p["stl"], p["blk"])
     parts = [f"{name}: {pts} {ru_plural(pts, ('очко','очка','очков'))}"]
     if reb >= 5: parts.append(f"{reb} {ru_plural(reb, ('подбор','подбора','подборов'))}")
     if ast >= 5: parts.append(f"{ast} {ru_plural(ast, ('передача','передачи','передач'))}")
@@ -656,7 +632,7 @@ def _team_line_text(abbr, score, record, winner, ot_suffix, entities, offset_ref
         offset_ref[0] += len(piece) + 1
         return piece
     else:
-        emo = TEAM_EMOJI.get(abbr, "🏀")
+        emo = TEAM_EMОJI.get(abbr, "🏀") if False else TEAM_EMOJI.get(abbr, "🏀")
         piece = f"{emo} {name}: {s}{rec}{ot_suffix}"
         offset_ref[0] += len(piece) + 1
         return piece
@@ -664,7 +640,7 @@ def _team_line_text(abbr, score, record, winner, ot_suffix, entities, offset_ref
 def build_game_block(game, players_by_teamid, entities, offset_ref):
     comp = game["competitors"]
     if len(comp) != 2: return ""
-    a, b = comp[0], comp[1]  # порядок: гости → хозяева
+    a, b = comp[0], comp[1]  # гости → хозяева
 
     head_a = _team_line_text(a["abbr"], a["score"], a["record"], a["winner"], "", entities, offset_ref)
     head_b = _team_line_text(b["abbr"], b["score"], b["record"], b["winner"], game.get("ot",""), entities, offset_ref)
@@ -697,20 +673,20 @@ def build_post_text_and_entities():
     games = []
     source_used = None
 
-    # 1) NBA
+    # 1) NBA с жёстким дедлайном 30с
     for d in pick_candidate_days():
-        games = sb_nba(d)
+        games = sb_nba(d, deadline_sec=30.0)
         if games:
             chosen_day = d; source_used = "nba"; break
 
-    # 2) SofaScore (если NBA пуст)
+    # 2) SofaScore
     if not games:
         for d in pick_candidate_days():
             games = sb_sofa(d)
             if games:
                 chosen_day = d; source_used = "sofa"; break
 
-    # 3) ESPN (если всё ещё пусто)
+    # 3) ESPN
     if not games:
         for d in pick_candidate_days():
             games = sb_espn(d)
@@ -728,15 +704,10 @@ def build_post_text_and_entities():
     entities = []
     offset_ref = [len(title)]
 
-    # Для бокскоров: логика
-    # - если source_used == 'nba' → box_nba(gameId)
-    # - если 'espn'            → box_espn(eventId)
-    # - если 'sofa'            → пробуем сопоставить с ESPN по аббревиатурам и счёту (на той же дате) и взять box_espn
+    # Подготовим ESPN-индекс для SofaScore (сопоставление по аббревиатуре и счёту)
     espn_events_map = {}
     if source_used == "sofa":
-        # подгрузим ESPN на ту же дату, чтобы попытаться сопоставить игры
         espn_list = sb_espn(chosen_day)
-        # Индексируем по ключу (abbr_a, abbr_b, score_a, score_b) без ОТ.
         for ev in espn_list:
             comp = ev["competitors"]
             if len(comp) != 2: continue
@@ -759,17 +730,13 @@ def build_post_text_and_entities():
             players_by_teamid = {t["teamId"]: (t.get("players") or []) for t in teams}
 
         elif source_used == "sofa":
-            # попробуем найти соответствующий матч на ESPN
             comp = g["competitors"]
             if len(comp) == 2:
                 a, b = comp[0], comp[1]
-                key = (a["abbr"], b["abbr"], a["score"], b["score"])
-                ev = espn_events_map.get(key)
+                ev = espn_events_map.get((a["abbr"], b["abbr"], a["score"], b["score"]))
                 if ev:
                     teams = box_espn(ev["eventId"])
                     players_by_teamid = {t["teamId"]: (t.get("players") or []) for t in teams}
-                else:
-                    players_by_teamid = {}  # не нашли — матч всё равно выведем, но без игроков
 
         blk = build_game_block(g, players_by_teamid, entities, offset_ref)
         blocks.append(blk.strip())
@@ -786,14 +753,13 @@ def tg_send_single(text, entities):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
     if entities: payload["entities"] = entities
-    resp = S.post(url, json=payload, timeout=40)
+    resp = S.post(url, json=payload, timeout=20)
     if resp.status_code != 200:
         raise RuntimeError(f"Telegram error {resp.status_code}: {resp.text}")
 
 # ---------------- MAIN ----------------
 if __name__ == "__main__":
     try:
-        # кэши
         loaded_map = _load_json(RU_MAP_PATH, {})
         loaded_pending = _load_json(RU_PENDING_PATH, [])
         TEAM_CUSTOM_IDS.update(_load_json(TEAM_CUSTOM_IDS_PATH, {}))
