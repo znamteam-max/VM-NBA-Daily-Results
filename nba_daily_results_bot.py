@@ -14,10 +14,11 @@ from bs4 import BeautifulSoup
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# ESPN
+# ESPN endpoints
 ESPN_SCORE_BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba"
 ESPN_BOX_WEB    = "https://site.web.api.espn.com/apis/v2/sports/basketball/nba/boxscore?event="
 ESPN_BOX_SITE   = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/boxscore?event="
+ESPN_SUMMARY    = "https://site.web.api.espn.com/apis/v2/sports/basketball/nba/summary?event="
 
 # sports.ru
 SPORTS_RU   = "https://www.sports.ru"
@@ -69,7 +70,7 @@ def make_session():
               allowed_methods=["GET","POST"])
     s.mount("https://", HTTPAdapter(max_retries=r))
     s.headers.update({
-        "User-Agent": "NBA-DailyResultsBot/2.9 (+espn; sports.ru resolver)",
+        "User-Agent": "NBA-DailyResultsBot/3.2 (+espn; sports.ru resolver)",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
     })
     return s
@@ -193,7 +194,7 @@ def _improve_cached_if_needed(pid: str, first: str, last: str):
     if low_last in EXCEPT_LAST:
         RU_MAP[pid] = {"first": "", "last": EXCEPT_LAST[low_last]}
         return
-    RU_MAP[pid] = {"first": "", "last": (last or "").strip()}  # ← без транслита — оставляем латиницу
+    RU_MAP[pid] = {"first": "", "last": (last or "").strip()}  # ← если ничего не нашли — оставляем латиницу
 
 def resolve_ru_name(first_en: str, last_en: str, athlete_id: str) -> tuple[str,str]:
     if athlete_id:
@@ -294,6 +295,9 @@ def fetch_boxscore(event_id: str) -> dict:
         j = _get_json(ESPN_BOX_SITE + str(event_id))
     return j or {}
 
+def fetch_summary(event_id: str) -> dict:
+    return _get_json(ESPN_SUMMARY + str(event_id)) or {}
+
 def _to_int_any(x, default=0) -> int:
     if x is None: return default
     if isinstance(x, (int, float)): return int(x)
@@ -310,24 +314,42 @@ def _to_int_any(x, default=0) -> int:
 def _norm_key(k: str) -> str:
     k = (k or "").strip().lower()
     aliases = {
-        "p":"pts","pts":"pts","points":"pts",
-        "r":"reb","reb":"reb","rebs":"reb","totreb":"reb","rebounds":"reb",
-        "a":"ast","ast":"ast","assists":"ast",
-        "s":"stl","stl":"stl","steals":"stl",
-        "b":"blk","blk":"blk","blocks":"blk",
+        "p":"pts","pts":"pts","points":"pts","point":"pts",
+        "r":"reb","reb":"reb","rebs":"reb","totreb":"reb","rebounds":"reb","reboundstotal":"reb",
+        "a":"ast","ast":"ast","assists":"ast","assist":"ast",
+        "s":"stl","stl":"stl","steals":"stl","steal":"stl",
+        "b":"blk","blk":"blk","blocks":"blk","block":"blk",
     }
     return aliases.get(k, k)
 
-def _merge_statmap(statmap: dict, source) -> None:
-    # source может быть list (по ключам), dict, или list of "x-y" (игнор)
-    if isinstance(source, dict):
-        for k, v in source.items():
+def _merge_statmap(dst: dict, src: dict | list | None, keys: list[str] | None = None):
+    if not src: return
+    if isinstance(src, list) and keys:
+        n = min(len(keys), len(src))
+        for i in range(n):
+            nk = _norm_key(keys[i])
+            dst[nk] = max(dst.get(nk, 0), _to_int_any(src[i], 0))
+    elif isinstance(src, dict):
+        for k, v in src.items():
             nk = _norm_key(k)
-            statmap[nk] = max(statmap.get(nk, 0), _to_int_any(v, 0))
+            dst[nk] = max(dst.get(nk, 0), _to_int_any(v, 0))
+
+def _harvest_from_group(statmap: dict, grp: dict, athlete_item: dict | None = None):
+    keys = [ _norm_key(k) for k in (grp.get("keys") or grp.get("labels") or []) ]
+    stats_obj = grp.get("stats")
+    if stats_obj is None and athlete_item is not None:
+        stats_obj = athlete_item.get("stats")
+    _merge_statmap(statmap, stats_obj, keys)
+    # totals/extra
+    _merge_statmap(statmap, grp.get("totals") or {})
+    if athlete_item:
+        ath = athlete_item.get("athlete") or {}
+        _merge_statmap(statmap, ath.get("stats") or {})
+        _merge_statmap(statmap, ath.get("totals") or {})
+        _merge_statmap(statmap, athlete_item.get("totals") or {})
 
 def parse_players_from_box(box: dict) -> dict:
     """ teamId -> [{"id","first","last","name","pts","reb","ast","stl","blk"}] """
-    # поддержка формата gamepackageJSON
     if "gamepackageJSON" in box:
         box = box["gamepackageJSON"]
     out: dict[str, list[dict]] = {}
@@ -337,62 +359,101 @@ def parse_players_from_box(box: dict) -> dict:
         tid = str(team.get("id") or "")
         col: dict[str, dict] = {}
 
+        # стандартные группы
         stats_groups = team_block.get("statistics") or []
-        # иногда нужное сидит в team_block['athletes'] (редко)
+        # иногда есть athletes на верхнем уровне блока
         athletes_direct = team_block.get("athletes") or []
 
-        def ensure_player(ath) -> dict:
-            pid = str((ath.get("id") or ath.get("athlete", {}).get("id") or "") if isinstance(ath, dict) else "")
-            if not pid: return {}
-            if pid not in col:
-                a = ath.get("athlete", ath)
-                first = (a.get("firstName") or "").strip()
-                last  = (a.get("lastName")  or "").strip()
-                name_full = (a.get("displayName") or a.get("fullName") or "").strip()
+        # 1) из groups -> athletes
+        for grp in stats_groups:
+            for a in (grp.get("athletes") or []):
+                ath = a.get("athlete") or {}
+                pid = str(ath.get("id") or a.get("id") or "")
+                if not pid: continue
+                first = (ath.get("firstName") or a.get("firstName") or "").strip()
+                last  = (ath.get("lastName")  or a.get("lastName")  or "").strip()
+                name_full = (ath.get("displayName") or a.get("displayName") or ath.get("fullName") or "").strip()
                 if not (first and last):
                     parts = [p for p in re.split(r"\s+", name_full) if p]
                     if not first and parts: first = parts[0]
                     if not last:  last  = " ".join(parts[1:]) if len(parts) > 1 else (parts[0] if parts else "")
-                col[pid] = {"id": pid, "first": first, "last": last,
-                            "name": name_full or (first + (" " + last if last else "")) or "Игрок",
-                            "pts":0,"reb":0,"ast":0,"stl":0,"blk":0}
-            return col[pid]
-
-        # 1) стандартный путь: groups -> athletes
-        for grp in stats_groups:
-            keys = [ _norm_key(k) for k in (grp.get("keys") or grp.get("labels") or []) ]
-            for a in (grp.get("athletes") or []):
-                m = ensure_player(a)
-                if not m: continue
-                # a["stats"] может быть list, dict, или список строк
-                stats_obj = a.get("stats")
+                m = col.setdefault(pid, {"id": pid, "first": first, "last": last,
+                                         "name": name_full or (first + (" " + last if last else "")) or "Игрок",
+                                         "pts":0,"reb":0,"ast":0,"stl":0,"blk":0})
                 statmap = {}
-                if isinstance(stats_obj, list):
-                    n = min(len(keys), len(stats_obj))
-                    for i in range(n):
-                        statmap[keys[i]] = _to_int_any(stats_obj[i], 0)
-                elif isinstance(stats_obj, dict):
-                    _merge_statmap(statmap, stats_obj)
-                # дубли прямо в athlete.stats/totals
-                ath = a.get("athlete") or {}
-                _merge_statmap(statmap, ath.get("stats") or {})
-                _merge_statmap(statmap, ath.get("totals") or {})
-                # применяем
+                _harvest_from_group(statmap, grp, a)
                 for k in ("pts","reb","ast","stl","blk"):
                     m[k] = max(m[k], int(statmap.get(k, 0)))
 
-        # 2) иногда список игроков лежит отдельно
+        # 2) athletes_direct (редкие структуры)
         for a in athletes_direct:
-            m = ensure_player(a)
-            if not m: continue
-            _merge_statmap(m, (a.get("stats") or {}))
-            _merge_statmap(m, (a.get("totals") or {}))
-            ath = a.get("athlete") or {}
-            _merge_statmap(m, ath.get("stats") or {})
-            _merge_statmap(m, ath.get("totals") or {})
+            pid = str(a.get("id") or a.get("athlete", {}).get("id") or "")
+            if not pid: continue
+            ath = a.get("athlete") or a
+            first = (ath.get("firstName") or "").strip()
+            last  = (ath.get("lastName")  or "").strip()
+            name_full = (ath.get("displayName") or ath.get("fullName") or "").strip()
+            if not (first and last):
+                parts = [p for p in re.split(r"\s+", name_full) if p]
+                if not first and parts: first = parts[0]
+                if not last:  last  = " ".join(parts[1:]) if len(parts) > 1 else (parts[0] if parts else "")
+            m = col.setdefault(pid, {"id": pid, "first": first, "last": last,
+                                     "name": name_full or (first + (" " + last if last else "")) or "Игрок",
+                                     "pts":0,"reb":0,"ast":0,"stl":0,"blk":0})
+            statmap = {}
+            _merge_statmap(statmap, a.get("stats") or {})
+            _merge_statmap(statmap, a.get("totals") or {})
+            _merge_statmap(statmap, ath.get("stats") or {})
+            _merge_statmap(statmap, ath.get("totals") or {})
+            for k in ("pts","reb","ast","stl","blk"):
+                m[k] = max(m[k], int(statmap.get(k, 0)))
 
         out[tid] = list(col.values())
     return out
+
+def augment_from_summary(players_by_team: dict, summary: dict):
+    """Дополняем недостающие значения (pts,reb,ast,stl,blk) из summary."""
+    box = (summary.get("boxscore") or {})
+    teams = box.get("players") or []  # такая же структура, как в boxscore
+    for team_block in teams:
+        team = team_block.get("team") or {}
+        tid = str(team.get("id") or "")
+        if not tid: continue
+        col = {p["id"]: p for p in players_by_team.get(tid, [])}
+        # как в parse_players_from_box
+        stats_groups = team_block.get("statistics") or []
+        athletes_direct = team_block.get("athletes") or []
+        for grp in stats_groups:
+            for a in (grp.get("athletes") or []):
+                ath = a.get("athlete") or {}
+                pid = str(ath.get("id") or a.get("id") or "")
+                if not pid: continue
+                if pid not in col:
+                    col[pid] = {"id": pid, "first": (ath.get("firstName") or "").strip(),
+                                "last": (ath.get("lastName") or "").strip(),
+                                "name": (ath.get("displayName") or ath.get("fullName") or "").strip(),
+                                "pts":0,"reb":0,"ast":0,"stl":0,"blk":0}
+                m = col[pid]
+                statmap = {}
+                _harvest_from_group(statmap, grp, a)
+                for k in ("pts","reb","ast","stl","blk"):
+                    m[k] = max(m[k], int(statmap.get(k, 0)))
+        for a in athletes_direct:
+            pid = str(a.get("id") or a.get("athlete", {}).get("id") or "")
+            if not pid: continue
+            b = col.setdefault(pid, {"id": pid, "first": (a.get("firstName") or "").strip(),
+                                     "last": (a.get("lastName") or "").strip(),
+                                     "name": (a.get("displayName") or "").strip(),
+                                     "pts":0,"reb":0,"ast":0,"stl":0,"blk":0})
+            statmap = {}
+            _merge_statmap(statmap, a.get("stats") or {})
+            _merge_statmap(statmap, a.get("totals") or {})
+            aa = a.get("athlete") or {}
+            _merge_statmap(statmap, aa.get("stats") or {})
+            _merge_statmap(statmap, aa.get("totals") or {})
+            for k in ("pts","reb","ast","stl","blk"):
+                b[k] = max(b[k], int(statmap.get(k, 0)))
+        players_by_team[tid] = list(col.values())
 
 def merge_with_leaders(players: list[dict], leaders: dict) -> list[dict]:
     by_id = {p["id"]: p for p in (players or [])}
@@ -485,6 +546,13 @@ def build_game_block(game: dict, entities, offset_ref) -> str:
     # игроки
     box = fetch_boxscore(game["eventId"])
     players_by_team = parse_players_from_box(box)
+
+    # усиливаем из summary, чтобы добрать «пропавшие» AST/REB/STL/BLK
+    try:
+        summary = fetch_summary(game["eventId"])
+        augment_from_summary(players_by_team, summary)
+    except Exception as e:
+        log("[summary fallback error]", e)
 
     def lines_for_team(c):
         arr = players_by_team.get(c["teamId"], [])
