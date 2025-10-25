@@ -1,3 +1,4 @@
+# nba_daily_results_bot.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -47,7 +48,7 @@ def make_session():
     ad = _mk_adapter()
     s.mount("https://", ad); s.mount("http://", ad)
     s.headers.update({
-        "User-Agent": "NBA-DailyResultsBot/4.0 (entities custom-emoji, abbr-normalization, sportsru+espn)",
+        "User-Agent": "NBA-DailyResultsBot/4.1 (entities+UTF16 custom-emoji, sportsru+espn)",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
         "Connection": "close",
     })
@@ -80,7 +81,6 @@ def pick_report_date_london() -> date:
     return now.date() if now.hour >= 11 else (now.date() - timedelta(days=1))
 
 def candidate_days() -> list[date]:
-    # Для ESPN/BDL гоняем несколько дат, чтобы поймать граничные игры
     now_et = datetime.now(ZoneInfo("America/New_York"))
     base_et = now_et.date() if now_et.hour >= 8 else (now_et.date() - timedelta(days=1))
     lon = pick_report_date_london()
@@ -114,11 +114,6 @@ TEAM_EMOJI_DEFAULT = {
 }
 
 def _as_tg_emoji(val) -> str:
-    """
-    val:
-      • Unicode-эмодзи (☘️) — вернуть как есть;
-      • ID кастом-эмодзи (строка/число) или 'id:123...' — вернём как <tg-emoji emoji-id="...">🏀</tg-emoji>.
-    """
     if val is None: return ""
     s = str(val).strip()
     m = re.fullmatch(r'(?:id:)?(\d{10,})', s)
@@ -141,7 +136,7 @@ TEAM_EMOJI = load_team_emojis()
 def emoji(abbr: str) -> str:
     return TEAM_EMOJI.get(norm_abbr(abbr), _as_tg_emoji("🏀"))
 
-# -------- SPORTS.RU (день + боксскоры на русском) --------
+# -------- SPORTS.RU --------
 def day_url(d: date) -> str:
     return f"https://www.sports.ru/stat/basketball/center/end/{d:%Y/%m/%d}.html"
 
@@ -475,16 +470,13 @@ def format_player_special(p: dict) -> str:
     chosen=stats[:3]
     return f"{name}: " + ", ".join(ru_forms(k,v) for k,v in chosen) + hot_mark(p)
 
-# -------- Спойлер / Разделитель / Конвертер HTML→entities --------
+# -------- Спойлер / Разделитель / HTML→entities / UTF-16 --------
 def sp(s: str) -> str: return f'<span class="tg-spoiler">{s}</span>'
 SEP = "–––––––––––––––––––––––"
 
 _TAG = re.compile(r'(<b>|</b>|<span class="tg-spoiler">|</span>|<tg-emoji emoji-id="(\d{10,})">.*?</tg-emoji>)', re.S)
+
 def html_to_plain_entities(text: str) -> tuple[str, list[dict]]:
-    """
-    Превращает наш HTML в (plain_text, entities) для sendMessage.
-    Поддерживает: <b>, <span class="tg-spoiler">, <tg-emoji emoji-id="...">…</tg-emoji>
-    """
     out = []
     entities = []
     bold_stack = []
@@ -513,8 +505,7 @@ def html_to_plain_entities(text: str) -> tuple[str, list[dict]]:
                 if pos > start:
                     entities.append({"type":"spoiler","offset":start,"length":pos-start})
         else:
-            # custom emoji
-            out.append("■")  # плейсхолдер символ
+            out.append("■")
             entities.append({"type":"custom_emoji","offset":pos,"length":1,"custom_emoji_id":cid})
 
         i = m.end()
@@ -523,7 +514,23 @@ def html_to_plain_entities(text: str) -> tuple[str, list[dict]]:
     plain = "".join(out)
     return plain, entities
 
-# -------- Блоки --------
+def to_utf16_entities(plain: str, entities: list[dict]) -> list[dict]:
+    # Преобразуем offset/length из codepoints в UTF-16 code units
+    pref = [0]*(len(plain)+1)
+    for i,ch in enumerate(plain):
+        pref[i+1] = pref[i] + (2 if ord(ch) > 0xFFFF else 1)
+    fixed=[]
+    for e in entities:
+        off = int(e["offset"]); ln = int(e["length"])
+        off16 = pref[off]
+        end16 = pref[off+ln]
+        ne = dict(e)
+        ne["offset"] = off16
+        ne["length"] = end16 - off16
+        fixed.append(ne)
+    return fixed
+
+# -------- Блоки вывода --------
 def format_score_line(name_ru: str, abbr: str, score: int, winner: bool, record: str, ot_str: str) -> str:
     score_txt = f"<b>{score}</b>" if winner else f"{score}"
     if ot_str and not winner: score_txt += ot_str
@@ -571,7 +578,7 @@ def build_block_from_espn(e: dict) -> str:
     if bl: lines.extend(bl)
     return head + ("\n".join(lines) if lines else "")
 
-# -------- Сбор матчей дня --------
+# -------- Сбор и пост --------
 def fetch_sports_games_for_title_day(d_title: date) -> dict[frozenset, dict]:
     games={}
     for url in collect_day_links(d_title):
@@ -625,23 +632,21 @@ def build_post() -> str:
         else:
             blocks.append(build_block_from_espn(espn_by_pair[pair]))
         if i < title_count:
-            # один доп. отступ (пустая строка) ПЕРЕД разделителем
             blocks.append("\n\n" + SEP + "\n\n")
 
     return (title + "".join(blocks)).strip()
 
-# -------- Telegram (entities) --------
+# -------- Telegram (entities с UTF-16) --------
 def tg_send(text: str):
     if not (BOT_TOKEN and CHAT_ID):
         raise RuntimeError("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы")
-    # конвертируем наш HTML в plain+entities (включая кастом-эмодзи)
     plain, ents = html_to_plain_entities(text)
+    ents_utf16 = to_utf16_entities(plain, ents)
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     r = S.post(url, json={
         "chat_id": CHAT_ID,
         "text": plain,
-        # когда передаём entities — НЕ указывать parse_mode
-        "entities": ents,
+        "entities": ents_utf16,  # offsets/length в UTF-16 code units
         "disable_web_page_preview": True,
     }, timeout=HTTP_TIMEOUT)
     if r.status_code != 200:
