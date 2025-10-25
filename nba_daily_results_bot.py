@@ -2,18 +2,25 @@
 # -*- coding: utf-8 -*-
 
 """
-NBA Daily Results → Telegram (RU), Yahoo-based
+NBA Daily Results → Telegram (RU), OFFICIAL NBA (cdn.nba.com)
 
-• Источник матчей/статистики: Yahoo Sports (внутренние JSON + fallback из HTML).
-• Имёны/фамилии: тянем русские фамилии со sports.ru; если не нашли — оставляем латиницу.
-• Порог показа игроков:
+• Табло:   https://cdn.nba.com/static/json/liveData/scoreboard/scoreboard_YYYYMMDD.json
+           (фоллбэк для «сегодня»: todaysScoreboard_00.json)
+• Бокскор: https://cdn.nba.com/static/json/liveData/boxscore/boxscore_{gameId}.json
+
+• Игроки к показу (1–2 на команду):
     - очки ≥ 30, ИЛИ
-    - дабл-дабл (любые два из PTS/REB/AST ≥ 10), ИЛИ
+    - дабл-дабл (любые 2 из PTS/REB/AST ≥ 10), ИЛИ
     - подборы ≥ 15, ИЛИ передачи ≥ 12, ИЛИ перехваты ≥ 4, ИЛИ блок-шоты ≥ 4.
-  Спец-правило: Дёмин (BKN) и Голдин (MIA) форс-включение и выделение жирным, если играли.
-• Овертайм: "(ОТ)" или "(2ОТ)" и т.п.
-• Логотипы: обычные emoji из словаря или кастом-эмодзи по файлу team_emoji_ids.json (карта { "LAL": "<custom_emoji_id>" }).
-  Сообщение отправляется одним постом.
+  Спец-правило: Дёмин (BKN) и Голдин (MIA) — включить и выделить жирным, если играли.
+
+• Отображение стат: всегда очки; дополнительно выводим ТОЛЬКО если пороги пройдены:
+    REB (≥5), AST (≥5), STL (≥4), BLK (≥4).
+
+• Команды: название на русском + эмодзи.
+  Обычные эмодзи — из словаря; кастом-эмодзи берём из team_emoji_ids.json ({ "LAL": "<custom_id>", ... }).
+
+• Сообщение отправляется ОДНИМ постом.
 """
 
 import os, sys, re, json, time, unicodedata
@@ -30,20 +37,10 @@ from bs4 import BeautifulSoup
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# ---------------- YAHOO ----------------
-Y_SCORE_HTML   = "https://sports.yahoo.com/nba/scoreboard/?date={date}"  # YYYY-MM-DD
-Y_SCORES_API_CANDIDATES = [
-    "https://sports.yahoo.com/_td/api/resource/sports.scores;leagues=nba;date={date}",
-    "https://sports.yahoo.com/_td/api/resource/sports.league.scoreboard;league=nba;date={date}",
-    "https://sports.yahoo.com/_td/api/resource/sports.scoreboard;leagues=nba;date={date}",
-]
-Y_BOX_API_CANDIDATES = [
-    "https://sports.yahoo.com/_td/api/resource/sports.game.stats;gameId={gid}",
-    "https://sports.yahoo.com/_td/api/resource/sports.game.stats?gameId={gid}",
-    "https://sports.yahoo.com/_td/api/resource/sports.game.meta;gameId={gid}",
-    "https://sports.yahoo.com/_td/api/resource/sports.game.detail;gameId={gid}",
-    "https://sports.yahoo.com/_td/api/resource/sports.game;gameId={gid}",
-]
+# ---------------- NBA (official) ----------------
+NBA_SB_DATE   = "https://cdn.nba.com/static/json/liveData/scoreboard/scoreboard_{date}.json"      # YYYYMMDD
+NBA_SB_TODAY  = "https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json"
+NBA_BOX       = "https://cdn.nba.com/static/json/liveData/boxscore/boxscore_{gid}.json"
 
 # ---------------- sports.ru ----------------
 SPORTS_RU   = "https://www.sports.ru"
@@ -56,10 +53,10 @@ RU_MAP_PATH          = "ru_map_nba.json"        # { athleteId: {"first":"Имя-
 RU_PENDING_PATH      = "ru_pending_nba.json"    # [{id, first, last}]
 TEAM_CUSTOM_IDS_PATH = "team_emoji_ids.json"    # { "LAL": "custom_emoji_id", ... }
 
-RU_MAP: dict[str, object] = {}
-RU_PENDING: list[dict] = []
-TEAM_CUSTOM_IDS: dict[str, str] = {}
-_session_pending_ids: set[str] = set()
+RU_MAP = {}
+RU_PENDING = []
+TEAM_CUSTOM_IDS = {}
+_session_pending_ids = set()
 
 # ---------------- DATES ----------------
 RU_MONTHS = {1:"января",2:"февраля",3:"марта",4:"апреля",5:"мая",6:"июня",7:"июля",8:"августа",9:"сентября",10:"октября",11:"ноября",12:"декабря"}
@@ -78,9 +75,14 @@ def make_session():
               status_forcelist=[429,500,502,503,504],
               allowed_methods=["GET","POST"])
     s.mount("https://", HTTPAdapter(max_retries=r))
+    # важны заголовки для cdn.nba.com, чтобы не резало
     s.headers.update({
-        "User-Agent": "NBA-DailyResultsBot/4.1 (Yahoo + sports.ru resolver)",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) NBA-DailyResultsBot/5.0",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
+        "Origin": "https://www.nba.com",
+        "Referer": "https://www.nba.com/",
+        "Accept": "application/json,text/plain,*/*",
+        "Connection": "keep-alive",
     })
     return s
 S = make_session()
@@ -94,10 +96,6 @@ def _get_json(url: str) -> dict:
         return r.json()
     except Exception:
         return {}
-
-def _get_text(url: str) -> str:
-    r = S.get(url, timeout=25)
-    return r.text if r.status_code == 200 else ""
 
 # ---------------- TEAMS ----------------
 TEAM_RU = {
@@ -160,7 +158,7 @@ def _sportsru_try_profile(first: str, last: str) -> str | None:
             return url
     return None
 
-def _rus_first_last_from_header(text: str) -> tuple[str,str] | None:
+def _rus_first_last_from_header(text: str):
     full = " ".join(text.split())
     parts = [p for p in re.split(r"\s+", full) if p]
     if len(parts) >= 2:
@@ -170,7 +168,7 @@ def _rus_first_last_from_header(text: str) -> tuple[str,str] | None:
         return ru_first, ru_last
     return None
 
-def _sportsru_from_profile(url: str) -> tuple[str,str] | None:
+def _sportsru_from_profile(url: str):
     try:
         r = S.get(url, timeout=20)
         if r.status_code != 200: return None
@@ -181,7 +179,7 @@ def _sportsru_from_profile(url: str) -> tuple[str,str] | None:
     except Exception:
         return None
 
-def _sportsru_search(first: str, last: str) -> tuple[str,str] | None:
+def _sportsru_search(first: str, last: str):
     try:
         q = quote_plus(f"{first} {last}".strip())
         r = S.get(SRU_SEARCH + q, timeout=20)
@@ -232,7 +230,7 @@ def _improve_cached_if_needed(pid: str, first: str, last: str):
         RU_MAP[pid] = {"first":"", "last": EXCEPT_LAST[low_last]}; return
     RU_MAP[pid] = {"first":"", "last": (last or "").strip()}
 
-def resolve_ru_name(first_en: str, last_en: str, athlete_id: str) -> tuple[str,str]:
+def resolve_ru_name(first_en: str, last_en: str, athlete_id: str):
     if athlete_id:
         _improve_cached_if_needed(athlete_id, first_en or "", last_en or "")
         val = RU_MAP.get(athlete_id)
@@ -249,240 +247,133 @@ def resolve_ru_name(first_en: str, last_en: str, athlete_id: str) -> tuple[str,s
 
 # ---------------- DATE PICK ----------------
 def pick_report_date() -> date:
+    # Ориентируемся на ET: публикуем прошедший игровой день до ~08:00 ET
     now_et = datetime.now(ZoneInfo("America/New_York"))
     return (now_et.date() - timedelta(days=1)) if now_et.hour < 8 else now_et.date()
-def pick_candidate_days() -> list[date]:
+
+def pick_candidate_days():
     base = pick_report_date()
     return [base, base - timedelta(days=1), base - timedelta(days=2)]
 
-# ---------------- YAHOO SCOREBOARD ----------------
-def _extract_app_json_from_html(html: str) -> dict:
-    m = re.search(r"root\.App\.main\s*=\s*({.*?})\s*;\s*\n", html, flags=re.DOTALL)
-    if not m:
-        m = re.search(r"window\.__APOLLO_STATE__\s*=\s*({.*?});", html, flags=re.DOTALL)
-    if not m: return {}
-    blob = m.group(1)
-    try:
-        return json.loads(blob)
-    except Exception:
-        cleaned = re.sub(r"/\*.*?\*/", "", blob, flags=re.DOTALL)
-        cleaned = re.sub(r"//.*?$", "", cleaned, flags=re.MULTILINE)
-        try:
-            return json.loads(cleaned)
-        except Exception:
-            return {}
-
-def fetch_scoreboard_yahoo(day: date) -> list[dict]:
-    dstr = day.strftime("%Y-%m-%d")
-    for tmpl in Y_SCORES_API_CANDIDATES:
-        j = _get_json(tmpl.format(date=dstr))
-        games = _parse_scoreboard_json(j)
-        if games:
-            return games
-    html = _get_text(Y_SCORE_HTML.format(date=dstr))
-    j = _extract_app_json_from_html(html)
+# ---------------- NBA SCOREBOARD ----------------
+def fetch_scoreboard(day: date):
+    dstr = day.strftime("%Y%m%d")
+    j = _get_json(NBA_SB_DATE.format(date=dstr))
     games = _parse_scoreboard_json(j)
-    return games
+    if games:
+        return games
+    # фоллбэк: если день = сегодня по ET, попробуем todaysScoreboard
+    today_et = datetime.now(ZoneInfo("America/New_York")).strftime("%Y%m%d")
+    if dstr == today_et:
+        j2 = _get_json(NBA_SB_TODAY)
+        g2 = _parse_scoreboard_json(j2)
+        if g2:
+            return g2
+    return []
 
-def _parse_scoreboard_json(j: dict) -> list[dict]:
-    if not j: return []
-    candidates = []
-    t = j
-    for key in ("context","dispatcher","stores","SportsScoresStore"):
-        if isinstance(t, dict) and key in t: t = t[key]
-        else: t = None; break
-    if isinstance(t, dict): candidates.append(t)
-    if "events" in j or "games" in j: candidates.append(j)
-    if "scoreboard" in j: candidates.append(j["scoreboard"])
-
+def _parse_scoreboard_json(j):
+    if not isinstance(j, dict): return []
+    sb = j.get("scoreboard") or {}
+    games = sb.get("games") or []
     out = []
-    for store in candidates:
-        games_arrays = []
-        if isinstance(store, dict):
-            for k,v in store.items():
-                if isinstance(v, list) and v and isinstance(v[0], dict) and ("gameId" in v[0] or "id" in v[0] or "status" in v[0]):
-                    games_arrays.append(v)
-            arr = store.get("games") or store.get("events") or []
-            if isinstance(arr, list) and arr: games_arrays.append(arr)
-
-        for arr in games_arrays:
-            for g in arr:
-                try:
-                    gid = str(g.get("gameId") or g.get("id") or g.get("gid") or "")
-                    status = (g.get("status") or g.get("statusDisplay") or g.get("statusType") or "").lower()
-                    completed = ("final" in status) or (g.get("completed") is True)
-                    if not completed: continue
-                    ot = ""
-                    st = (g.get("statusDisplay") or g.get("status") or "")
-                    st_l = str(st).lower()
-                    if "ot" in st_l:
-                        m = re.search(r'(\d+)\s*ot', st_l) or re.search(r'(\d)ot', st_l)
-                        ot = f" ({int(m.group(1))}ОТ)" if m else " (ОТ)"
-                    teams = g.get("teams") or g.get("participants") or g.get("competitors") or []
-                    comp = []
-                    leaders_by_abbr = {}
-                    for tm in teams:
-                        team = tm.get("team") or tm.get("info") or tm
-                        abbr = (team.get("abbreviation") or team.get("abbr") or team.get("code") or "").upper()
-                        if abbr == "GS": abbr = "GSW"
-                        score = int(float(tm.get("score") or team.get("score") or 0))
-                        win = bool(tm.get("winner") or team.get("winner") or False)
-                        record = ""
-                        rec = tm.get("record") or team.get("record")
-                        if isinstance(rec, dict):
-                            w = rec.get("wins") or rec.get("w") or ""
-                            l = rec.get("losses") or rec.get("l") or ""
-                            record = f"{w}-{l}" if (w != "" and l != "") else ""
-                        elif isinstance(rec, str):
-                            record = rec
-                        comp.append({"abbr": abbr, "score": score, "winner": win, "record": record, "teamId": str(team.get("id") or tm.get("id") or "")})
-                        # leaders (PTS/REB/AST) — если есть
-                        leaders = {}
-                        for catkey in ("leaders","statLeaders"):
-                            if catkey in tm and isinstance(tm[catkey], list):
-                                for ld in tm[catkey]:
-                                    cat = str(ld.get("name") or ld.get("category") or "").lower()
-                                    ath = ld.get("athlete") or ld.get("player") or {}
-                                    leaders.setdefault(cat, []).append({
-                                        "id": str(ath.get("id") or ""),
-                                        "first": (ath.get("firstName") or "").strip(),
-                                        "last":  (ath.get("lastName")  or "").strip(),
-                                        "value": float(ld.get("value") or 0),
-                                        "name":  (ath.get("displayName") or ath.get("fullName") or "").strip(),
-                                    })
-                        leaders_by_abbr[abbr] = leaders
-                    if len(comp) == 2:
-                        out.append({"eventId": gid, "competitors": comp, "ot": ot, "leaders_by_abbr": leaders_by_abbr})
-                except Exception:
-                    continue
+    for g in games:
+        try:
+            gid = str(g.get("gameId") or g.get("gameCode") or "")
+            status = str(g.get("gameStatusText") or "").lower()
+            completed = "final" in status
+            if not completed:  # только финальные
+                continue
+            ot = ""
+            m = re.search(r'(\d+)\s*ot', status)
+            if "ot" in status:
+                ot = f" ({int(m.group(1))}ОТ)" if m else " (ОТ)"
+            # home/away
+            ht = g.get("homeTeam") or {}
+            at = g.get("awayTeam") or {}
+            comp = []
+            for tm in (at, ht):  # держим порядок: гостевая — первая, домашняя — вторая
+                abbr = (tm.get("teamTricode") or "").upper()
+                if abbr == "GS": abbr = "GSW"
+                score = int(tm.get("score") or 0)
+                record = f"{tm.get('wins',0)}-{tm.get('losses',0)}"
+                comp.append({
+                    "abbr": abbr,
+                    "score": score,
+                    "winner": bool(tm.get("isWinner", False)),
+                    "record": record,
+                    "teamId": str(tm.get("teamId") or ""),
+                })
+            if len(comp) == 2:
+                out.append({"eventId": gid, "competitors": comp, "ot": ot})
+        except Exception:
+            continue
     return out
 
-# ---------------- YAHOO BOXES ----------------
-def fetch_box_yahoo(game_id: str) -> list[dict]:
-    """
-    Возвращает список блоков по командам:
-    [{teamId, players:[{id,first,last,name,pts,reb,ast,stl,blk}]}]
-    """
-    j = {}
-    for tmpl in Y_BOX_API_CANDIDATES:
-        j = _get_json(tmpl.format(gid=game_id))
-        if j: break
-    if not j:
-        return []
-
+# ---------------- NBA BOX ----------------
+def fetch_box(game_id: str):
+    j = _get_json(NBA_BOX.format(gid=game_id)) or {}
+    game = j.get("game") or {}
     teams = []
-
-    def norm_key(k: str) -> str:
-        k = (k or "").lower()
-        return {"points":"pts","pts":"pts","p":"pts",
-                "rebounds":"reb","reb":"reb","r":"reb",
-                "assists":"ast","ast":"ast","a":"ast",
-                "steals":"stl","stl":"stl","s":"stl",
-                "blocks":"blk","blk":"blk","b":"blk"}.get(k, k)
-
-    def to_int(x) -> int:
-        try:
-            if x is None:
+    for side in ("awayTeam","homeTeam"):
+        team = game.get(side) or {}
+        tid = str(team.get("teamId") or "")
+        players = []
+        for p in (team.get("players") or []):
+            info = p.get("person") or {}
+            st   = p.get("statistics") or {}
+            # фильтр «играл»: минуты или любые статы
+            mins = st.get("minutes") or st.get("minutesCalculated") or ""
+            if not any(st.get(k) for k in ("points","reboundsTotal","assists","steals","blocks")) and not mins:
+                continue
+            pid   = str(info.get("personId") or "")
+            first = (info.get("firstName") or "").strip()
+            last  = (info.get("familyName") or info.get("lastName") or "").strip()
+            name  = (info.get("displayName") or f"{first} {last}").strip()
+            def ig(key, *alts):
+                for k in (key,)+alts:
+                    v = st.get(k)
+                    if v is None: continue
+                    try: return int(v)
+                    except: 
+                        try: return int(float(v))
+                        except: pass
                 return 0
-            if isinstance(x, (int, float)):
-                return int(x)
-            if isinstance(x, str):
-                m = re.search(r"-?\d+", x)
-                return int(m.group(0)) if m else 0
-            if isinstance(x, dict):
-                for k in ("value", "val", "stat", "amount"):
-                    if k in x:
-                        try:
-                            return int(float(x[k]))
-                        except Exception:
-                            continue
-            return 0
-        except Exception:
-            return 0
-
-    collected: dict[str, dict[str, dict]] = {}
-
-    def ensure_player(tid: str, pid: str, first: str, last: str, name: str):
-        if tid not in collected: collected[tid] = {}
-        m = collected[tid].setdefault(pid or name or "", {
-            "id": pid or "", "first": first or "", "last": last or "",
-            "name": name or (first+" "+last).strip() or "Player",
-            "pts":0,"reb":0,"ast":0,"stl":0,"blk":0
-        })
-        return m
-
-    def walk(node):
-        if isinstance(node, dict):
-            tid = str(node.get("teamId") or node.get("teamID") or node.get("team_id") or node.get("tid") or "")
-            # форма 1: playerStats + statCategories
-            if "playerStats" in node and isinstance(node["playerStats"], list):
-                for it in node["playerStats"]:
-                    pl = it.get("player") or it.get("athlete") or {}
-                    pid = str(pl.get("id") or "")
-                    first = (pl.get("firstName") or "").strip()
-                    last  = (pl.get("lastName") or "").strip()
-                    name  = (pl.get("fullName") or pl.get("displayName") or "").strip()
-                    m = ensure_player(tid, pid, first, last, name)
-                    cats = it.get("statCategories") or it.get("stats") or []
-                    if isinstance(cats, dict):
-                        cats = [{"name":k,"value":v} for k,v in cats.items()]
-                    for c in cats:
-                        k = norm_key(str(c.get("name") or c.get("label") or c.get("abbr") or ""))
-                        v = to_int(c.get("value"))
-                        if k in ("pts","reb","ast","stl","blk"):
-                            m[k] = max(m[k], v)
-            # форма 2: node["stats"] — список объектов с label/value рядом с player|athlete
-            if "stats" in node and isinstance(node["stats"], list) and any(isinstance(x, dict) for x in node["stats"]) and ("player" in node or "athlete" in node):
-                pl = node.get("player") or node.get("athlete") or {}
-                pid = str(pl.get("id") or "")
-                first = (pl.get("firstName") or "").strip()
-                last  = (pl.get("lastName") or "").strip()
-                name  = (pl.get("fullName") or pl.get("displayName") or "").strip()
-                m = ensure_player(tid, pid, first, last, name)
-                for c in node["stats"]:
-                    k = norm_key(str(c.get("name") or c.get("label") or c.get("abbr") or ""))
-                    v = to_int(c.get("value"))
-                    if k in ("pts","reb","ast","stl","blk"):
-                        m[k] = max(m[k], v)
-            # рекурсивно внутрь
-            for v in node.values():
-                walk(v)
-        elif isinstance(node, list):
-            for v in node:
-                walk(v)
-
-    walk(j)
-
-    for tid, players in collected.items():
-        teams.append({"teamId": tid, "players": list(players.values())})
+            pts = ig("points","pointsTotal","pts")
+            reb = ig("reboundsTotal","rebounds","reb")
+            ast = ig("assists","ast")
+            stl = ig("steals","stl")
+            blk = ig("blocks","blk")
+            players.append({"id":pid,"first":first,"last":last,"name":name,
+                            "pts":pts,"reb":reb,"ast":ast,"stl":stl,"blk":blk})
+        teams.append({"teamId": tid, "players": players})
     return teams
 
 # ---------------- HIGHLIGHTS & RENDER ----------------
-def merge_with_leaders(players: list[dict], leaders: dict) -> list[dict]:
-    by_id = {p["id"]: p for p in (players or [])}
-    def apply(cat, key):
-        for it in leaders.get(cat, []) or []:
-            pid = it.get("id","")
-            if not pid: continue
-            val = int(float(it.get("value") or 0))
-            m = by_id.setdefault(pid, {"id":pid,"first":it.get("first",""),"last":it.get("last",""),
-                                       "name":it.get("name",""),"pts":0,"reb":0,"ast":0,"stl":0,"blk":0})
-            m[key] = max(m[key], val)
-    apply("points","pts"); apply("rebounds","reb"); apply("assists","ast")
-    return list(by_id.values())
-
-def _flame(pts:int, reb:int, ast:int, stl:int, blk:int) -> str:
+def _flame(pts, reb, ast, stl, blk):
     dd = sum(v>=10 for v in (pts,reb,ast))
     td = dd >= 3
     if pts >= 35 or td or (pts>=30 and dd>=2): return " 🔥"
     return ""
 
-def _initial_ru(first_en: str, ru_first: str, fallback_name: str) -> str:
+def is_highlight(p):
+    pts, reb, ast, stl, blk = p["pts"], p["reb"], p["ast"], p["stl"], p["blk"]
+    dd = sum(v>=10 for v in (pts,reb,ast))
+    return (pts >= 30) or (dd >= 2) or (reb >= 15) or (ast >= 12) or (stl >= 4) or (blk >= 4)
+
+def merge_lists(players):
+    # nothing to merge here (все из одного источника), но оставим для симметрии
+    return list(players or [])
+
+def _initial_ru(first_en, ru_first, fallback_name):
     if ru_first: return ru_first[:1].upper()
     base = first_en or (fallback_name.split()[0] if fallback_name else "")
-    return _latin_initial_to_cyr(base)
+    ch = base[:1].upper() if base else "И"
+    table = {"A":"А","B":"Б","C":"К","D":"Д","E":"Е","F":"Ф","G":"Г","H":"Х","I":"И","J":"Д","K":"К",
+             "L":"Л","M":"М","N":"Н","O":"О","P":"П","Q":"К","R":"Р","S":"С","T":"Т","U":"У","V":"В",
+             "W":"В","X":"К","Y":"Й","Z":"З"}
+    return table.get(ch, "И")
 
-def display_name_ru(p: dict, ru_first: str, ru_last: str) -> str:
+def display_name_ru(p, ru_first, ru_last):
     init = _initial_ru(p.get("first",""), ru_first, p.get("name",""))
     surname = (ru_last or "").strip()
     if not surname:
@@ -490,7 +381,7 @@ def display_name_ru(p: dict, ru_first: str, ru_last: str) -> str:
         surname = (last_en or "").strip()
     return f"{init}. {surname}"
 
-def fmt_stat_line_ru(p: dict, ru_first: str, ru_last: str, bold: bool=False) -> str:
+def fmt_stat_line_ru(p, ru_first, ru_last, bold=False):
     name = display_name_ru(p, ru_first, ru_last)
     if bold: name = f"<b>{name}</b>"
     pts, reb, ast, stl, blk = p["pts"], p["reb"], p["ast"], p["stl"], p["blk"]
@@ -501,12 +392,7 @@ def fmt_stat_line_ru(p: dict, ru_first: str, ru_last: str, bold: bool=False) -> 
     if blk >= 4: parts.append(f"{blk} {ru_plural(blk, ('блок-шот','блок-шота','блок-шотов'))}")
     return ", ".join(parts) + _flame(pts,reb,ast,stl,blk)
 
-def is_highlight(p: dict) -> bool:
-    pts, reb, ast, stl, blk = p["pts"], p["reb"], p["ast"], p["stl"], p["blk"]
-    dd = sum(v>=10 for v in (pts,reb,ast))
-    return (pts >= 30) or (dd >= 2) or (reb >= 15) or (ast >= 12) or (stl >= 4) or (blk >= 4)
-
-def select_highlights(players: list[dict], abbr: str) -> list[tuple[dict,bool]]:
+def select_highlights(players, abbr):
     if not players: return []
     want_special = "demin" if abbr=="BKN" else ("goldin" if abbr=="MIA" else None)
     def score_key(p): return (p.get("pts",0), p.get("reb",0)+p.get("ast",0), p.get("stl",0)+p.get("blk",0))
@@ -520,16 +406,17 @@ def select_highlights(players: list[dict], abbr: str) -> list[tuple[dict,bool]]:
             else: picks.append(spec)
     return [(p, bool(spec and p["id"] == spec["id"])) for p in picks]
 
+# ---------------- RENDER ----------------
 SEP = "–––––––––––––––––––––––"
 
-def _team_line_text(abbr: str, score: int, record: str, winner: bool, ot_suffix: str, entities, offset_ref) -> str:
+def _team_line_text(abbr, score, record, winner, ot_suffix, entities, offset_ref):
     name = TEAM_RU.get(abbr, abbr)
     s   = f"<b>{score}</b>" if winner else f"{score}"
     rec = f" ({record})" if record else ""
     use_custom = TEAM_CUSTOM_IDS.get(abbr)
     if use_custom:
         piece = f"■ {name}: {s}{rec}{ot_suffix}"
-        # entity: один символ '■' заменяется кастом-эмодзи
+        # entity: один символ '■' заменяем на custom emoji
         entities.append({"type":"custom_emoji","offset":offset_ref[0],"length":1,"custom_emoji_id":use_custom})
         offset_ref[0] += len(piece) + 1
         return piece
@@ -539,23 +426,22 @@ def _team_line_text(abbr: str, score: int, record: str, winner: bool, ot_suffix:
         offset_ref[0] += len(piece) + 1
         return piece
 
-def build_game_block(game: dict, entities, offset_ref) -> str:
+def build_game_block(game, entities, offset_ref):
     comp = game["competitors"]
     if len(comp) != 2: return ""
-    a, b = comp[0], comp[1]
+    a, b = comp[0], comp[1]  # порядок: «гости», затем «дом»
 
     head_a = _team_line_text(a["abbr"], a["score"], a["record"], a["winner"], "", entities, offset_ref)
     head_b = _team_line_text(b["abbr"], b["score"], b["record"], b["winner"], game.get("ot",""), entities, offset_ref)
     head = head_a + "\n" + head_b + "\n"
     offset_ref[0] += 1
 
-    # игроки: тянем из боксов Yahoo
-    box_teams = fetch_box_yahoo(game["eventId"])  # [{teamId, players:[...]}]
-    by_tid = {t["teamId"]: t.get("players", []) for t in box_teams}
+    # бокс с официального API
+    box_teams = fetch_box(game["eventId"])
+    by_tid = {t["teamId"]: merge_lists(t.get("players", [])) for t in box_teams}
 
     def lines_for_team(c):
         arr = by_tid.get(c["teamId"], [])
-        arr = merge_with_leaders(arr, game.get("leaders_by_abbr", {}).get(c["abbr"], {}))
         picks = select_highlights(arr, c["abbr"])
         lines = []
         for p, bold in picks:
@@ -563,35 +449,35 @@ def build_game_block(game: dict, entities, offset_ref) -> str:
             lines.append(fmt_stat_line_ru(p, ru_first, ru_last, bold))
         return lines
 
-    lines = []
     la = lines_for_team(a)
     lb = lines_for_team(b)
+    lines = []
     if la: lines.extend(la + [""])
     if lb: lines.extend(lb)
-
     text = head + ("\n".join(l for l in lines if l.strip()))
     offset_ref[0] += len(text) - len(head)
     return text.strip()
 
-def build_post_text_and_entities() -> tuple[str, list]:
+def build_post_text_and_entities():
     global TEAM_CUSTOM_IDS
     TEAM_CUSTOM_IDS = _load_json(TEAM_CUSTOM_IDS_PATH, {})
 
     chosen_day = None
     games = []
     for d in pick_candidate_days():
-        games = fetch_scoreboard_yahoo(d)
+        games = fetch_scoreboard(d)
         if games:
             chosen_day = d
             break
-    if not chosen_day: chosen_day = pick_report_date()
+    if not chosen_day:
+        chosen_day = pick_report_date()
 
     title = f"НБА • {ru_date(chosen_day)} • {len(games)} {ru_plural(len(games), ('матч','матча','матчей'))}\n" \
             "Результаты надёжно спрятаны 👇\n" \
             f"{SEP}\n\n"
 
-    entities: list[dict] = []
-    offset_ref = [len(title)]  # позиция для entities (учитывает видимые символы)
+    entities = []
+    offset_ref = [len(title)]
 
     blocks = []
     for i, g in enumerate(games, 1):
@@ -604,7 +490,7 @@ def build_post_text_and_entities() -> tuple[str, list]:
     return (title + "\n".join(blocks)).strip(), entities
 
 # ---------------- TELEGRAM ----------------
-def tg_send_single(text: str, entities: list[dict]):
+def tg_send_single(text, entities):
     if not (BOT_TOKEN and CHAT_ID):
         raise RuntimeError("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы")
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -617,6 +503,7 @@ def tg_send_single(text: str, entities: list[dict]):
 # ---------------- MAIN ----------------
 if __name__ == "__main__":
     try:
+        # кэши
         loaded_map = _load_json(RU_MAP_PATH, {})
         loaded_pending = _load_json(RU_PENDING_PATH, [])
         TEAM_CUSTOM_IDS.update(_load_json(TEAM_CUSTOM_IDS_PATH, {}))
