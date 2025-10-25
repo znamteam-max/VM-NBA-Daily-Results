@@ -5,13 +5,16 @@
 NBA Daily Results → Telegram (RU), с логотипами, овертаймами и выдающимися игроками.
 
 Источники:
-• Матчи/бокскор: ESPN (public) — https://site.api.espn.com/apis/site/v2/sports/basketball/nba/...
+• Матчи/бокскор: ESPN — https://site.api.espn.com/apis/site/v2/sports/basketball/nba/...
 • Русские фамилии: sports.ru (профиль/поиск) + кэш ru_map_nba.json / ru_pending_nba.json
 • Логотипы: ESPN CDN — https://a.espncdn.com/combiner/i?img=/i/teamlogos/nba/500/{code}.png
 
-Параметры окружения:
-• TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID — куда отправлять
-• NBA_LOGOS_MODE = "photo" (по умолчанию) | "text" — отправлять фото с логотипами или текст
+Критерии «выдающихся» игроков (1–2 за команду):
+• ≥30 очков, или
+• дабл-дабл по очкам/подборам/передачам, или
+• ≥15 подборов, или ≥12 передач, или
+• ≥4 перехвата, или ≥4 блок-шота.
+В строке игрока показываем: очки всегда; подборы/передачи — только если ≥5; перехваты/блоки — только если ≥4.
 """
 
 import os, sys, re, json, time, unicodedata, io
@@ -24,7 +27,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 
-# --- optional: Pillow для коллажа логотипов ---
+# --- Pillow для коллажа логотипов ---
 try:
     from PIL import Image
     PIL_OK = True
@@ -34,7 +37,6 @@ except Exception:
 # ---------- ENV ----------
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-LOGOS_MODE = (os.getenv("NBA_LOGOS_MODE", "photo") or "photo").lower()  # "photo" | "text"
 
 # ---------- ESPN ----------
 ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba"  # scoreboard/boxscore
@@ -72,14 +74,14 @@ def make_session():
               status_forcelist=[429,500,502,503,504],
               allowed_methods=["GET","POST"])
     s.mount("https://", HTTPAdapter(max_retries=r))
-    s.headers.update({"User-Agent": "NBA-DailyResultsBot/1.4 (+espn; sports.ru resolver)", "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6"})
+    s.headers.update({"User-Agent": "NBA-DailyResultsBot/1.5 (+espn; sports.ru resolver)", "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6"})
     return s
 S = make_session()
 
 def _get_json(url: str) -> dict:
     r = S.get(url, timeout=25)
     if r.status_code != 200:
-        log("HTTP", r.status_code, url[:120])
+        log("HTTP", r.status_code, url[:160])
         return {}
     try:
         return r.json()
@@ -97,54 +99,22 @@ def pick_candidate_days() -> list[date]:
 
 # ---------- TEAMS / RUS NAMES ----------
 TEAM_RU = {
-    # Включаем все варианты аббревиатур ESPN, которые встречаются на табло
-    "ATL": ("Атланта"),
-    "BOS": ("Бостон"),
-    "BKN": ("Бруклин"),
-    "NY":  ("Нью-Йорк"),
-    "NYK": ("Нью-Йорк"),
-    "PHI": ("Филадельфия"),
-    "TOR": ("Торонто"),
-    "CHI": ("Чикаго"),
-    "CLE": ("Кливленд"),
-    "DET": ("Детройт"),
-    "IND": ("Индиана"),
-    "MIL": ("Милуоки"),
-    "DEN": ("Денвер"),
-    "MIN": ("Миннесота"),
-    "OKC": ("Оклахома-Сити"),
-    "POR": ("Портленд"),
-    "UTA": ("Юта"),
-    "UTAH":("Юта"),
-    "GS":  ("Голден Стэйт"),
-    "GSW": ("Голден Стэйт"),
-    "LAC": ("Клипперс"),
-    "LAL": ("Лейкерс"),
-    "PHX": ("Финикс"),
-    "SAC": ("Сакраменто"),
-    "MIA": ("Майами"),
-    "ORL": ("Орландо"),
-    "DAL": ("Даллас"),
-    "HOU": ("Хьюстон"),
-    "MEM": ("Мемфис"),
-    "NO":  ("Новый Орлеан"),
-    "NOP": ("Новый Орлеан"),
-    "SA":  ("Сан-Антонио"),
-    "SAS": ("Сан-Антонио"),
-    "WSH": ("Вашингтон"),
-    "WAS": ("Вашингтон"),
+    "ATL":"Атланта","BOS":"Бостон","BKN":"Бруклин","NY":"Нью-Йорк","NYK":"Нью-Йорк","PHI":"Филадельфия",
+    "TOR":"Торонто","CHI":"Чикаго","CLE":"Кливленд","DET":"Детройт","IND":"Индиана","MIL":"Милуоки",
+    "DEN":"Денвер","MIN":"Миннесота","OKC":"Оклахома-Сити","POR":"Портленд","UTA":"Юта","UTAH":"Юта",
+    "GS":"Голден Стэйт","GSW":"Голден Стэйт","LAC":"Клипперс","LAL":"Лейкерс","PHX":"Финикс","SAC":"Сакраменто",
+    "MIA":"Майами","ORL":"Орландо","DAL":"Даллас","HOU":"Хьюстон","MEM":"Мемфис","NO":"Новый Орлеан",
+    "NOP":"Новый Орлеан","SA":"Сан-Антонио","SAS":"Сан-Антоонио","WSH":"Вашингтон","WAS":"Вашингтон",
 }
 def team_ru_name(abbr: str) -> str:
     return TEAM_RU.get((abbr or "").upper(), (abbr or ""))
 
-# ЛОГО-коды ESPN CDN (см. /i/teamlogos/nba/500/{code}.png)
+# ЛОГО-коды ESPN CDN (/i/teamlogos/nba/500/{code}.png)
 LOGO_CODE = {
-    "ATL":"atl","BOS":"bos","BKN":"bkn","NY":"ny","NYK":"ny","PHI":"phi","TOR":"tor",
-    "CHI":"chi","CLE":"cle","DET":"det","IND":"ind","MIL":"mil",
-    "DEN":"den","MIN":"min","OKC":"okc","POR":"por","UTA":"utah","UTAH":"utah",
-    "GS":"gsw","GSW":"gsw","LAC":"lac","LAL":"lal","PHX":"phx","SAC":"sac",
-    "MIA":"mia","ORL":"orl","DAL":"dal","HOU":"hou","MEM":"mem",
-    "NO":"no","NOP":"no","SA":"sa","SAS":"sa","WSH":"wsh","WAS":"wsh",
+    "ATL":"atl","BOS":"bos","BKN":"bkn","NY":"ny","NYK":"ny","PHI":"phi","TOR":"tor","CHI":"chi","CLE":"cle",
+    "DET":"det","IND":"ind","MIL":"mil","DEN":"den","MIN":"min","OKC":"okc","POR":"por","UTA":"utah","UTAH":"utah",
+    "GS":"gsw","GSW":"gsw","LAC":"lac","LAL":"lal","PHX":"phx","SAC":"sac","MIA":"mia","ORL":"orl","DAL":"dal",
+    "HOU":"hou","MEM":"mem","NO":"no","NOP":"no","SA":"sa","SAS":"sa","WSH":"wsh","WAS":"wsh",
 }
 def logo_url(abbr: str) -> str | None:
     code = LOGO_CODE.get((abbr or "").upper())
@@ -275,15 +245,17 @@ def fetch_scoreboard(day: date) -> list[dict]:
                 continue
             comp = (ev.get("competitions") or [])[0]
             competitors = comp.get("competitors") or []
+
             status_comp = (comp.get("status") or {}).get("type") or {}
             short = (status_comp.get("shortDetail") or t.get("shortDetail") or "").lower()
-            # определим ОТ
             ot_label = ""
             if "ot" in short:
-                m = re.search(r"(\d+)\s*ot", short)
+                m = re.search(r'(\d+)\s*ot', short)
+                m2 = re.search(r'(\d)ot', short)
                 if m:
-                    n = int(m.group(1))
-                    ot_label = f" ({n}ОТ)"
+                    ot_label = f" ({int(m.group(1))}ОТ)"
+                elif m2:
+                    ot_label = f" ({int(m2.group(1))}ОТ)"
                 else:
                     ot_label = " (ОТ)"
 
@@ -394,20 +366,21 @@ def is_highlight(p: dict) -> bool:
 
 def select_highlights(players: list[dict], abbr: str) -> list[tuple[dict,bool]]:
     if not players: return []
-    # спец-игроки
+    # спец-игроки (по прежнему правилу)
     want_special = "demin" if abbr=="BKN" else ("goldin" if abbr=="MIA" else None)
-    # сортировка важности
+
     def score(p):
         pts, reb, ast, stl, blk = p["pts"], p["reb"], p["ast"], p["stl"], p["blk"]
         dd = sum(v>=10 for v in (pts,reb,ast))
         td = dd >= 3
         return (is_highlight(p), pts, reb+ast, stl+blk, td, reb, ast)
     players_sorted = sorted(players, key=score, reverse=True)
-    # базовый выбор
+
+    # только те, кто реально выдающиеся; максимум 2
     picks = [p for p in players_sorted if is_highlight(p)][:2]
-    if not picks:
-        picks = [players_sorted[0]]  # минимум один
-    # добавить спец-игрока, если нужно
+
+    # включим спец-игрока, даже если он не попал в критерии (как исключение)
+    spec = None
     if want_special:
         spec = next((p for p in players_sorted if p["last"].strip().lower().endswith(want_special)), None)
         if spec and all(spec["id"] != x["id"] for x in picks):
@@ -415,11 +388,10 @@ def select_highlights(players: list[dict], abbr: str) -> list[tuple[dict,bool]]:
                 picks[1] = spec
             else:
                 picks.append(spec)
-    # пометить жирным только спец-игрока
+
     out = []
     for p in picks:
-        bold = bool(want_special and p is spec)
-        out.append((p, bold))
+        out.append((p, bool(spec and p["id"] == spec["id"])))
     return out
 
 # ---------- LOGO collage ----------
@@ -440,16 +412,14 @@ def make_pair_banner(abbr_left: str, abbr_right: str) -> bytes | None:
     L = fetch_logo(abbr_left)
     R = fetch_logo(abbr_right)
     if not L or not R: return None
-    # размеры
     H = 320
-    BG = (255,255,255,0)  # прозрачный
     def fit(im: Image.Image, h=H):
         w = int(im.width * (h / im.height))
         return im.resize((w,h), Image.LANCZOS)
     Lr = fit(L); Rr = fit(R)
     gap = 40
     W = Lr.width + gap + Rr.width
-    canvas = Image.new("RGBA", (W, H), BG)
+    canvas = Image.new("RGBA", (W, H), (255,255,255,0))
     canvas.paste(Lr, (0, 0), Lr)
     canvas.paste(Rr, (Lr.width + gap, 0), Rr)
     out = io.BytesIO()
@@ -459,7 +429,6 @@ def make_pair_banner(abbr_left: str, abbr_right: str) -> bytes | None:
 # ---------- GAME block → caption + (optional) photo ----------
 def build_game_render(game: dict) -> dict:
     a, b = game["competitors"][0], game["competitors"][1]
-    name_a, name_b = team_ru_name(a["abbr"]), team_ru_name(b["abbr"])
 
     def line(c, add_ot=False):
         s = f"<b>{c['score']}</b>" if c["winner"] else f"{c['score']}"
@@ -469,29 +438,35 @@ def build_game_render(game: dict) -> dict:
 
     caption = line(a, add_ot=False) + "\n" + line(b, add_ot=True) + "\n\n"
 
-    # игроки
     box = fetch_boxscore(game["eventId"])
     players_by_team = parse_players_from_box(box)
 
     lines = []
+    total_highlighted = 0
     for c in (a, b):
         arr = players_by_team.get(c["teamId"], [])
         picks = select_highlights(arr, c["abbr"])
+        total_highlighted += len(picks)
         for p, bold in picks:
             ru = resolve_ru_surname(p.get("first",""), p.get("last",""), p.get("id",""))
             lines.append(fmt_stat_line_ru(p, ru, bold))
         if picks:
-            lines.append("")  # пустая строка между командами
+            lines.append("")
+
+    # если в матче совсем нет выдающихся игроков — минимум один общий лучший из обеих команд
+    if total_highlighted == 0:
+        all_players = (players_by_team.get(a["teamId"], []) or []) + (players_by_team.get(b["teamId"], []) or [])
+        if all_players:
+            best = sorted(all_players, key=lambda p: (p["pts"], p["reb"]+p["ast"], p["stl"]+p["blk"]), reverse=True)[0]
+            ru = resolve_ru_surname(best.get("first",""), best.get("last",""), best.get("id",""))
+            lines.append(fmt_stat_line_ru(best, ru, False))
 
     caption += "\n".join(l for l in lines if l.strip())
 
-    # рендер фото с логотипами
-    photo_bytes = None
-    if LOGOS_MODE == "photo" and PIL_OK:
-        # чтобы слева вверхняя строка соответствовала левой картинке — ставим победителя жирным в подписи, а баннер — (a vs b)
-        photo_bytes = make_pair_banner(a["abbr"], b["abbr"])
-    return {"mode": ("photo" if (photo_bytes and LOGOS_MODE == "photo") else "text"),
-            "caption": caption.strip(), "photo": photo_bytes}
+    photo_bytes = make_pair_banner(a["abbr"], b["abbr"]) if PIL_OK else None
+    return {"mode": ("photo" if photo_bytes else "text"),
+            "caption": caption.strip(),
+            "photo": photo_bytes}
 
 # ---------- POST ----------
 def build_post() -> tuple[str, list[dict]]:
@@ -540,15 +515,10 @@ def tg_send_post():
         raise RuntimeError("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы")
     title, renders = build_post()
     tg_send_text(title)
-    if not renders:
-        return
-    for i, r in enumerate(renders, 1):
+    for r in renders:
         if r["mode"] == "photo" and r["photo"]:
             tg_send_photo(r["caption"], r["photo"])
         else:
-            # текстовый запасной вариант + разделитель
-            if i > 1:
-                tg_send_text("–––––––––––––––––––––––")
             tg_send_text(r["caption"])
 
 # ---------- MAIN ----------
