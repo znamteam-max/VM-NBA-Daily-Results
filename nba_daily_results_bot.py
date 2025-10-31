@@ -325,7 +325,7 @@ def initials_ru(full: str) -> str:
     if len(parts) == 1: return parts[0]
     first = parts[0]; last = parts[-1]
     if last.lower() in {"jr.","jr","мл.","ст.","sr.","sr"} and len(parts)>=3:
-        last = parts[-2] + " " + parts[-1]
+        last = parts[-2] + " " + last
     return f"{first[0]}. {last}"
 
 def ru_forms(label: str, v: int) -> str:
@@ -408,10 +408,11 @@ def build_block_from_sports(info: dict, records: dict[str,str]) -> str:
     A,B = info["teamA"], info["teamB"]
     ot_str = "" if info["ot"]==0 else (" (ОТ)" if info["ot"]==1 else f" ({info['ot']} ОТ)")
     a_win = A["score"] > B["score"]; b_win = B["score"] > A["score"]
-    head = (
-        f"{format_score_line(A['name'], A['abbr'], A['score'], a_win, records.get(A['abbr'],""), '')}\n"
-        f"{format_score_line(B['name'], B['abbr'], B['score'], b_win, records.get(B['abbr'],""), ot_str)}\n\n"
-    )
+
+    line1 = format_score_line(A['name'], A['abbr'], A['score'], a_win, records.get(A['abbr'], ""), "")
+    line2 = format_score_line(B['name'], B['abbr'], B['score'], b_win, records.get(B['abbr'], ""), ot_str)
+    head = f"{line1}\n{line2}\n\n"
+
     rowsA = info["players"].get(A["name"], []); rowsB = info["players"].get(B["name"], [])
     al = [sp(format_player_special(p) if det else format_player_regular(p, bold))
           for (p,bold,det) in pick_team_players(A["abbr"], rowsA)]
@@ -427,10 +428,11 @@ def build_block_from_espn(e: dict) -> str:
     h, a = e["home"], e["away"]
     name_h = ABBR_TO_RU.get(h["abbr"], h["abbr"]); name_a = ABBR_TO_RU.get(a["abbr"], a["abbr"])
     ot_str = "" if e["ot"]==0 else (" (ОТ)" if e["ot"]==1 else f" ({e['ot']} ОТ)")
-    head = (
-        f"{format_score_line(name_h, h['abbr'], h['score'], h['winner'], h.get('record',''), '')}\n"
-        f"{format_score_line(name_a, a['abbr'], a['score'], a['winner'], a.get('record',''), ot_str)}\n\n"
-    )
+
+    line1 = format_score_line(name_h, h['abbr'], h['score'], h['winner'], h.get('record',''), "")
+    line2 = format_score_line(name_a, a['abbr'], a['score'], a['winner'], a.get('record',''), ot_str)
+    head = f"{line1}\n{line2}\n\n"
+
     players_by_tid = fetch_espn_players(e["eventId"]) if e.get("eventId") else {}
     rowsH = players_by_tid.get(h["teamId"], []); rowsA = players_by_tid.get(a["teamId"], [])
     al = [sp(format_player_special(p) if det else format_player_regular(p, bold))
