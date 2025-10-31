@@ -4,26 +4,31 @@
 """
 NBA Daily Results → Telegram (RU)
 
-• Источник пар, финального счёта, OT и рекордов (W-L): ESPN site.api (completed) за отчётный день (ET).
-• Игроки и русские фамилии: Sports.ru (боксскор) — приоритетно. Фоллбек: ESPN boxscore.
-• Формат: названия и эмодзи видны; счёт и игроки — в спойлерах. У победителя счёт жирным, после счёта — (W-L).
+• Пары, финальный счёт, OT и рекорды (W-L): ESPN (оба эндпоинта) строго за выбранный день по ET
+  с фильтрацией по реальной дате события (America/New_York).
+• Игроки и русские фамилии: Sports.ru (боксскор), фоллбек — ESPN boxscore.
+• Формат: названия и эмодзи видны; счёт и игроки — в спойлерах. Победитель — жирным; после счёта — (W-L).
 • Выбор игроков:
   – минимум 1, максимум 2 на команду;
-  – второй, если: ≥20 очков ИЛИ дабл-дабл ИЛИ ≥6 стилов/блоков;
+  – второй, если: ≥20 очков ИЛИ дабл-дабл ИЛИ ≥6 перехватов/блоков;
   – спец: если играл Егор Дёмин (BKN) или Влад Голдин (MIA), показываем всегда, жирным, 3 макс. метрики (>0).
   – показывать очки всегда; ≥5 реб/≥5 аст/≥4 стл/≥4 блк.
-• Эмодзи команд: дефолтные или кастом из TEAM_EMOJI_JSON (JSON {"BOS":"<emoji>", ...}).
-• Отчётный день: по ET (America/New_York) — чтобы сетка и финалы совпадали с ESPN.
 
-ENV:
-  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID — обязательно
-  TEAM_EMOJI_JSON — опционально (кастом-эмодзи)
-  DEBUG_NBA=1 — детальный лог в stderr
+Новые возможности выбора дня (по ET):
+  • ET_DAY_OFFSET=0|1|2 — выбрать «сегодня/вчера/позавчера».
+  • PRINT_LAST3_MENU=1 — прислать интерактивное меню (кнопки) на 3 последних дня; при нажатии публикуется выбранный.
+      TELEGRAM_ADMIN_ID=<id> — принимать нажатия только от указанного пользователя.
+      INTERACTIVE_WAIT_SEC=75 — сколько секунд ждать нажатие; если не нажали — просто отправим меню и завершимся.
+  • SEND_LAST3=1 — сразу отправить три поста подряд (ET-0, ET-1, ET-2).
+
+ENV обязательно: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+Опционально: TEAM_EMOJI_JSON — JSON {"BOS":"<emoji>", ...} для кастом-эмодзи (например, из паков тг).
+DEBUG_NBA=1 — расширенный лог.
 """
 
 from __future__ import annotations
 
-import os, sys, re, json
+import os, sys, re, json, time
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import urlparse, urlunparse
@@ -36,16 +41,24 @@ except Exception:
     Retry = None
 from bs4 import BeautifulSoup
 
-# ============ ENV / DEBUG ============
+# ================== ENV / DEBUG ==================
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TEAM_EMOJI_JSON = os.getenv("TEAM_EMOJI_JSON", "").strip()
 DEBUG = os.getenv("DEBUG_NBA", "").strip() != ""
 
-def log(*a): 
-    if DEBUG: print(*a, file=sys.stderr)
+# Выбор дня / режимы
+ET_DAY_OFFSET = int(os.getenv("ET_DAY_OFFSET", "0") or "0")  # 0..2
+PRINT_LAST3_MENU = os.getenv("PRINT_LAST3_MENU", "").strip() == "1"
+SEND_LAST3 = os.getenv("SEND_LAST3", "").strip() == "1"
+TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID", "").strip()
+INTERACTIVE_WAIT_SEC = int(os.getenv("INTERACTIVE_WAIT_SEC", "75") or "75")
 
-# ============ HTTP ============
+def log(*a):
+    if DEBUG:
+        print(*a, file=sys.stderr)
+
+# ================== HTTP ==================
 HTTP_TIMEOUT = 10
 
 def _mk_adapter():
@@ -61,8 +74,7 @@ def make_session():
     ad = _mk_adapter()
     s.mount("https://", ad); s.mount("http://", ad)
     s.headers.update({
-        # ASCII-only UA — чтобы не ловить UnicodeEncodeError в CI
-        "User-Agent": "NBA-DR/5.0 (espn-score-ot-wl; sportsru-players; spoilers)",
+        "User-Agent": "NBA-DR/5.4 (espn dual endpoints; sportsru players; spoilers; last3 menu)",
         "Accept-Language": "ru-RU,ru;q=0.8,en;q=0.5",
         "Connection": "close",
     })
@@ -79,7 +91,7 @@ def _get_json(url: str) -> dict:
     except Exception:
         return {}
 
-# ============ DATES / RU ============
+# ================== DATES / RU ==================
 RU_MONTHS = {1:"января",2:"февраля",3:"марта",4:"апреля",5:"мая",6:"июня",
              7:"июля",8:"августа",9:"сентября",10:"октября",11:"ноября",12:"декабря"}
 
@@ -93,15 +105,15 @@ def ru_plural(n: int, forms: tuple[str,str,str]) -> str:
     if n1 == 1:      return forms[0]
     return forms[2]
 
-def pick_title_date_london() -> date:
-    now = datetime.now(ZoneInfo("Europe/London"))
-    return now.date() if now.hour >= 11 else (now.date() - timedelta(days=1))
-
-def pick_report_date_et() -> date:
+def et_today() -> date:
     now = datetime.now(ZoneInfo("America/New_York"))
     return now.date() if now.hour >= 8 else (now.date() - timedelta(days=1))
 
-# ============ TEAMS / EMOJI ============
+def title_date_for_et(d_et: date) -> date:
+    # Для заголовка можно показывать ту же дату (по ET), чтобы не путать пользователя.
+    return d_et
+
+# ================== TEAMS / EMOJI ==================
 TEAM_RU_TO_ABBR = {
     "Атланта":"ATL","Бостон":"BOS","Бруклин":"BKN","Шарлотт":"CHA","Чикаго":"CHI",
     "Кливленд":"CLE","Даллас":"DAL","Денвер":"DEN","Детройт":"DET","Голден Стэйт":"GSW",
@@ -112,11 +124,9 @@ TEAM_RU_TO_ABBR = {
 }
 ABBR_TO_RU = {v:k for k,v in TEAM_RU_TO_ABBR.items()}
 
-# нормализация «чужих» аббревиатур в наши ключи
 ESPN_NORM = {
     "WSH":"WAS","SA":"SAS","GS":"GSW","NY":"NYK","NO":"NOP","PHO":"PHX","UTAH":"UTA",
-    # исторические/редкие
-    "NJN":"BKN","CHH":"CHA","SAN":"SAS","GSW":"GSW","OKL":"OKC","PHX":"PHX"
+    "NJN":"BKN","CHH":"CHA","SAN":"SAS","OKL":"OKC","WS":"WAS","GSW":"GSW"
 }
 def norm_abbr(a: str) -> str:
     a = (a or "").upper()
@@ -140,7 +150,7 @@ def load_team_emojis():
 TEAM_EMOJI = load_team_emojis()
 def emoji(abbr: str) -> str: return TEAM_EMOJI.get(norm_abbr(abbr), "🏀")
 
-# ============ SPORTS.RU (только игроки и русские фамилии) ============
+# ================== SPORTS.RU (players/ru names) ==================
 def day_url(d: date) -> str:
     return f"https://www.sports.ru/stat/basketball/center/end/{d:%Y/%m/%d}.html"
 
@@ -164,12 +174,11 @@ def collect_day_links(d: date) -> list[str]:
         href = a["href"]
         if "/basketball/match/" not in href: continue
         full = _normalize_match_url(href)
-        # оставляем только валидные ссылки вида /team-a-vs-team-b/
-        if not re.search(r"/basketball/match/[^/]+-vs-[^/]+/?$", full): 
+        if not re.search(r"/basketball/match/[^/]+-vs-[^/]+/?$", full):
             continue
         if full in seen: continue
         seen.add(full); out.append(full)
-    log("[DBG] SPORTS LINKS", len(out))
+    log("[DBG] SPORTS LINKS", len(out), "for", d)
     return out
 
 def _canonical_ru_team(raw: str) -> str | None:
@@ -189,7 +198,7 @@ def _players_rows_for_team(soup: BeautifulSoup, team_ru_key: str) -> list[dict]:
         if "статистика игроков" in t and stamp in t.split(".")[0]:
             anchor=h; break
     if not anchor: return rows
-    table = anchor.find_next("table"); 
+    table = anchor.find_next("table")
     if not table: return rows
     for tr in table.find_all("tr"):
         tds = [td.get_text(" ", strip=True) for td in tr.find_all(["td","th"])]
@@ -197,7 +206,7 @@ def _players_rows_for_team(soup: BeautifulSoup, team_ru_key: str) -> list[dict]:
         if any(x.lower().startswith("игрок") for x in tds): continue
         name_idx=None
         for i,cell in enumerate(tds[:3]):
-            if re.search(r"[^\d/:% ]", cell): 
+            if re.search(r"[^\d/:% ]", cell):
                 name_idx=i; break
         if name_idx is None: continue
         name = tds[name_idx]
@@ -205,7 +214,7 @@ def _players_rows_for_team(soup: BeautifulSoup, team_ru_key: str) -> list[dict]:
         if len(nums) < 14: continue
         def as_int(x: str) -> int:
             try: return int(x)
-            except: 
+            except:
                 try: return int(float(x))
                 except: return 0
         pts = as_int(nums[0])
@@ -218,7 +227,6 @@ def _players_rows_for_team(soup: BeautifulSoup, team_ru_key: str) -> list[dict]:
     return rows
 
 def parse_sports_players(url: str) -> dict | None:
-    """Возвращает {'teamA':{name,abbr}, 'teamB':{...}, 'players':{ruTeam:[rows]}} без счёта."""
     soup = _soup(url)
     if not soup: return None
 
@@ -227,10 +235,8 @@ def parse_sports_players(url: str) -> dict | None:
     teamA = teamB = None
     if title and "—" in title:
         left, right = [x.strip() for x in title.split("—", 1)]
-        teamA = _canonical_ru_team(left)
-        teamB = _canonical_ru_team(right)
+        teamA = _canonical_ru_team(left); teamB = _canonical_ru_team(right)
     if not (teamA and teamB) or teamA == teamB:
-        # резерв: из заголовков секций
         heads=[]
         for h in soup.find_all(["h2","h3","h4"]):
             t = h.get_text(" ", strip=True).lower()
@@ -240,13 +246,11 @@ def parse_sports_players(url: str) -> dict | None:
         if len(heads) >= 2:
             teamA = teamA or heads[0]
             teamB = teamB or next((x for x in heads[1:] if x != teamA), None)
-    if not (teamA and teamB) or teamA == teamB: 
+    if not (teamA and teamB) or teamA == teamB:
         return None
 
-    a_abbr = TEAM_RU_TO_ABBR.get(teamA,"")
-    b_abbr = TEAM_RU_TO_ABBR.get(teamB,"")
-    if not a_abbr or not b_abbr:
-        return None
+    a_abbr = TEAM_RU_TO_ABBR.get(teamA,""); b_abbr = TEAM_RU_TO_ABBR.get(teamB,"")
+    if not a_abbr or not b_abbr: return None
 
     rowsA = _players_rows_for_team(soup, teamA)
     rowsB = _players_rows_for_team(soup, teamB)
@@ -258,9 +262,31 @@ def parse_sports_players(url: str) -> dict | None:
         "url": url,
     }
 
-# ============ ESPN (score/OT/W-L и фоллбек-игроки) ============
-ESPN_SB  = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates={ymd}"
-ESPN_BOX = "https://site.web.api.espn.com/apis/v2/sports/basketball/nba/boxscore?event={eid}"
+def collect_sports_players_for_pairs(pairs: set[frozenset[str]], d_et: date) -> dict[str, list[dict]]:
+    # Собираем со sports.ru игроков для пар из ESPN, идя по 3 датам: ET-1, ET, ET+1 (на всякий случай).
+    players: dict[str, list[dict]] = {}
+    for dd in [d_et - timedelta(days=1), d_et, d_et + timedelta(days=1)]:
+        for url in collect_day_links(dd):
+            info = parse_sports_players(url)
+            if not info: 
+                continue
+            a_abbr = info["teamA"]["abbr"]; b_abbr = info["teamB"]["abbr"]
+            key = frozenset([a_abbr, b_abbr])
+            if key not in pairs:
+                continue
+            rowsA = info["players"].get(info["teamA"]["name"], [])
+            rowsB = info["players"].get(info["teamB"]["name"], [])
+            if rowsA and a_abbr not in players: players[a_abbr] = rowsA
+            if rowsB and b_abbr not in players: players[b_abbr] = rowsB
+        # если закрыли все пары — прекращаем раньше
+        if all(any(x in players for x in p) for p in pairs):
+            break
+    return players
+
+# ================== ESPN (score/OT/W-L + fallback boxscore) ==================
+ESPN_SITE_SB  = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates={ymd}"
+ESPN_WEB_SB   = "https://site.web.api.espn.com/apis/v2/sports/basketball/nba/scoreboard?dates={ymd}"
+ESPN_BOX      = "https://site.web.api.espn.com/apis/v2/sports/basketball/nba/boxscore?event={eid}"
 
 def _espn_record(c: dict) -> str:
     for r in c.get("records") or []:
@@ -268,32 +294,44 @@ def _espn_record(c: dict) -> str:
             return r["summary"]
     return ""
 
-def fetch_espn_completed_for_day(d: date) -> list[dict]:
-    j = _get_json(ESPN_SB.format(ymd=d.strftime("%Y%m%d")))
+def _as_int(x):
+    try: return int(float(x))
+    except: return 0
+
+def _parse_espn_events(j: dict, day_et: date) -> list[dict]:
     out=[]
     for ev in (j.get("events") or []):
         try:
-            status = (ev.get("status") or {}).get("type") or {}
-            if not bool(status.get("completed", False)):
-                continue
             comp = (ev.get("competitions") or [None])[0] or {}
             comps = comp.get("competitors") or []
             if len(comps) != 2: 
                 continue
+
+            # дата события → ET → фильтр по дню
+            dt_iso = comp.get("date") or ev.get("date")
+            if not dt_iso: 
+                continue
+            try:
+                dt_utc = datetime.fromisoformat(dt_iso.replace("Z","+00:00"))
+            except Exception:
+                continue
+            dt_et = dt_utc.astimezone(ZoneInfo("America/New_York")).date()
+            if dt_et != day_et: 
+                continue
+
+            status = (ev.get("status") or {}).get("type") or {}
+            completed = bool(status.get("completed", False)) or str(status.get("state","")).lower()=="post"
+            if not completed: 
+                continue
+
             home = next(c for c in comps if c.get("homeAway")=="home")
             away = next(c for c in comps if c.get("homeAway")=="away")
-
             th = (home.get("team") or {})
             ta = (away.get("team") or {})
             abbr_h = norm_abbr(th.get("abbreviation",""))
             abbr_a = norm_abbr(ta.get("abbreviation",""))
-            # нормализованные аббревиатуры должны попадать в наши карты
             if abbr_h not in ABBR_TO_RU or abbr_a not in ABBR_TO_RU:
                 continue
-
-            def as_int(x):
-                try: return int(float(x))
-                except: return 0
 
             try:
                 period = int(status.get("period") or 0)
@@ -301,27 +339,51 @@ def fetch_espn_completed_for_day(d: date) -> list[dict]:
                 period = 0
             ot = max(period - 4, 0)
 
+            h_score = _as_int(home.get("score", 0))
+            a_score = _as_int(away.get("score", 0))
+            h_win = bool(home.get("winner", False)) or (h_score > a_score)
+            a_win = bool(away.get("winner", False)) or (a_score > h_score)
+
             out.append({
                 "eventId": str(ev.get("id") or ""),
                 "home": {
                     "abbr": abbr_h,
                     "teamId": str(th.get("id") or ""),
-                    "score": as_int(home.get("score", 0)),
-                    "winner": bool(home.get("winner", False)),
+                    "score": h_score,
+                    "winner": h_win,
                     "record": _espn_record(home),
                 },
                 "away": {
                     "abbr": abbr_a,
                     "teamId": str(ta.get("id") or ""),
-                    "score": as_int(away.get("score", 0)),
-                    "winner": bool(away.get("winner", False)),
+                    "score": a_score,
+                    "winner": a_win,
                     "record": _espn_record(away),
                 },
                 "ot": ot,
             })
         except Exception:
             continue
-    log("[DBG] ESPN COMPLETED", len(out), "for", d)
+    return out
+
+def fetch_espn_completed_for_day(day_et: date) -> list[dict]:
+    endpoints = [ESPN_SITE_SB, ESPN_WEB_SB]
+    dates = [day_et - timedelta(days=1), day_et, day_et + timedelta(days=1)]
+    gathered=[]
+    for d in dates:
+        ymd = d.strftime("%Y%m%d")
+        for ep in endpoints:
+            j = _get_json(ep.format(ymd=ymd))
+            parsed = _parse_espn_events(j, day_et)
+            if parsed:
+                log(f"[DBG] ESPN pull {ep.split('/apis/')[0].split('//')[-1]} {ymd} -> {len(parsed)} for ET {day_et}")
+            gathered.extend(parsed)
+    seen=set(); out=[]
+    for e in gathered:
+        key = (e["home"]["abbr"], e["away"]["abbr"], e["home"]["score"], e["away"]["score"])
+        if key in seen: continue
+        seen.add(key); out.append(e)
+    log("[DBG] ESPN COMPLETED (merged)", len(out), "for", day_et)
     return out
 
 def fetch_espn_players(event_id: str) -> dict[str, list[dict]]:
@@ -359,14 +421,14 @@ def fetch_espn_players(event_id: str) -> dict[str, list[dict]]:
         out[tid] = list(merged.values())
     return out
 
-# ============ PLAYERS PICK/FORMAT ============
+# ================== PLAYERS PICK/FORMAT ==================
 def initials_ru(full: str) -> str:
     parts = [p for p in re.split(r"\s+", (full or "").strip()) if p]
     if not parts: return full or ""
     if len(parts) == 1: return parts[0]
     first, last = parts[0], parts[-1]
     if last.lower() in {"jr.","jr","мл.","ст.","sr.","sr"} and len(parts)>=3:
-        last = parts[-2] + " " + parts[-1]
+        last = parts[-2] + " " + last
     return f"{first[0]}. {last}"
 
 def ru_forms(label: str, v: int) -> str:
@@ -393,7 +455,6 @@ def score_key(p: dict): return (p["pts"], p["reb"]+p["ast"], p["stl"]+p["blk"])
 def pick_team_players(abbr: str, rows: list[dict]) -> list[tuple[dict,bool,bool]]:
     if not rows: return []
     rows = sorted(rows, key=score_key, reverse=True)
-    # спец
     special_keys=[]
     if abbr=="BKN": special_keys=["дёмин","демин","demin"]
     if abbr=="MIA": special_keys=["голдин","goldin"]
@@ -434,7 +495,7 @@ def format_player_special(p: dict) -> str:
     chosen=stats[:3]
     return f"{name}: " + ", ".join(ru_forms(k,v) for k,v in chosen) + hot_mark(p)
 
-# ============ SPOILERS / LINES ============
+# ================== SPOILERS / LINES ==================
 def sp(s: str) -> str: return f'<span class="tg-spoiler">{s}</span>'
 SEP = "–––––––––––––––––––––––"
 
@@ -457,12 +518,9 @@ def block_from_event(ev: dict, players_by_abbr: dict[str, list[dict]]) -> str:
         f"{format_score_line(name_a, abbr_a, a['score'], a['winner'], a.get('record',''), ot_str)}\n\n"
     )
 
-    # игроки: из Sports.ru (если есть), иначе фоллбек ESPN по teamId
     rowsH = players_by_abbr.get(abbr_h, [])
     rowsA = players_by_abbr.get(abbr_a, [])
-
-    # если нет — ESPN boxscore
-    if not rowsH or not rowsA:
+    if (not rowsH or not rowsA) and ev.get("eventId"):
         espn_players = fetch_espn_players(ev["eventId"])
         rowsH = rowsH or espn_players.get(h["teamId"], [])
         rowsA = rowsA or espn_players.get(a["teamId"], [])
@@ -474,47 +532,26 @@ def block_from_event(ev: dict, players_by_abbr: dict[str, list[dict]]) -> str:
 
     lines=[]
     if al: lines.extend(al)
-    if al and bl: lines.append("")  # пустая строка между командами
+    if al and bl: lines.append("")
     if bl: lines.extend(bl)
-
     return head + ("\n".join(lines) if lines else "")
 
-# ============ BUILD POST ============
-def build_post() -> str:
-    d_title = pick_title_date_london()   # для заголовка и sports.ru
-    d_espn  = pick_report_date_et()      # сетка/счёт/OT/records — строго по ESPN/ET
+# ================== BUILD POST ==================
+def build_post_for_et_day(d_et: date) -> str:
+    events = fetch_espn_completed_for_day(d_et)
+    log("[DBG] DAY ESPN COUNT", len(events), "ET", d_et)
 
-    # 1) ESPN completed на отчётный день (ET) — это и есть «истина» по числу матчей и счёту
-    events = fetch_espn_completed_for_day(d_espn)
-    # Индекс по паре аббревиатур (frozenset)
-    by_pair = {frozenset([e["home"]["abbr"], e["away"]["abbr"]]): e for e in events}
-    log("[DBG] DAY ESPN COUNT", len(events), "ET", d_espn)
+    pairs = {frozenset([e["home"]["abbr"], e["away"]["abbr"]]) for e in events}
+    players_by_abbr: dict[str, list[dict]] = {}
+    if events:
+        players_by_abbr = collect_sports_players_for_pairs(pairs, d_et)
 
-    # 2) Загружаем sports.ru для русских фамилий и игроков, но ТОЛЬКО для пар из ESPN
-    #    Сначала соберём все матчи дня на sports.ru (по дате заголовка),
-    #    затем отфильтруем по парам из ESPN.
-    players_by_abbr: dict[str, list[dict]] = {}  # "BOS" -> [rows]
-    for url in collect_day_links(d_title):
-        info = parse_sports_players(url)
-        if not info: 
-            continue
-        a_abbr = info["teamA"]["abbr"]; b_abbr = info["teamB"]["abbr"]
-        key = frozenset([a_abbr, b_abbr])
-        if key not in by_pair:
-            # не матч НБА дня по ESPN — пропускаем
-            continue
-        rowsA = info["players"].get(info["teamA"]["name"], [])
-        rowsB = info["players"].get(info["teamB"]["name"], [])
-        # Запишем только если что-то есть
-        if rowsA: players_by_abbr.setdefault(a_abbr, rowsA)
-        if rowsB: players_by_abbr.setdefault(b_abbr, rowsB)
-
-    # 3) Формируем блоки в стабильном порядке (по русскому названию хозяев)
     def sort_key(ev: dict) -> tuple:
         return (ABBR_TO_RU.get(ev["home"]["abbr"], ev["home"]["abbr"]),
                 ABBR_TO_RU.get(ev["away"]["abbr"], ev["away"]["abbr"]))
     events_sorted = sorted(events, key=sort_key)
 
+    d_title = title_date_for_et(d_et)
     title_count = len(events_sorted)
     title = f"НБА • {ru_date(d_title)} • {title_count} {ru_plural(title_count, ('матч','матча','матчей'))}\n"
     title += "Результаты надёжно спрятаны 👇\n"
@@ -531,11 +568,13 @@ def build_post() -> str:
 
     return (title + "".join(blocks)).strip()
 
-# ============ TELEGRAM ============
-def tg_send(text: str):
+# ================== TELEGRAM ==================
+API = "https://api.telegram.org"
+
+def tg_send(text: str) -> dict:
     if not (BOT_TOKEN and CHAT_ID):
         raise RuntimeError("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы")
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    url = f"{API}/bot{BOT_TOKEN}/sendMessage"
     r = S.post(url, json={
         "chat_id": CHAT_ID,
         "text": text,
@@ -544,13 +583,116 @@ def tg_send(text: str):
     }, timeout=HTTP_TIMEOUT)
     if r.status_code != 200:
         raise RuntimeError(f"Telegram error {r.status_code}: {r.text}")
+    return r.json()
 
-# ============ MAIN ============
+def tg_send_menu_last3(options: list[tuple[date,int]]) -> dict:
+    # options: [(d_et, count), ...] len=3
+    buttons=[]
+    rows=[]
+    for d, n in options:
+        cap = f"{d:%d %b} (ET) — {n} {ru_plural(n, ('матч','матча','матчей'))}"
+        cb  = f"NBA:DAY:{d.isoformat()}"
+        rows.append([{"text": cap, "callback_data": cb}])
+    kb={"inline_keyboard": rows}
+    url = f"{API}/bot{BOT_TOKEN}/sendMessage"
+    text = "Выберите день (по ET) для публикации:"
+    r = S.post(url, json={
+        "chat_id": CHAT_ID,
+        "text": text,
+        "reply_markup": kb,
+    }, timeout=HTTP_TIMEOUT)
+    if r.status_code != 200:
+        raise RuntimeError(f"Telegram error {r.status_code}: {r.text}")
+    return r.json()
+
+def tg_answer_callback(cb_id: str):
+    url = f"{API}/bot{BOT_TOKEN}/answerCallbackQuery"
+    S.post(url, json={"callback_query_id": cb_id}, timeout=HTTP_TIMEOUT)
+
+def tg_get_updates(offset: int|None=None) -> dict:
+    url = f"{API}/bot{BOT_TOKEN}/getUpdates"
+    payload={"timeout": 0}
+    if offset is not None: payload["offset"] = offset
+    r = S.get(url, params=payload, timeout=HTTP_TIMEOUT)
+    if r.status_code != 200:
+        return {}
+    return r.json()
+
+def tg_delete_message(chat_id: str, message_id: int):
+    url = f"{API}/bot{BOT_TOKEN}/deleteMessage"
+    S.post(url, json={"chat_id": chat_id, "message_id": message_id}, timeout=HTTP_TIMEOUT)
+
+# ================== LAST3 MENU / FLOW ==================
+def espn_count_for_et(d: date) -> int:
+    return len(fetch_espn_completed_for_day(d))
+
+def build_last3_options() -> list[tuple[date,int]]:
+    base = et_today()
+    days = [base - timedelta(days=k) for k in [0,1,2]]
+    out=[]
+    for d in days:
+        c = espn_count_for_et(d)
+        out.append((d,c))
+    return out
+
+def wait_callback_and_post(menu_msg: dict, options_set: set[str]):
+    # Ждём нажатие до INTERACTIVE_WAIT_SEC
+    deadline = time.time() + INTERACTIVE_WAIT_SEC
+    last_update_id = None
+    while time.time() < deadline:
+        up = tg_get_updates(last_update_id+1 if last_update_id is not None else None)
+        for upd in (up.get("result") or []):
+            last_update_id = upd.get("update_id", last_update_id)
+            cb = upd.get("callback_query")
+            if not cb: continue
+            data = cb.get("data","")
+            from_user = str(((cb.get("from") or {}).get("id")) or "")
+            if not data.startswith("NBA:DAY:"): continue
+            if TELEGRAM_ADMIN_ID and from_user != TELEGRAM_ADMIN_ID:
+                continue
+            iso = data.split("NBA:DAY:",1)[1]
+            if iso not in options_set:
+                continue
+            try:
+                d = date.fromisoformat(iso)
+            except Exception:
+                continue
+            try:
+                tg_answer_callback(cb.get("id",""))
+            except Exception:
+                pass
+            # по желанию — удалим меню
+            try:
+                msg = menu_msg.get("result",{}).get("message_id")
+                if msg:
+                    tg_delete_message(CHAT_ID, msg)
+            except Exception:
+                pass
+            post = build_post_for_et_day(d)
+            tg_send(post)
+            return
+        time.sleep(1)
+
+# ================== MAIN ==================
 if __name__ == "__main__":
     try:
-        post = build_post()
-        tg_send(post)
-        print("OK")
-    except Exception as e:
-        print("ERROR:", repr(e), file=sys.stderr)
-        sys.exit(1)
+        if PRINT_LAST3_MENU:
+            opts = build_last3_options()  # [(date,count)*3]
+            # Отправляем меню
+            msg = tg_send_menu_last3(opts)
+            # Ждём нажатие (если задан интервал >0). Иначе — просто завершаемся после отправки меню.
+            if INTERACTIVE_WAIT_SEC > 0:
+                options_set = {d.isoformat() for d,_ in opts}
+                wait_callback_and_post(msg, options_set)
+            print("OK")
+            sys.exit(0)
+
+        if SEND_LAST3:
+            base = et_today()
+            for delta in [0,1,2]:
+                d = base - timedelta(days=delta)
+                post = build_post_for_et_day(d)
+                tg_send(post)
+                time.sleep(0.5)
+            print("OK")
+            sys.exit(0
