@@ -1,54 +1,140 @@
-name: Emoji smoke test (Telegram custom emojis)
+name: Emoji Smoke Test
 
 on:
-  workflow_dispatch: {}   # запуск вручную из GitHub → Actions
+  workflow_dispatch: {}
 
 jobs:
-  run:
+  emoji:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    timeout-minutes: 10
-
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TEAM_EMOJI_JSON: ${{ secrets.TEAM_EMOJI_JSON }}
+      TEST_CHAT_ID: ${{ secrets.TEST_CHAT_ID }} # необязательно
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: Install deps (stdlib подходит, но пусть будет requests)
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests
+      - name: Install requests
+        run: pip install requests
 
-      # Быстрая проверка формата секрета
-      - name: Sanity check TEAM_EMOJI_JSON
-        env:
-          TEAM_EMOJI_JSON: ${{ secrets.TEAM_EMOJI_JSON }}
+      - name: Validate TEAM_EMOJI_JSON is readable
         run: |
-          python - <<'PY'
-          import os, json
-          s = os.getenv("TEAM_EMOJI_JSON")
-          print("TEAM_EMOJI_JSON present:", bool(s))
-          if not s: raise SystemExit(1)
+          python - << 'PY'
+          import os, json, sys
+          raw = os.getenv('TEAM_EMOJI_JSON','')
+          if not raw:
+            sys.exit('TEAM_EMOJI_JSON secret is empty or missing')
           try:
-              d = json.loads(s)
+            mp = json.loads(raw)
+            assert isinstance(mp, dict), 'TEAM_EMOJI_JSON must be a JSON object {ABBR: id}'
+            print('TEAM_EMOJI_JSON entries:', len(mp))
+            # Ключи должны быть каноничными: ATL, BOS, ..., WAS
+            bad = [k for k in mp if k.upper()!=k or len(k) not in (2,3)]
+            if bad:
+              print('WARNING: non-canonical keys:', bad)
           except Exception as e:
-              print("JSON error:", e); raise
-          print("Keys total:", len(d))
-          bad = [k for k in d if len(k)!=3]
-          if bad: print("Non-canonical keys:", ",".join(bad))
+            raise SystemExit(f'Invalid TEAM_EMOJI_JSON: {e}')
           PY
 
-      - name: Run emoji smoke test (send only recognized)
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          TEAM_EMOJI_JSON:    ${{ secrets.TEAM_EMOJI_JSON }}
-          # опционально: если хочешь фильтровать по имени набора
-          TEAM_EMOJI_SET_NAME: ${{ vars.TEAM_EMOJI_SET_NAME }}
+      - name: Check IDs exist in Telegram (no sending)
         run: |
-          python scripts/emoji_smoke_test.py
+          python - << 'PY'
+          import os, json, requests, sys
+          token = os.getenv('TELEGRAM_BOT_TOKEN','').strip()
+          if not token:
+            sys.exit('No TELEGRAM_BOT_TOKEN')
+          mapping = json.loads(os.getenv('TEAM_EMOJI_JSON','{}'))
+          ids = sorted({str(v) for v in mapping.values() if v})
+          if not ids:
+            sys.exit('No IDs in TEAM_EMOJI_JSON')
+          url = f'https://api.telegram.org/bot{token}/getCustomEmojiStickers'
+          r = requests.post(url, json={'custom_emoji_ids': ids}, timeout=20)
+          print('HTTP', r.status_code)
+          try:
+            data = r.json()
+          except Exception:
+            print('RAW:', r.text[:500])
+            sys.exit('Telegram answer not JSON')
+          if not data.get('ok'):
+            print('Telegram API error:', data)
+            sys.exit(1)
+          found = {s.get('custom_emoji_id') for s in data.get('result', [])}
+          missing = [(abbr, cid) for abbr, cid in mapping.items() if str(cid) not in found]
+          print('Found:', len(found), '/', len(ids))
+          if missing:
+            print('Missing or invalid IDs:')
+            for abbr, cid in missing:
+              print(f'  {abbr}: {cid}')
+            sys.exit(2)
+          else:
+            print('All custom_emoji_id are valid ✅')
+          PY
+
+      - name: Dry-run entity building (no sending)
+        run: |
+          python - << 'PY'
+          import os, json, re, sys
+          mapping = json.loads(os.getenv('TEAM_EMOJI_JSON','{}'))
+          # Сконструируем тестовый текст с токенами {EMO:(ABBR)}ABBR
+          text = " ".join([f'{{EMO:\\n({abbr})\\n}}{abbr}' for abbr in sorted(mapping)])
+          # Правильный расчёт offset в UTF-16 код-юнитах
+          def u16len(s): return len(s.encode('utf-16-le'))//2
+          entities=[]; out_parts=[]; last=0
+          for m in re.finditer(r"\\{EMO:\\n\\(([A-Z]{2,3})\\)\\n\\}", text):
+            abbr=m.group(1)
+            out_parts.append(text[last:m.start()])
+            start=u16len(''.join(out_parts))
+            if abbr in mapping:
+              out_parts.append('⬤')
+              entities.append({'type':'custom_emoji','offset':start,'length':1,'custom_emoji_id':str(mapping[abbr])})
+            else:
+              out_parts.append('🏀')
+            last=m.end()
+          out_parts.append(text[last:])
+          final=''.join(out_parts)
+          print('Preview text:', final[:200].replace('\\n',' '))
+          print('Entities count:', len(entities))
+          if not entities:
+            sys.exit('No entities built — check TEAM_EMOJI_JSON keys (must be ATL/BOS/...)')
+          # Базовая проверка: все abbr должны быть представлены в entities
+          if len(entities) < len(mapping):
+            print('WARNING: entities < mapping size. Some keys may be missing.')
+          else:
+            print('Entity building looks fine ✅')
+          PY
+
+      - name: Optional live send (one message to TEST_CHAT_ID)
+        if: env.TEST_CHAT_ID != ''
+        run: |
+          python - << 'PY'
+          import os, json, re, requests, sys
+          token=os.getenv('TELEGRAM_BOT_TOKEN','').strip()
+          chat=os.getenv('TEST_CHAT_ID','').strip()
+          if not token or not chat:
+            sys.exit('No token or TEST_CHAT_ID')
+          mapping=json.loads(os.getenv('TEAM_EMOJI_JSON','{}'))
+          text=" ".join([f'{{EMO:\\n({abbr})\\n}}{abbr}' for abbr in sorted(mapping)])
+          def u16len(s): return len(s.encode('utf-16-le'))//2
+          entities=[]; out_parts=[]; last=0
+          for m in re.finditer(r"\\{EMO:\\n\\(([A-Z]{2,3})\\)\\n\\}", text):
+            abbr=m.group(1); out_parts.append(text[last:m.start()])
+            start=u16len(''.join(out_parts))
+            if abbr in mapping:
+              out_parts.append('⬤'); entities.append({'type':'custom_emoji','offset':start,'length':1,'custom_emoji_id':str(mapping[abbr])})
+            else:
+              out_parts.append('🏀')
+            last=m.end()
+          out_parts.append(text[last:])
+          final=''.join(out_parts)
+          r=requests.post(f'https://api.telegram.org/bot{token}/sendMessage',
+                          json={'chat_id':chat,'text':final,'parse_mode':'HTML','disable_web_page_preview':True,'entities':entities},
+                          timeout=20)
+          print(r.status_code, r.text[:300])
+          if r.status_code != 200:
+            sys.exit('sendMessage failed')
+          PY
