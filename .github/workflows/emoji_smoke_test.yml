@@ -9,7 +9,7 @@ jobs:
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TEAM_EMOJI_JSON: ${{ secrets.TEAM_EMOJI_JSON }}
-      TEST_CHAT_ID: ${{ secrets.TEST_CHAT_ID }} # необязательно
+      TEST_CHAT_ID: ${{ secrets.TEST_CHAT_ID }} # обязательный для отправки предпросмотра
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,7 +33,6 @@ jobs:
             mp = json.loads(raw)
             assert isinstance(mp, dict), 'TEAM_EMOJI_JSON must be a JSON object {ABBR: id}'
             print('TEAM_EMOJI_JSON entries:', len(mp))
-            # Ключи должны быть каноничными: ATL, BOS, ..., WAS
             bad = [k for k in mp if k.upper()!=k or len(k) not in (2,3)]
             if bad:
               print('WARNING: non-canonical keys:', bad)
@@ -58,11 +57,9 @@ jobs:
           try:
             data = r.json()
           except Exception:
-            print('RAW:', r.text[:500])
-            sys.exit('Telegram answer not JSON')
+            print('RAW:', r.text[:500]); sys.exit('Telegram answer not JSON')
           if not data.get('ok'):
-            print('Telegram API error:', data)
-            sys.exit(1)
+            print('Telegram API error:', data); sys.exit(1)
           found = {s.get('custom_emoji_id') for s in data.get('result', [])}
           missing = [(abbr, cid) for abbr, cid in mapping.items() if str(cid) not in found]
           print('Found:', len(found), '/', len(ids))
@@ -80,9 +77,7 @@ jobs:
           python - << 'PY'
           import os, json, re, sys
           mapping = json.loads(os.getenv('TEAM_EMOJI_JSON','{}'))
-          # Сконструируем тестовый текст с токенами {EMO:(ABBR)}ABBR
           text = " ".join([f'{{EMO:\\n({abbr})\\n}}{abbr}' for abbr in sorted(mapping)])
-          # Правильный расчёт offset в UTF-16 код-юнитах
           def u16len(s): return len(s.encode('utf-16-le'))//2
           entities=[]; out_parts=[]; last=0
           for m in re.finditer(r"\\{EMO:\\n\\(([A-Z]{2,3})\\)\\n\\}", text):
@@ -97,44 +92,71 @@ jobs:
             last=m.end()
           out_parts.append(text[last:])
           final=''.join(out_parts)
-          print('Preview text:', final[:200].replace('\\n',' '))
+          print('Preview text snippet:', final[:200].replace('\\n',' '))
           print('Entities count:', len(entities))
           if not entities:
             sys.exit('No entities built — check TEAM_EMOJI_JSON keys (must be ATL/BOS/...)')
-          # Базовая проверка: все abbr должны быть представлены в entities
-          if len(entities) < len(mapping):
-            print('WARNING: entities < mapping size. Some keys may be missing.')
-          else:
-            print('Entity building looks fine ✅')
+          print('Entity building looks fine ✅')
           PY
 
-      - name: Optional live send (one message to TEST_CHAT_ID)
+      - name: Send per-team logos with names (to TEST_CHAT_ID)
         if: env.TEST_CHAT_ID != ''
         run: |
           python - << 'PY'
-          import os, json, re, requests, sys
+          import os, json, re, requests, sys, math
+
           token=os.getenv('TELEGRAM_BOT_TOKEN','').strip()
           chat=os.getenv('TEST_CHAT_ID','').strip()
           if not token or not chat:
-            sys.exit('No token or TEST_CHAT_ID')
-          mapping=json.loads(os.getenv('TEAM_EMOJI_JSON','{}'))
-          text=" ".join([f'{{EMO:\\n({abbr})\\n}}{abbr}' for abbr in sorted(mapping)])
-          def u16len(s): return len(s.encode('utf-16-le'))//2
-          entities=[]; out_parts=[]; last=0
-          for m in re.finditer(r"\\{EMO:\\n\\(([A-Z]{2,3})\\)\\n\\}", text):
-            abbr=m.group(1); out_parts.append(text[last:m.start()])
-            start=u16len(''.join(out_parts))
-            if abbr in mapping:
-              out_parts.append('⬤'); entities.append({'type':'custom_emoji','offset':start,'length':1,'custom_emoji_id':str(mapping[abbr])})
-            else:
-              out_parts.append('🏀')
-            last=m.end()
-          out_parts.append(text[last:])
-          final=''.join(out_parts)
-          r=requests.post(f'https://api.telegram.org/bot{token}/sendMessage',
-                          json={'chat_id':chat,'text':final,'parse_mode':'HTML','disable_web_page_preview':True,'entities':entities},
-                          timeout=20)
-          print(r.status_code, r.text[:300])
-          if r.status_code != 200:
-            sys.exit('sendMessage failed')
+            sys.exit('No TELEGRAM_BOT_TOKEN or TEST_CHAT_ID')
+
+          mapping=json.loads(os.getenv('TEAM_EMOJI_JSON','{}'))  # {ABBR: custom_emoji_id}
+
+          # Русские названия (как в твоём боте)
+          ABBR_TO_RU = {
+            "ATL":"Атланта","BOS":"Бостон","BKN":"Бруклин","CHA":"Шарлотт","CHI":"Чикаго",
+            "CLE":"Кливленд","DAL":"Даллас","DEN":"Денвер","DET":"Детройт","GSW":"Голден Стэйт",
+            "HOU":"Хьюстон","IND":"Индиана","LAC":"Клипперс","LAL":"Лейкерс","MEM":"Мемфис",
+            "MIA":"Майами","MIL":"Милуоки","MIN":"Миннесота","NOP":"Новый Орлеан","NYK":"Нью-Йорк",
+            "OKC":"Оклахома-Сити","ORL":"Орландо","PHI":"Филадельфия","PHX":"Финикс","POR":"Портленд",
+            "SAC":"Сакраменто","SAS":"Сан-Антонио","TOR":"Торонто","UTA":"Юта","WAS":"Вашингтон",
+          }
+
+          # Строим строки вида: {EMO:(BOS)} BOS — Бостон
+          abbrs = sorted(mapping.keys())
+          lines = [f'{{EMO:\\n({abbr})\\n}} {abbr} — {ABBR_TO_RU.get(abbr, abbr)}' for abbr in abbrs]
+
+          def u16len(s: str) -> int:
+            return len(s.encode('utf-16-le')) // 2
+
+          def build_text_and_entities(text: str, mapping: dict) -> tuple[str, list]:
+            entities=[]; out_parts=[]; last=0
+            for m in re.finditer(r"\\{EMO:\\n\\(([A-Z]{2,3})\\)\\n\\}", text):
+              abbr=m.group(1)
+              out_parts.append(text[last:m.start()])
+              start=u16len(''.join(out_parts))
+              if abbr in mapping:
+                out_parts.append('⬤')
+                entities.append({'type':'custom_emoji','offset':start,'length':1,'custom_emoji_id':str(mapping[abbr])})
+              else:
+                out_parts.append('🏀')
+              last=m.end()
+            out_parts.append(text[last:])
+            return ''.join(out_parts), entities
+
+          # Бьём по 10 строк в сообщение
+          CHUNK=10
+          for i in range(0, len(lines), CHUNK):
+            chunk_lines = lines[i:i+CHUNK]
+            text = "\\n".join(chunk_lines)
+            final, entities = build_text_and_entities(text, mapping)
+            r = requests.post(
+              f'https://api.telegram.org/bot{token}/sendMessage',
+              json={'chat_id':chat,'text':final,'parse_mode':'HTML','disable_web_page_preview':True,'entities':entities},
+              timeout=20
+            )
+            print('send:', i//CHUNK+1, r.status_code, r.text[:180])
+            if r.status_code != 200:
+              sys.exit('sendMessage failed')
+          print('Done: sent', math.ceil(len(lines)/CHUNK), 'messages')
           PY
