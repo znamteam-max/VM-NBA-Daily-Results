@@ -145,82 +145,131 @@ def _canonical_ru_team(raw: str) -> str | None:
 
 def parse_sports_match(url: str) -> dict | None:
     soup = _soup(url)
-    if not soup: return None
+    if not soup:
+        return None
+
+    # счёт + признак ОТ
     text = soup.get_text(" ", strip=True)
-
-    m = re.search(r"(\d+)\s:\s(\d+)", text)
-    if not m: return None
+    m = re.search(r"(\d+)\s*:\s*(\d+)", text)
+    if not m:
+        return None
     scoreA, scoreB = int(m.group(1)), int(m.group(2))
-
-    # OT по количеству «периодов» рядом
     tail = text[m.end():m.end()+240]
-    add = re.findall(r"\d+\s:\s\d+", tail)
-    ot = max(len(add)-4, 0) if add else 0
+    extra_pairs = re.findall(r"\d+\s*:\s*\d+", tail)
+    ot = max(len(extra_pairs) - 4, 0) if extra_pairs else 0
 
-    # команды
-    meta = soup.find("meta", attrs={"property":"og:title"})
+    # команды из <meta property="og:title"> (или заголовков)
+    meta = soup.find("meta", attrs={"property": "og:title"})
     title = meta.get("content") if meta and meta.get("content") else (soup.title.string if soup.title else "")
     teamA = teamB = None
     if title and "—" in title:
         left, right = [x.strip() for x in title.split("—", 1)]
-        teamA = _canonical_ru_team(left); teamB = _canonical_ru_team(right)
-    if not (teamA and teamB) or (teamA == teamB):
-        heads=[]
-        for h in soup.find_all(["h2","h3","h4"]):
-            t = h.get_text(" ", strip=True).lower()
-            if "статистика игроков" in t:
-                k = _canonical_ru_team(h.get_text(" ", strip=True).split(".")[0])
-                if k: heads.append(k)
+        teamA = _canonical_ru_team(left)
+        teamB = _canonical_ru_team(right)
+
+    if not (teamA and teamB) or teamA == teamB:
+        # подстрахуемся заголовками секций "статистика игроков"
+        heads = []
+        for h in soup.find_all(["h2", "h3", "h4"]):
+            t = h.get_text(" ", strip=True)
+            if "статистика игроков" in t.lower():
+                k = _canonical_ru_team(t.split(".")[0])
+                if k:
+                    heads.append(k)
         if len(heads) >= 2:
             teamA = teamA or heads[0]
             teamB = teamB or next((x for x in heads[1:] if x != teamA), None)
-    if not (teamA and teamB) or teamA == teamB: return None
 
-    a_abbr = TEAM_RU_TO_ABBR.get(teamA,""); b_abbr = TEAM_RU_TO_ABBR.get(teamB,"")
-    if not a_abbr or not b_abbr: return None
+    if not (teamA and teamB) or teamA == teamB:
+        return None
 
-    def read_rows(team_ru_key: str) -> list[dict]:
-        rows=[]; stamp = team_ru_key.lower()
-        anchor=None
-        for h in soup.find_all(["h2","h3","h4"]):
-            t = h.get_text(" ", strip=True)
-            if "статистика игроков" in t.lower() and stamp in t.lower().split(".")[0]:
-                anchor=h; break
-        if not anchor: return rows
+    a_abbr = TEAM_RU_TO_ABBR.get(teamA, "")
+    b_abbr = TEAM_RU_TO_ABBR.get(teamB, "")
+    if not a_abbr or not b_abbr:
+        return None
+
+    # --- извлечение таблиц игроков Sports.ru ---
+    def read_rows_for(team_ru_key: str) -> list[dict]:
+        """Парсим таблицу вида '<Команда>. статистика игроков' для заданной команды."""
+        # найдём как раз ту секцию, где и команда, и слова "статистика игроков"
+        anchor = None
+        want = team_ru_key.lower()
+        for h in soup.find_all(["h2", "h3", "h4"]):
+            t = h.get_text(" ", strip=True).lower()
+            if "статистика игроков" in t and want in t:
+                anchor = h
+                break
+        if not anchor:
+            return []
+
         table = anchor.find_next("table")
-        if not table: return rows
+        if not table:
+            return []
+
+        rows = []
         for tr in table.find_all("tr"):
-            tds = [td.get_text(" ", strip=True) for td in tr.find_all(["td","th"])]
-            if not tds: continue
-            if any(x.lower().startswith("игрок") for x in tds): continue
-            # имя
-            name_idx=None
-            for i,cell in enumerate(tds[:3]):
-                if re.search(r"[^\d/:% ]", cell):
-                    name_idx=i; break
-            if name_idx is None: continue
-            name = tds[name_idx]
-            nums = tds[name_idx+1:]
-            if len(nums) < 14: continue
+            # имя берём только из ссылки-имени игрока
+            a = tr.find("a", href=True)
+            if not a:
+                continue
+            name = a.get_text(" ", strip=True)
+            if not name:
+                continue
+
+            # найдём индекс ячейки, содержащей ссылку с именем
+            tds = tr.find_all("td")
+            if not tds:
+                continue
+            name_td = a.find_parent("td")
+            name_idx = None
+            for i, td in enumerate(tds):
+                if td is name_td:
+                    name_idx = i
+                    break
+            if name_idx is None:
+                continue
+
+            # далее идут чисто числовые колонки (см. шапку Sports.ru):
+            # О, 2-очк (3/В %), 3-очк (3/В %), Штрафные (3/В %), ПБ, АП, Ф, ПХ, П, БШ, Мин
+            cells = [td.get_text(" ", strip=True) for td in tds[name_idx + 1:]]
+            if len(cells) < 13:
+                # короткая строка или строка-итог команды
+                continue
+
             def as_int(x: str) -> int:
-                try: return int(x)
-                except:
-                    try: return int(float(x))
-                    except: return 0
-            pts = as_int(nums[0]); reb = as_int(nums[7]); ast = as_int(nums[8])
-            stl = as_int(nums[10]); blk = as_int(nums[12])
+                try:
+                    return int(x)
+                except Exception:
+                    try:
+                        return int(float(x))
+                    except Exception:
+                        return 0
+
+            pts = as_int(cells[0])
+            reb = as_int(cells[7])
+            ast = as_int(cells[8])
+            stl = as_int(cells[10])
+            blk = as_int(cells[12])  # перед минутами
+
+            # отфильтруем совсем "пустые" строки
+            if not any([pts, reb, ast, stl, blk]):
+                continue
+
             rows.append({"name": name, "pts": pts, "reb": reb, "ast": ast, "stl": stl, "blk": blk})
+
         return rows
 
-    rowsA = read_rows(teamA); rowsB = read_rows(teamB)
+    rowsA = read_rows_for(teamA)
+    rowsB = read_rows_for(teamB)
     finished = bool(rowsA or rowsB)
 
     return {
-        "teamA": {"name": teamA, "abbr": a_abbr, "emoji": emoji(a_abbr), "score": scoreA},
-        "teamB": {"name": teamB, "abbr": b_abbr, "emoji": emoji(b_abbr), "score": scoreB},
-        "ot": ot, "finished": finished,
+        "teamA": {"name": teamA, "abbr": a_abbr, "score": scoreA},
+        "teamB": {"name": teamB, "abbr": b_abbr, "score": scoreB},
+        "ot": ot,
+        "finished": finished,
         "players": {teamA: rowsA, teamB: rowsB},
-        "url": url,
+        "url": _normalize_match_url(url),
     }
 
 # -------- ESPN site.api (за ОДИН день ET) --------
