@@ -308,20 +308,35 @@ def espn_scoreboard(d: date) -> list[dict]:
     j = _get_json(ESPN_SB.format(ymd=d.strftime("%Y%m%d")))
     return j.get("events") or []
 
-def espn_find_event_for_pair(d: date, ab1: str, ab2: str):
+def _espn_find_event_for_day(d: date, ab1: str, ab2: str):
+    """Ищем событие ESPN на КОНКРЕТНУЮ дату d."""
     need = {ab1, ab2}
-    for ev in espn_scoreboard(d):
+    j = _get_json(ESPN_SB.format(ymd=d.strftime("%Y%m%d")))
+    for ev in (j.get("events") or []):
         comp = (ev.get("competitions") or [{}])[0]
-        abbrs=set(); mapping={}
+        abbrs, id2abbr = set(), {}
         for c in (comp.get("competitors") or []):
-            t=c.get("team") or {}
+            t = c.get("team") or {}
             ab = norm_abbr(t.get("abbreviation") or "")
-            mapping[str(t.get("id") or "")]=ab
+            id2abbr[str(t.get("id") or "")] = ab
             abbrs.add(ab)
-        if need == abbrs:
-            return ev, mapping
+        if abbrs == need:
+            logdbg("ESPN HIT", d, ab1, ab2, "event", ev.get("id"))
+            return ev, id2abbr
     return None, {}
 
+def espn_find_event_for_pair_multi(d_title: date, ab1: str, ab2: str):
+    """
+    Ищем событие ESPN на трёх датах: D, D-1, D+1.
+    Это закрывает расхождения между европейской датой sports.ru и ET-датой ESPN.
+    """
+    for dd in (d_title, d_title - timedelta(days=1), d_title + timedelta(days=1)):
+        ev, mapping = _espn_find_event_for_day(dd, ab1, ab2)
+        if ev:
+            return ev, mapping
+    logdbg("ESPN MISS on 3 dates for", ab1, ab2, d_title)
+    return None, {}
+  
 def espn_box_players(event_id: str) -> dict[str, list[dict]]:
     j = _get_json(ESPN_BOX.format(eid=event_id))
     out={}
@@ -521,10 +536,12 @@ def build_block(game: dict) -> str:
 # ================== ENRICH (ESPN) ==================
 def enrich_with_espn(game: dict, d: date):
     ab1 = game["teams"][0]["abbr"]; ab2 = game["teams"][1]["abbr"]
-    ev, id2abbr = espn_find_event_for_pair(d, ab1, ab2)
+    # БЫЛО: ev, id2abbr = espn_find_event_for_pair(d, ab1, ab2)
+    ev, id2abbr = espn_find_event_for_pair_multi(d, ab1, ab2)
     if not ev:
         logdbg("ESPN fallback: event not found for", ab1, ab2)
         return
+    ...
 
     # заполним игроков, если пусто
     need_a = not game["teams"][0]["players"]
@@ -570,6 +587,7 @@ def enrich_with_espn(game: dict, d: date):
 def pick_report_day() -> date:
     d_today = et_today()
     today_cnt = len(fetch_day_links(d_today))
+    logdbg("SPORTS LINKS", today_cnt)  # <-- добавь эту строчку, если её нет
     if today_cnt > 0:
         logdbg("DAY PICK", d_today, "(today)")
         return d_today
