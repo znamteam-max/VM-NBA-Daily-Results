@@ -9,7 +9,7 @@ jobs:
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TEAM_EMOJI_JSON: ${{ secrets.TEAM_EMOJI_JSON }}
-      TEST_CHAT_ID: ${{ secrets.TEST_CHAT_ID }} # обязателен для шага отправки предпросмотров
+      TEST_CHAT_ID: ${{ secrets.TEST_CHAT_ID }} # обязателен для предпросмотра в чат
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -77,12 +77,12 @@ jobs:
           python - << 'PY'
           import os, json, re, sys
           mapping = json.loads(os.getenv('TEAM_EMOJI_JSON','{}'))
-          # Сконструируем тестовый текст с токенами {EMO:(ABBR)}ABBR
-          text = " ".join([f'{{EMO:\\n({abbr})\\n}}{abbr}' for abbr in sorted(mapping)])
+          # Тестовый текст с токенами {EMO:(ABBR)}ABBR
+          text = " ".join([f'{{EMO:\n({abbr})\n}}{abbr}' for abbr in sorted(mapping)])
           # Правильный расчёт offset в UTF-16 код-юнитах
           def u16len(s): return len(s.encode('utf-16-le'))//2
-          # ГИБКИЙ шаблон: любые пробелы/переводы строк вокруг EMO: и скобок
-          pat = re.compile(r"\\{\\s*EMO:\\s*\\(([A-Z]{2,3})\\)\\s*\\}")
+          # ГИБКИЙ шаблон (вАЖНО: одиночные слэши!)
+          pat = re.compile(r"\{\s*EMO:\s*\(([A-Z]{2,3})\)\s*\}")
           entities=[]; out_parts=[]; last=0
           for m in pat.finditer(text):
             abbr=m.group(1)
@@ -93,7 +93,7 @@ jobs:
             last=m.end()
           out_parts.append(text[last:])
           final=''.join(out_parts)
-          print('Preview text snippet:', final[:200].replace('\\n',' '))
+          print('Preview text snippet:', final[:200].replace('\n',' '))
           print('Entities count:', len(entities))
           if not entities:
             sys.exit('No entities built — check TEAM_EMOJI_JSON keys (must be ATL/BOS/...)')
@@ -119,9 +119,9 @@ jobs:
             "SAC":"Сакраменто","SAS":"Сан-Антонио","TOR":"Торонто","UTA":"Юта","WAS":"Вашингтон",
           }
           abbrs = sorted(mapping.keys())
-          lines = [f'{{EMO:\\n({abbr})\\n}} {abbr} — {ABBR_TO_RU.get(abbr, abbr)}' for abbr in abbrs]
+          lines = [f'{{EMO:\n({abbr})\n}} {abbr} — {ABBR_TO_RU.get(abbr, abbr)}' for abbr in abbrs]
           def u16len(s: str) -> int: return len(s.encode('utf-16-le')) // 2
-          pat = re.compile(r"\\{\\s*EMO:\\s*\\(([A-Z]{2,3})\\)\\s*\\}")
+          pat = re.compile(r"\{\s*EMO:\s*\(([A-Z]{2,3})\)\s*\}")
           def build(text: str):
             entities=[]; out=[]; last=0
             for m in pat.finditer(text):
@@ -135,7 +135,7 @@ jobs:
             return ''.join(out), entities
           CHUNK=10
           for i in range(0, len(lines), CHUNK):
-            text="\\n".join(lines[i:i+CHUNK])
+            text="\n".join(lines[i:i+CHUNK])
             final, entities = build(text)
             r = requests.post(
               f'https://api.telegram.org/bot{token}/sendMessage',
