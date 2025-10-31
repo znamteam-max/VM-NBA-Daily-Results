@@ -37,6 +37,27 @@ jobs:
             raise SystemExit(f'Invalid TEAM_EMOJI_JSON: {e}')
           PY
 
+      - name: Minimal single custom_emoji test (no parse_mode)
+        run: |
+          python - << 'PY'
+          import os, json, re, requests, sys
+          token=os.getenv('TELEGRAM_BOT_TOKEN','').strip()
+          chat=os.getenv('TEST_CHAT_ID','').strip()
+          mapping=json.loads(os.getenv('TEAM_EMOJI_JSON','{}'))
+          if not mapping: sys.exit('TEAM_EMOJI_JSON empty')
+          # возьмём первый ID
+          abbr, cid = sorted(mapping.items())[0]
+          text = "⬤"  # один символ-плейсхолдер
+          def u16len(s): return len(s.encode('utf-16-le'))//2
+          entities=[{"type":"custom_emoji","offset":0,"length":u16len(text),"custom_emoji_id":str(cid)}]
+          r=requests.post(f'https://api.telegram.org/bot{token}/sendMessage',
+                          json={"chat_id":chat, "text":text, "entities":entities, "disable_web_page_preview":True},
+                          timeout=20)
+          print(r.status_code, r.text[:200])
+          if r.status_code != 200:
+            sys.exit('sendMessage single custom_emoji failed')
+          PY
+
       - name: Bot self-check (getMe)
         run: |
           python - << 'PY'
