@@ -4,8 +4,8 @@
 """
 NBA Daily Results → Telegram (RU)
 
-• Источник игроков/русских фамилий/локального счёта: sports.ru (страницы матча).
-• Источник финального счёта (фоллбек) и рекордов W-L: ESPN site.api (несколько соседних дат).
+• Игроки/русские фамилии/локальный счёт: sports.ru (страница матча).
+• Счёт (фоллбек) и рекорды W-L: ESPN site.api (несколько соседних дат).
 • Формат: названия команд видны, счёт и игроки — в спойлерах. У победителя счёт жирным.
 • Игроки:
   – 1–2 на команду; второй — если ≥20 очков ИЛИ дабл-дабл ИЛИ ≥6 STL/BLK;
@@ -48,7 +48,7 @@ def make_session():
     ad = _mk_adapter()
     s.mount("https://", ad); s.mount("http://", ad)
     s.headers.update({
-        "User-Agent": "NBA-DailyResultsBot/4.4 (sports.ru score=maxpair, espn records, spoilers, custom_emoji)",
+        "User-Agent": "NBA-DailyResultsBot/4.5 (sports.ru near-«завершен», espn records, spoilers, custom_emoji)",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
         "Connection": "close",
     })
@@ -111,7 +111,7 @@ def load_custom_emoji():
 CUSTOM_EMOJI = load_custom_emoji()
 
 def emoji_token(abbr: str) -> str:
-    return f"{{EMO:{(abbr or '').upper()}}}"
+    return f"{{EMO:({(abbr or '').upper()})}}"
 
 # -------- SPORTS.RU (match pages) --------
 def day_url(d: date) -> str:
@@ -236,19 +236,46 @@ def _parse_players_table(node) -> list[dict]:
 
     return rows_out
 
+# --- НОВОЕ: извлечение итогового счёта рядом с «завершен/завершён» или по сумме четвертей ---
 def _extract_total_score_from_page(soup: BeautifulSoup) -> tuple[int,int]:
-    """Берём максимальную по сумме пару X:Y (обычно это 107:123), игнорируя мелкие пары."""
-    txt = soup.get_text(" ", strip=True)
-    pairs=[]
-    for m in re.finditer(r"\b(\d{2,3})\s*:\s*(\d{2,3})\b", txt):
-        a = int(m.group(1)); b = int(m.group(2))
-        pairs.append((a,b))
-    if not pairs: return (0,0)
-    # сначала отбрасываем пары с суммой < 120 (четверти/статы), если останутся — возьмём максимум
-    big = [p for p in pairs if (p[0]+p[1]) >= 120]
-    target = max(big or pairs, key=lambda p: p[0]+p[1])
-    log(f"[DBG] SCORE CAND {pairs[:8]} -> {target}")
-    return target
+    txt = soup.get_text("\n", strip=True)
+    low = txt.lower().replace("ё", "е")
+
+    # 1) окно перед «завершен/завершена/завершено/завершена игра»
+    m_end = re.search(r"заверш[её]н|\bзавершена|\bзавершено", low)
+    if m_end:
+        start = max(0, m_end.start() - 300)
+        window = txt[start:m_end.start()]
+        pairs = re.findall(r"(\d{1,3})\s*[:]\s*(\d{1,3})", window)
+        if pairs:
+            a, b = map(int, pairs[-1])  # ближайшая перед «заверш…»
+            log(f"[DBG] SCORE NEAR-END -> {a}:{b}")
+            return (a, b)
+
+    # 2) «итоговый» + затем 4–7 пар четвертей/ОВ; сверяем суммы
+    #    Собираем пары вместе с индексами, чтобы проверять последовательности
+    pairs_pos = [(m.start(), m.end(), int(m.group(1)), int(m.group(2)))
+                 for m in re.finditer(r"(\d{1,3})\s*[:]\s*(\d{1,3})", txt)]
+    n = len(pairs_pos)
+    for i in range(0, max(0, n - 5)):
+        A = pairs_pos[i][2]; B = pairs_pos[i][3]
+        for k in range(4, 8):  # 4 четверти + до 3 ОТ
+            if i + k >= n: break
+            q = pairs_pos[i+1:i+1+k]
+            sumA = sum(t[2] for t in q); sumB = sum(t[3] for t in q)
+            if sumA == A and sumB == B:
+                log(f"[DBG] SCORE BY-SUM k={k} -> {A}:{B}")
+                return (A, B)
+
+    # 3) фоллбек — пара с максимальной суммой, но с порогом >= 120
+    all_pairs = [(int(a),int(b)) for (a,b) in re.findall(r"(\d{1,3})\s*[:]\s*(\d{1,3})", txt)]
+    if all_pairs:
+        big = [p for p in all_pairs if (p[0]+p[1]) >= 120]
+        target = max(big or all_pairs, key=lambda p: p[0]+p[1])
+        log(f"[DBG] SCORE MAXPAIR -> {target}")
+        return target
+
+    return (0, 0)
 
 def parse_sports_match(url: str) -> dict | None:
     soup = _soup(url)
@@ -526,16 +553,16 @@ def tg_send(text: str):
     if not (BOT_TOKEN and CHAT_ID):
         raise RuntimeError("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы")
 
-    # Превращаем {EMO:ABBR} в кастом-эмодзи (или дефолт)
+    # Превращаем {EMO:(ABBR)} в кастом-эмодзи (или дефолт)
     entities=[]
     out_parts=[]
     last=0
-    for m in re.finditer(r"\{EMO:([A-Z]{2,3})\}", text):
+    for m in re.finditer(r"\{EMO:\(([A-Z]{2,3})\)\}", text):
         abbr = m.group(1)
         out_parts.append(text[last:m.start()])
         start_offset = sum(len(p) for p in out_parts)
         if abbr in CUSTOM_EMOJI:
-            out_parts.append("⬤")  # плейсхолдер 1 символ
+            out_parts.append("⬤")  # плейсхолдер
             entities.append({
                 "type": "custom_emoji",
                 "offset": start_offset,
