@@ -549,42 +549,63 @@ def format_score_line(name_ru: str, abbr: str, score: int, winner: bool, record:
     return f"{emoji(abbr)} {name_ru}: {sp(score_txt)}"
 
 def build_block_from_sports(info: dict, records: dict[str,str]) -> str:
-    A,B = info["teamA"], info["teamB"]
-    ot_str = "" if info["ot"]==0 else (" (ОТ)" if info["ot"]==1 else f" ({info['ot']} ОТ)")
-    a_win = A["score"] > B["score"]; b_win = B["score"] > A["score"]
-    head = (
-        f"{format_score_line(A['name'], A['abbr'], A['score'], a_win, records.get(A['abbr'],""), '')}\n"
-        f"{format_score_line(B['name'], B['abbr'], B['score'], b_win, records.get(B['abbr'],""), ot_str)}\n\n"
-    )
-    rowsA = info["players"].get(A["name"], []); rowsB = info["players"].get(B["name"], [])
+    A, B = info["teamA"], info["teamB"]
+    ot_str = "" if info["ot"] == 0 else (" (ОТ)" if info["ot"] == 1 else f" ({info['ot']} ОТ)")
+    a_win = A["score"] > B["score"]
+    b_win = B["score"] > A["score"]
+
+    rec_a = records.get(A["abbr"], "")
+    rec_b = records.get(B["abbr"], "")
+
+    line_a = format_score_line(A["name"], A["abbr"], A["score"], a_win, rec_a, "")
+    line_b = format_score_line(B["name"], B["abbr"], B["score"], b_win, rec_b, ot_str)
+    head = line_a + "\n" + line_b + "\n\n"
+
+    rowsA = info["players"].get(A["name"], [])
+    rowsB = info["players"].get(B["name"], [])
+
     al = [sp(format_player_special(p) if det else format_player_regular(p, bold))
-          for (p,bold,det) in pick_team_players(A["abbr"], rowsA)]
+          for (p, bold, det) in pick_team_players(A["abbr"], rowsA)]
     bl = [sp(format_player_special(p) if det else format_player_regular(p, bold))
-          for (p,bold,det) in pick_team_players(B["abbr"], rowsB)]
-    lines=[]
-    if al: lines.extend(al)
-    if al and bl: lines.append("")  # пустая строка между командами
-    if bl: lines.extend(bl)
+          for (p, bold, det) in pick_team_players(B["abbr"], rowsB)]
+
+    lines = []
+    if al:
+        lines.extend(al)
+    if al and bl:
+        lines.append("")  # пустая строка между командами
+    if bl:
+        lines.extend(bl)
+
     return head + ("\n".join(lines) if lines else "")
 
 def build_block_from_espn(e: dict) -> str:
     h, a = e["home"], e["away"]
-    name_h = ABBR_TO_RU.get(h["abbr"], h["abbr"]); name_a = ABBR_TO_RU.get(a["abbr"], a["abbr"])
-    ot_str = "" if e["ot"]==0 else (" (ОТ)" if e["ot"]==1 else f" ({e['ot']} ОТ)")
-    head = (
-        f"{format_score_line(name_h, h['abbr'], h['score'], h['winner'], h.get('record',''), '')}\n"
-        f"{format_score_line(name_a, a['abbr'], a['score'], a['winner'], a.get('record',''), ot_str)}\n\n"
-    )
+    name_h = ABBR_TO_RU.get(h["abbr"], h["abbr"])
+    name_a = ABBR_TO_RU.get(a["abbr"], a["abbr"])
+    ot_str = "" if e["ot"] == 0 else (" (ОТ)" if e["ot"] == 1 else f" ({e['ot']} ОТ)")
+
+    line_h = format_score_line(name_h, h["abbr"], h["score"], h.get("winner", False), h.get("record", ""), "")
+    line_a = format_score_line(name_a, a["abbr"], a["score"], a.get("winner", False), a.get("record", ""), ot_str)
+    head = line_h + "\n" + line_a + "\n\n"
+
     players_by_tid = fetch_espn_players(e["eventId"])
-    rowsH = players_by_tid.get(h["teamId"], []); rowsA = players_by_tid.get(a["teamId"], [])
+    rowsH = players_by_tid.get(h.get("teamId", ""), [])
+    rowsA = players_by_tid.get(a.get("teamId", ""), [])
+
     al = [sp(format_player_special(p) if det else format_player_regular(p, bold))
-          for (p,bold,det) in pick_team_players(h["abbr"], rowsH)]
+          for (p, bold, det) in pick_team_players(h["abbr"], rowsH)]
     bl = [sp(format_player_special(p) if det else format_player_regular(p, bold))
-          for (p,bold,det) in pick_team_players(a["abbr"], rowsA)]
-    lines=[]
-    if al: lines.extend(al)
-    if al and bl: lines.append("")
-    if bl: lines.extend(bl)
+          for (p, bold, det) in pick_team_players(a["abbr"], rowsA)]
+
+    lines = []
+    if al:
+        lines.extend(al)
+    if al and bl:
+        lines.append("")
+    if bl:
+        lines.extend(bl)
+
     return head + ("\n".join(lines) if lines else "")
 
 # -------- Сбор матчей дня --------
