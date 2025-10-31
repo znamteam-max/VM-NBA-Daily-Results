@@ -682,17 +682,28 @@ if __name__ == "__main__":
             msg = tg_send_menu_last3(opts)
             # Ждём нажатие (если задан интервал >0). Иначе — просто завершаемся после отправки меню.
             if INTERACTIVE_WAIT_SEC > 0:
-                options_set = {d.isoformat() for d,_ in opts}
+                options_set = {d.isoformat() for d, _ in opts}
                 wait_callback_and_post(msg, options_set)
             print("OK")
             sys.exit(0)
 
         if SEND_LAST3:
             base = et_today()
-            for delta in [0,1,2]:
+            for delta in [0, 1, 2]:
                 d = base - timedelta(days=delta)
                 post = build_post_for_et_day(d)
                 tg_send(post)
                 time.sleep(0.5)
             print("OK")
-            sys.exit(0
+            sys.exit(0)
+
+        # Обычный режим: один отчёт за выбранный ET-офсет (0..2)
+        base = et_today()
+        off = max(0, min(2, ET_DAY_OFFSET))
+        d = base - timedelta(days=off)
+        post = build_post_for_et_day(d)
+        tg_send(post)
+        print("OK")
+    except Exception as e:
+        print("ERROR:", repr(e), file=sys.stderr)
+        sys.exit(1)
