@@ -124,12 +124,16 @@ def collect_day_match_urls(d: date) -> list[str]:
     out, seen = [], set()
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if "/basketball/match/" not in href: continue
+        if "/basketball/match/" not in href:
+            continue
         u = _normalize_url(href)
-        if u in seen: continue
-        seen.add(u); out.append(u)
-    # только страницы матча со слагом (отсечём архив/инфо)
-    out = [u for u in out if re.search(r"/basketball/match/[^/]+/?$", u)]
+        if u in seen:
+            continue
+        # Берём ТОЛЬКО матчевые страницы формата team-vs-team, отсекаем архивы по датам и прочее
+        if not re.search(r"/basketball/match/[^/]+-vs-[^/]+/?$", u):
+            continue
+        seen.add(u)
+        out.append(u)
     log("[DBG] SPORTS LINKS", len(out))
     return out
 
@@ -141,6 +145,31 @@ def _canonical_ru_team(raw: str) -> str | None:
         if t.startswith(k) or k in t:
             return k
     return None
+
+def _is_players_table(table) -> bool:
+    """Ровно таблица 'Статистика игроков': в хедере должна быть колонка с 'Игрок'
+       и колонка очков (любой из: 'О', 'Очки', 'PTS', 'Оч')."""
+    if table is None:
+        return False
+    # найдём первую строку-хедер (часто это <thead><tr>, но бывает и просто первый <tr>)
+    hdr_tr = None
+    thead = table.find("thead")
+    if thead:
+        hdr_tr = thead.find("tr")
+    if not hdr_tr:
+        hdr_tr = table.find("tr")
+    if not hdr_tr:
+        return False
+
+    hdr_cells = [c.get_text(" ", strip=True) for c in hdr_tr.find_all(["th","td"])]
+    hl = [h.lower() for h in hdr_cells]
+
+    has_player_col = any("игрок" in h for h in hl)
+    has_points_col = any(
+        (h in {"о", "очки", "pts"}) or ("оч" in h) or ("pts" in h)
+        for h in hl
+    )
+    return bool(has_player_col and has_points_col)
 
 # ========= Parse a match page (players-table strict) =========
 def parse_match(url: str) -> dict | None:
