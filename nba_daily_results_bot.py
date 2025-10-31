@@ -49,7 +49,7 @@ def make_session():
     s.mount("https://", ad); s.mount("http://", ad)
     # ASCII-only UA, чтобы не было UnicodeEncodeError в некоторых окружениях
     s.headers.update({
-        "User-Agent": "NBA-DailyResultsBot/4.8 (sportsru-final-score-before-finished; espn-records; spoilers; custom-emoji)",
+        "User-Agent": "NBA-DailyResultsBot/4.8 (sportsru-final-score-before-finished; espn-records; spoilers; custom-emoji; abbr-normalization)",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
         "Connection": "close",
     })
@@ -99,6 +99,42 @@ TEAM_EMOJI_DEFAULT = {
     "TOR":"🦖","UTA":"🎷","WAS":"🧙",
 }
 
+# -------- ABBR NORMALIZATION / SYNONYMS --------
+# Приводим возможные альтернативные/укороченные коды ESPN к нашему канону
+ESPN_ABBR_FIXUPS = {
+    "GS":  "GSW",
+    "NY":  "NYK",
+    "SA":  "SAS",
+    "NO":  "NOP",
+    "NOR": "NOP",
+    "WSH": "WAS",
+    "PHO": "PHX",
+    "CHO": "CHA",
+    "BRK": "BKN",
+    "UTH": "UTA",   # на всякий
+}
+
+def canon_abbr(a: str) -> str:
+    a = (a or "").strip().upper()
+    return ESPN_ABBR_FIXUPS.get(a, a)
+
+# Синонимы для генерации всех возможных комбинаций ключей сопоставления
+TEAM_ABBR_SYNONYMS: dict[str, set[str]] = {abbr: {abbr} for abbr in TEAM_RU_TO_ABBR.values()}
+TEAM_ABBR_SYNONYMS["GSW"].update({"GS"})
+TEAM_ABBR_SYNONYMS["NYK"].update({"NY"})
+TEAM_ABBR_SYNONYMS["SAS"].update({"SA"})
+TEAM_ABBR_SYNONYMS["NOP"].update({"NO", "NOR"})
+TEAM_ABBR_SYNONYMS["PHX"].update({"PHO"})
+TEAM_ABBR_SYNONYMS["CHA"].update({"CHO"})
+TEAM_ABBR_SYNONYMS["BKN"].update({"BRK"})
+TEAM_ABBR_SYNONYMS["WAS"].update({"WSH"})
+
+def abbr_variants(a: str) -> set[str]:
+    """Все валидные варианты аббревиатуры для сопоставления пар."""
+    c = canon_abbr(a)
+    return set(TEAM_ABBR_SYNONYMS.get(c, {c}))
+
+
 def load_custom_emoji():
     if not TEAM_EMOJI_JSON: return {}
     try:
@@ -144,7 +180,7 @@ def collect_day_links(d: date) -> list[str]:
 
 def _canonical_ru_team(raw: str) -> str | None:
     if not raw: return None
-    t = raw.replace("«","").replace("»","").strip()
+    t = raw.replace("«",""").replace("»",""").strip()
     t = re.sub(r"\(.*?\)", "", t).strip()
     for k in TEAM_RU_TO_ABBR:
         if t.startswith(k) or k in t:
@@ -362,10 +398,8 @@ def fetch_espn_events_for_day(d: date) -> list[dict]:
             home = next(c for c in comps if c.get("homeAway")=="home")
             away = next(c for c in comps if c.get("homeAway")=="away")
             th = (home.get("team") or {}); ta = (away.get("team") or {})
-            abbr_h = (th.get("abbreviation") or "").upper()
-            abbr_a = (ta.get("abbreviation") or "").upper()
-            if abbr_h == "GS": abbr_h = "GSW"
-            if abbr_a == "GS": abbr_a = "GSW"
+            abbr_h = canon_abbr(th.get("abbreviation"))
+            abbr_a = canon_abbr(ta.get("abbreviation"))
 
             status = (ev.get("status") or {}).get("type") or {}
             if not bool(status.get("completed", False)):
@@ -394,12 +428,18 @@ def fetch_espn_events_multi(days: list[date]) -> dict[frozenset, dict]:
     seen={}
     for d in days:
         for e in fetch_espn_events_for_day(d):
-            key = frozenset([e["home"]["abbr"], e["away"]["abbr"]])
-            if key in seen: continue
-            seen[key] = e
+            # ключуем событие всеми комбинациями синонимов (дом/гость)
+            homes = abbr_variants(e["home"]["abbr"])
+            aways = abbr_variants(e["away"]["abbr"])
+            for h in homes:
+                for a in aways:
+                    key = frozenset([h, a])
+                    if key not in seen:
+                        seen[key] = e
     return seen
 
 # -------- Игроки/формат --------
+
 def initials_ru(full: str) -> str:
     parts = [p for p in re.split(r"\s+", (full or "").strip()) if p]
     if not parts: return full or ""
@@ -478,11 +518,11 @@ def format_player_special(p: dict) -> str:
     return f"{name}: " + ", ".join(ru_forms(k,v) for k,v in chosen) + hot_mark(p)
 
 # -------- Спойлер --------
-def sp(s: str) -> str: return f'<span class="tg-spoiler">{s}</span>'
+ndef sp(s: str) -> str: return f'<span class="tg-spoiler">{s}</span>'
 SEP = "–––––––––––––––––––––––"
 
 # -------- Блоки --------
-def format_score_line(name_ru: str, abbr: str, score: int, winner: bool, record: str) -> str:
+ndef format_score_line(name_ru: str, abbr: str, score: int, winner: bool, record: str) -> str:
     score_txt = f"<b>{score}</b>" if winner else f"{score}"
     if record:
         score_txt += f" ({record})"
@@ -510,7 +550,7 @@ def build_block(info: dict) -> str:
     return head + ("\n".join(lines) if lines else "")
 
 # -------- Сбор матчей дня --------
-def fetch_sports_games_for_day(d: date) -> list[dict]:
+ndef fetch_sports_games_for_day(d: date) -> list[dict]:
     out=[]
     for url in collect_day_links(d):
         info = parse_sports_match(url)
@@ -519,7 +559,7 @@ def fetch_sports_games_for_day(d: date) -> list[dict]:
     return out
 
 # -------- ESPN: добавим рекорды и (если надо) счёт --------
-def enrich_scores_and_records_from_espn(games: list[dict]):
+ndef enrich_scores_and_records_from_espn(games: list[dict]):
     if not games: return
     espn_by_pair = fetch_espn_events_multi(candidate_days_for_espn())
     for info in games:
@@ -541,7 +581,8 @@ def enrich_scores_and_records_from_espn(games: list[dict]):
             else:
                 A["score"] = ev["away"]["score"]; B["score"] = ev["home"]["score"]
 
-def build_post() -> str:
+# -------- Пост --------
+ndef build_post() -> str:
     d_title = pick_report_date_london()
     games = fetch_sports_games_for_day(d_title)
     enrich_scores_and_records_from_espn(games)
@@ -563,7 +604,7 @@ def build_post() -> str:
     return (title + "".join(blocks)).strip()
 
 # -------- Telegram (custom emoji entities) --------
-def tg_send(text: str):
+ndef tg_send(text: str):
     if not (BOT_TOKEN and CHAT_ID):
         raise RuntimeError("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы")
 
