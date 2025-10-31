@@ -518,11 +518,11 @@ def format_player_special(p: dict) -> str:
     return f"{name}: " + ", ".join(ru_forms(k,v) for k,v in chosen) + hot_mark(p)
 
 # -------- Спойлер --------
-ndef sp(s: str) -> str: return f'<span class="tg-spoiler">{s}</span>'
+def sp(s: str) -> str: return f'<span class="tg-spoiler">{s}</span>'
 SEP = "–––––––––––––––––––––––"
 
 # -------- Блоки --------
-ndef format_score_line(name_ru: str, abbr: str, score: int, winner: bool, record: str) -> str:
+def format_score_line(name_ru: str, abbr: str, score: int, winner: bool, record: str) -> str:
     score_txt = f"<b>{score}</b>" if winner else f"{score}"
     if record:
         score_txt += f" ({record})"
@@ -550,7 +550,7 @@ def build_block(info: dict) -> str:
     return head + ("\n".join(lines) if lines else "")
 
 # -------- Сбор матчей дня --------
-ndef fetch_sports_games_for_day(d: date) -> list[dict]:
+def fetch_sports_games_for_day(d: date) -> list[dict]:
     out=[]
     for url in collect_day_links(d):
         info = parse_sports_match(url)
@@ -559,7 +559,7 @@ ndef fetch_sports_games_for_day(d: date) -> list[dict]:
     return out
 
 # -------- ESPN: добавим рекорды и (если надо) счёт --------
-ndef enrich_scores_and_records_from_espn(games: list[dict]):
+def enrich_scores_and_records_from_espn(games: list[dict]):
     if not games: return
     espn_by_pair = fetch_espn_events_multi(candidate_days_for_espn())
     for info in games:
@@ -582,7 +582,7 @@ ndef enrich_scores_and_records_from_espn(games: list[dict]):
                 A["score"] = ev["away"]["score"]; B["score"] = ev["home"]["score"]
 
 # -------- Пост --------
-ndef build_post() -> str:
+def build_post() -> str:
     d_title = pick_report_date_london()
     games = fetch_sports_games_for_day(d_title)
     enrich_scores_and_records_from_espn(games)
@@ -604,7 +604,7 @@ ndef build_post() -> str:
     return (title + "".join(blocks)).strip()
 
 # -------- Telegram (custom emoji entities) --------
-ndef tg_send(text: str):
+def tg_send(text: str):
     if not (BOT_TOKEN and CHAT_ID):
         raise RuntimeError("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы")
 
