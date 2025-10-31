@@ -4,21 +4,22 @@
 """
 NBA Daily Results → Telegram (RU) — Sports.ru only
 
-Что делает:
-• Находит матчи дня на https://www.sports.ru/stat/basketball/center/end/YYYY/MM/DD.html
-• Оставляет только НБА (оба участника slugs мапятся в аббревиатуры НБА).
-• В каждой игре парсит <h3> «… статистика игроков» и ближайшую таблицу: игроков + «Итого».
-• Собирает единый пост с кастомными правилами отбора игроков и спойлерами.
+• Матчи и игроки берутся со страницы дня:
+  https://www.sports.ru/stat/basketball/center/end/YYYY/MM/DD.html
+• Фильтруем только НБА (по слагам команд).
+• Внутри матча парсим таблицы «статистика игроков» (устойчиво к <th>/<td> и разным заголовкам).
+• Пост: один месседж, счёт и строки игроков спрятаны в спойлеры; победитель — жирным.
+• Дёмин (BKN) и Голдин (MIA) включаются обязательно, для них показываем 3 крупнейших ненулевых показателя.
 
-Логи (DEBUG_NBA=1) показывают:
-• сколько ссылок на матчи найдено;
-• по каждому матчу: названия, счёт, и количество считанных игроков у обеих команд.
+Переменные окружения:
+  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID — обязательны.
+  TEAM_EMOJI_JSON — JSON-словарь { "LAL": "🟡", "BOS": "☘️", ... } из вашего пака.
+  DEBUG_NBA=1 — подробные логи.
+  NBA_DATE_MODE=today|best  — today = всегда «сегодня по ET» (по умолчанию), best = «где больше игр».
 
-Дёмин (BKN) и Голдин (MIA) включаются обязательно (если играли) и выводятся с 3 самыми
-крупными ненулевыми показателями.
 """
 
-import os, sys, re
+import os, sys, re, json
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 from urllib.parse import urljoin
@@ -32,6 +33,7 @@ from bs4 import BeautifulSoup
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 DEBUG     = os.getenv("DEBUG_NBA", "").strip() not in {"", "0", "false", "False"}
+DATE_MODE = ( os.getenv("NBA_DATE_MODE", "today").strip().lower() or "today" )  # "today" | "best"
 
 def logdbg(*a):
     if DEBUG:
@@ -41,11 +43,9 @@ def logdbg(*a):
 def et_today() -> date:
     return datetime.now(ZoneInfo("America/New_York")).date()
 
-def ru_date(d: date) -> str:
-    RU_MONTHS = {1:"января",2:"февраля",3:"марта",4:"апреля",5:"мая",6:"июня",
-                 7:"июля",8:"августа",9:"сентября",10:"октября",11:"ноября",12:"декабря"}
-    return f"{d.day} {RU_MONTHS[d.month]}"
-
+RU_MONTHS = {1:"января",2:"февраля",3:"марта",4:"апреля",5:"мая",6:"июня",
+             7:"июля",8:"августа",9:"сентября",10:"октября",11:"ноября",12:"декабря"}
+def ru_date(d: date) -> str: return f"{d.day} {RU_MONTHS[d.month]}"
 def ru_plural(n: int, forms: tuple[str,str,str]) -> str:
     n = abs(int(n)) % 100; n1 = n % 10
     if 11 <= n <= 19: return forms[2]
@@ -53,30 +53,15 @@ def ru_plural(n: int, forms: tuple[str,str,str]) -> str:
     if n1 == 1:      return forms[0]
     return forms[2]
 
-def count_games_for_day(d: date) -> int:
-    cnt = 0
-    for u in fetch_day_links(d):
-        a = abbr_from_url(u, 0); b = abbr_from_url(u, 1)
-        if a and b and a in TEAM_RU and b in TEAM_RU:
-            cnt += 1
-    return cnt
-
-def pick_best_report_date() -> date:
-    d_today = et_today()
-    d_yest  = d_today - timedelta(days=1)
-    n_today = count_games_for_day(d_today)
-    n_yest  = count_games_for_day(d_yest)
-    logdbg(f"DAY CANDIDATES ET today={d_today}({n_today}) / yest={d_yest}({n_yest})")
-    return d_today if n_today >= n_yest else d_yest
-
 # ========= HTTP =========
 def make_session():
     s = requests.Session()
     r = Retry(total=6, connect=6, read=6, backoff_factor=0.7,
               status_forcelist=[429,500,502,503,504], allowed_methods=["GET"])
     s.mount("https://", HTTPAdapter(max_retries=r))
+    # без юникода в UA, чтобы не поймать UnicodeEncodeError на некоторых раннерах
     s.headers.update({
-        "User-Agent": "NBA-DailyResultsBot/5.1 (sports.ru)",
+        "User-Agent": "NBA-ResultsBot/5.2 (sportsru-only)",
         "Accept-Language": "ru,en;q=0.7",
     })
     return s
@@ -104,17 +89,26 @@ TEAM_RU = {
     "PHX":"Финикс","POR":"Портленд","SAC":"Сакраменто","SAS":"Сан-Антонио","TOR":"Торонто","UTA":"Юта","WAS":"Вашингтон",
 }
 
-def team_emoji(_abbr: str) -> str:
-    # Плейсхолдер. (Кастом-эмодзи можно подставлять через entities в другой версии.)
-    return "🏀"
+# кастом-эмодзи из вашего пака
+def load_team_emojis() -> dict[str, str]:
+    raw = os.getenv("TEAM_EMOJI_JSON", "").strip()
+    if not raw:
+        return {}
+    try:
+        mp = json.loads(raw)
+        if isinstance(mp, dict):
+            # убедимся, что все значения — строки-эмодзи
+            return {k.upper(): (str(v) or "🏀") for k, v in mp.items()}
+    except Exception:
+        return {}
+    return {}
 
-def abbr_from_url(url: str, side: int) -> str | None:
-    m = re.search(r"/basketball/match/([a-z0-9\-]+)-vs-([a-z0-9\-]+)/", url)
-    if not m: return None
-    slug = m.group(1 + side)
-    return SLUG2ABBR.get(slug)
+TEAM_EMOJI = load_team_emojis()
 
-# ========= DAY LINKS =========
+def team_emoji(abbr: str) -> str:
+    return TEAM_EMOJI.get(abbr.upper(), "🏀")
+
+# ========= LINKS FOR DAY =========
 def fetch_day_links(d: date) -> list[str]:
     url = DAY_URL_TMPL.format(y=d.year, m=d.month, d=d.day)
     r = S.get(url, timeout=25)
@@ -135,6 +129,11 @@ def fetch_day_links(d: date) -> list[str]:
             continue
         if not full.endswith("/"):
             full += "/"
+        # проверим, что обе команды — НБА
+        a_abbr = abbr_from_url(full, 0)
+        b_abbr = abbr_from_url(full, 1)
+        if not (a_abbr and b_abbr and a_abbr in TEAM_RU and b_abbr in TEAM_RU):
+            continue
         links.append(full)
     # dedup
     out, seen = [], set()
@@ -144,59 +143,85 @@ def fetch_day_links(d: date) -> list[str]:
     logdbg("SPORTS LINKS", len(out))
     return out
 
-# ========= TABLE PARSER =========
-def norm_col(text: str) -> str:
-    t = re.sub(r"\s+", "", (text or "").lower())
-    t = t.replace("очки", "оч").replace("передачи", "перед").replace("подборы", "подбор")
-    t = t.replace("перехваты", "перех").replace("блок-шоты", "блокшоты").replace("блокшот", "блокшоты")
-    return t
+def count_games_for_day(d: date) -> int:
+    return len(fetch_day_links(d))
 
-def col_metric(t: str) -> str | None:
-    if t in {"оч","очки","pts"}: return "pts"
-    if t in {"подбор","подб","reb"}: return "reb"
-    if t in {"перед","передачи","ast","пас"}: return "ast"
-    if t in {"перех","stl"}: return "stl"
-    if t in {"блокшоты","blk","бш","блок"}: return "blk"
-    return None
+# ========= UTILS =========
+def abbr_from_url(url: str, side: int) -> str | None:
+    m = re.search(r"/basketball/match/([a-z0-9\-]+)-vs-([a-z0-9\-]+)/", url)
+    if not m: return None
+    slug = m.group(1 + side)
+    return SLUG2ABBR.get(slug)
 
 def _int_first(text: str) -> int:
     m = re.search(r"-?\d+", text or "")
     return int(m.group(0)) if m else 0
 
-def parse_stats_table(h3) -> tuple[list[dict], int]:
-    """Из <h3> «… статистика игроков» → ближайшая <table>; возвращает (players, team_total_pts)."""
-    tbl = h3.find_next("table")
-    if not tbl:
-        return [], 0
+def norm_col(text: str) -> str:
+    t = re.sub(r"\s+", "", (text or "").lower())
+    t = (t.replace("очки", "оч").replace("очков", "оч")
+            .replace("передачи", "перед").replace("перед", "аст")
+            .replace("подборы", "подбор").replace("перехваты","перех")
+            .replace("блок-шоты","блокшоты").replace("блокшот","блокшоты"))
+    # часто встречаются чистые англ. аббревиатуры
+    return t
 
-    # Заголовок (thead или первая строка с буквами)
-    header_cells = None
+def col_metric(t: str) -> str | None:
+    if t in {"оч","pts"}: return "pts"
+    if t in {"подбор","reb"}: return "reb"
+    if t in {"аст","ast","пас"}: return "ast"
+    if t in {"перех","stl"}: return "stl"
+    if t in {"блокшоты","blk","бш","блок"}: return "blk"
+    return None
+
+# ========= TABLE PARSER =========
+def header_to_index(tbl) -> dict[str,int]:
+    # 1) thead → последняя строка
     thead = tbl.find("thead")
     if thead:
         rows = thead.find_all("tr")
         if rows:
-            header_cells = [c.get_text(" ", strip=True) for c in rows[-1].find_all(["th","td"])]
-    if not header_cells:
-        for tr in tbl.find_all("tr"):
-            cells = tr.find_all(["th","td"])
-            if not cells: 
-                continue
-            if any(re.search(r"[A-Za-zА-Яа-я]", c.get_text()) for c in cells):
-                header_cells = [c.get_text(" ", strip=True) for c in cells]
-                break
-    if not header_cells:
+            cells = rows[-1].find_all(["th","td"])
+            headers = [c.get_text(" ", strip=True) for c in cells]
+            idx_map = {}
+            for i, h in enumerate(headers):
+                m = col_metric(norm_col(h))
+                if m and m not in idx_map:
+                    idx_map[m] = i
+            if idx_map:
+                logdbg("HEAD (thead):", headers, "→", idx_map)
+                return idx_map
+    # 2) перебирать первые 3 строки tbody и искать «похожую на header»
+    tbody = tbl.find("tbody") or tbl
+    for tr in tbody.find_all("tr")[:3]:
+        cells = tr.find_all(["th","td"])
+        headers = [c.get_text(" ", strip=True) for c in cells]
+        ok_letters = sum(1 for x in headers if re.search(r"[A-Za-zА-Яа-я]", x))
+        ok_digits  = sum(1 for x in headers if re.search(r"\d", x))
+        if ok_letters >= 4 and ok_digits <= 1:  # шапка обычно буквенная
+            idx_map = {}
+            for i, h in enumerate(headers):
+                m = col_metric(norm_col(h))
+                if m and m not in idx_map:
+                    idx_map[m] = i
+            if idx_map:
+                logdbg("HEAD (tbody):", headers, "→", idx_map)
+                return idx_map
+    logdbg("HEAD not found")
+    return {}
+
+def parse_stats_table_near(h3) -> tuple[list[dict], int]:
+    """Из <h3> …статистика игроков → ближайшая <table>; возвращает (players, team_total_pts)."""
+    tbl = h3.find_next("table")
+    if not tbl:
         return [], 0
 
-    idx_map = {}
-    for idx, htxt in enumerate(header_cells):
-        m = col_metric(norm_col(htxt))
-        if m and m not in idx_map:
-            idx_map[m] = idx
+    idx_map = header_to_index(tbl)
+    tbody = tbl.find("tbody") or tbl
 
     players = []
     team_pts = 0
 
-    tbody = tbl.find("tbody") or tbl
     for tr in tbody.find_all("tr"):
         cells = tr.find_all(["th","td"])
         if not cells:
@@ -205,7 +230,7 @@ def parse_stats_table(h3) -> tuple[list[dict], int]:
         name_cell = cells[0]
         first_text = name_cell.get_text(" ", strip=True)
 
-        # Итого / Всего — команда
+        # «Итого» / «Всего»
         if re.search(r"^(итого|всего)\s*$", first_text, flags=re.IGNORECASE):
             if "pts" in idx_map and idx_map["pts"] < len(cells):
                 team_pts = _int_first(cells[idx_map["pts"]].get_text(" ", strip=True))
@@ -236,28 +261,24 @@ def parse_stats_table(h3) -> tuple[list[dict], int]:
     return players, team_pts
 
 def detect_ot(soup: BeautifulSoup) -> bool:
-    # По таблице «по периодам»
     for h3 in soup.find_all("h3"):
         txt = (h3.get_text(" ", strip=True) or "").lower()
         if "период" in txt:
             tbl = h3.find_next("table")
-            if not tbl: 
-                continue
+            if not tbl: continue
             row = tbl.find("tr")
-            if not row: 
-                continue
+            if not row: continue
             s = row.get_text(" ", strip=True)
             pairs = re.findall(r"\b\d{1,2}\s*:\s*\d{1,2}\b", s)
             if len(pairs) > 4:
                 return True
-    # fallback — текст
     txt = soup.get_text(" ", strip=True)
     return bool(re.search(r"\bОТ\b|Овертайм", txt, flags=re.IGNORECASE))
 
 def parse_sports_match(url: str) -> dict | None:
     a_abbr = abbr_from_url(url, 0); b_abbr = abbr_from_url(url, 1)
     if not (a_abbr and b_abbr and a_abbr in TEAM_RU and b_abbr in TEAM_RU):
-        return None  # не НБА
+        return None
 
     r = S.get(url, timeout=25)
     if r.status_code != 200:
@@ -265,7 +286,7 @@ def parse_sports_match(url: str) -> dict | None:
         return None
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # все h3 с фразой «статистика игроков»
+    # H3 блоки «статистика игроков»
     h3s = [h for h in soup.find_all("h3") if re.search(r"статистика игроков", h.get_text(" ", strip=True), re.I)]
     if len(h3s) < 2:
         logdbg("PARSE START", url, "NO H3 STATS")
@@ -281,10 +302,10 @@ def parse_sports_match(url: str) -> dict | None:
     teamA_name = team_from_h3(h3s[0]) or TEAM_RU.get(a_abbr, a_abbr)
     teamB_name = team_from_h3(h3s[1]) or TEAM_RU.get(b_abbr, b_abbr)
 
-    playersA, scoreA = parse_stats_table(h3s[0])
-    playersB, scoreB = parse_stats_table(h3s[1])
+    playersA, scoreA = parse_stats_table_near(h3s[0])
+    playersB, scoreB = parse_stats_table_near(h3s[1])
 
-    # Если «Итого» не нашли, попробуем общий «XX:YY»
+    # если «Итого» не поймали, выдернем общий «XX:YY»
     if not (scoreA and scoreB):
         txt = soup.get_text(" ", strip=True)
         m = re.search(r"\b(\d{1,3})\s*:\s*(\d{1,3})\b", txt)
@@ -317,7 +338,6 @@ def pick_players_for_team(team_abbr: str, plist: list[dict]) -> list[dict]:
     plist_sorted = sorted(plist, key=lambda x: (x["pts"], x["reb"], x["ast"]), reverse=True)
     picked = []
 
-    # спец-игроки
     want_last = "Дёмин" if team_abbr == "BKN" else ("Голдин" if team_abbr == "MIA" else None)
     special = None
     if want_last:
@@ -446,10 +466,23 @@ def tg_send(text: str):
         raise RuntimeError(f"Telegram error {r.status_code}: {r.text}")
 
 # ========= MAIN =========
+def pick_report_day() -> date:
+    if DATE_MODE == "best":
+        d_today = et_today()
+        d_yest  = d_today - timedelta(days=1)
+        n_today = count_games_for_day(d_today)
+        n_yest  = count_games_for_day(d_yest)
+        logdbg(f"DAY CANDIDATES ET today={d_today}({n_today}) / yest={d_yest}({n_yest})")
+        return d_today if n_today >= n_yest else d_yest
+    else:
+        # всегда сегодня по ET
+        d = et_today()
+        logdbg("DAY PICKED (today)", d)
+        return d
+
 if __name__ == "__main__":
     try:
-        day = pick_best_report_date()
-        logdbg("DAY PICKED", day.isoformat())
+        day = pick_report_day()
         post = build_post(day)
         tg_send(post)
         print("OK")
