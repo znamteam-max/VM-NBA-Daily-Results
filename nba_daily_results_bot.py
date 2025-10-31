@@ -4,12 +4,12 @@
 """
 NBA Daily Results → Telegram (RU)
 
-• Контент: players/русские фамилии — sports.ru (match pages).
-• Счёт и W-L (рекорды) — ESPN (site.api) по нескольким соседним датам (ET±1 и London).
+• Источник игроков/русских фамилий/локального счёта: sports.ru (страницы матча).
+• Источник финального счёта (фоллбек) и рекордов W-L: ESPN site.api (несколько соседних дат).
 • Формат: названия команд видны, счёт и игроки — в спойлерах. У победителя счёт жирным.
 • Игроки:
-  – 1–2 на команду; второй — если ≥20 очков ИЛИ дабл-дабл ИЛИ ≥6 STL/BLK.
-  – Спец: Дёмин (BKN) и Голдин (MIA) — всегда включаем, показываем 3 максимальные метрики >0 (жирным).
+  – 1–2 на команду; второй — если ≥20 очков ИЛИ дабл-дабл ИЛИ ≥6 STL/BLK;
+  – спец: Дёмин (BKN) и Голдин (MIA) — всегда включаем, 3 максимальные метрики >0, имя жирным.
 • Лого: кастом-эмодзи через TEAM_EMOJI_JSON (abbr->custom_emoji_id). Иначе — дефолтные юникод-эмодзи.
 """
 
@@ -48,7 +48,7 @@ def make_session():
     ad = _mk_adapter()
     s.mount("https://", ad); s.mount("http://", ad)
     s.headers.update({
-        "User-Agent": "NBA-DailyResultsBot/4.3 (sports.ru + espn scores/records, spoilers, custom_emoji)",
+        "User-Agent": "NBA-DailyResultsBot/4.4 (sports.ru score=maxpair, espn records, spoilers, custom_emoji)",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
         "Connection": "close",
     })
@@ -236,6 +236,20 @@ def _parse_players_table(node) -> list[dict]:
 
     return rows_out
 
+def _extract_total_score_from_page(soup: BeautifulSoup) -> tuple[int,int]:
+    """Берём максимальную по сумме пару X:Y (обычно это 107:123), игнорируя мелкие пары."""
+    txt = soup.get_text(" ", strip=True)
+    pairs=[]
+    for m in re.finditer(r"\b(\d{2,3})\s*:\s*(\d{2,3})\b", txt):
+        a = int(m.group(1)); b = int(m.group(2))
+        pairs.append((a,b))
+    if not pairs: return (0,0)
+    # сначала отбрасываем пары с суммой < 120 (четверти/статы), если останутся — возьмём максимум
+    big = [p for p in pairs if (p[0]+p[1]) >= 120]
+    target = max(big or pairs, key=lambda p: p[0]+p[1])
+    log(f"[DBG] SCORE CAND {pairs[:8]} -> {target}")
+    return target
+
 def parse_sports_match(url: str) -> dict | None:
     soup = _soup(url)
     if not soup: return None
@@ -269,17 +283,7 @@ def parse_sports_match(url: str) -> dict | None:
     if not (rowsA or rowsB):
         return None
 
-    # Счёт попытаемся достать локально (может не найтись) — потом дополним ESPN
-    scoreA = scoreB = 0
-    rx = re.compile(r"\b(\d{2,3})\s*:\s*(\d{2,3})\b")
-    near = ancB.find_next(string=True)
-    tries = 0
-    while near and tries < 40 and (scoreA == 0 and scoreB == 0):
-        m = rx.search(str(near))
-        if m:
-            scoreA, scoreB = int(m.group(1)), int(m.group(2)); break
-        near = near.next_element
-        tries += 1
+    scoreA, scoreB = _extract_total_score_from_page(soup)
 
     log(f"[DBG] OK {teamA}-{teamB} SCORE {scoreA}:{scoreB} A_rows {len(rowsA)} B_rows {len(rowsB)}")
     return {
@@ -484,7 +488,6 @@ def enrich_scores_and_records_from_espn(games: list[dict]):
         ev = espn_by_pair.get(key)
         if not ev:
             continue
-        # записи
         rec_map = {
             ev["home"]["abbr"]: ev["home"].get("record",""),
             ev["away"]["abbr"]: ev["away"].get("record",""),
@@ -500,7 +503,6 @@ def enrich_scores_and_records_from_espn(games: list[dict]):
 def build_post() -> str:
     d_title = pick_report_date_london()
     games = fetch_sports_games_for_day(d_title)
-    # дополним счёт/рекорды из ESPN
     enrich_scores_and_records_from_espn(games)
 
     title_count = len(games)
@@ -524,6 +526,7 @@ def tg_send(text: str):
     if not (BOT_TOKEN and CHAT_ID):
         raise RuntimeError("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы")
 
+    # Превращаем {EMO:ABBR} в кастом-эмодзи (или дефолт)
     entities=[]
     out_parts=[]
     last=0
