@@ -10,7 +10,7 @@ NBA Daily Results → Telegram (RU)
 • Игроки:
   – 1–2 на команду; второй — если ≥20 очков ИЛИ дабл-дабл ИЛИ ≥6 STL/BLK;
   – спец: Дёмин (BKN) и Голдин (MIA) — всегда включаем, 3 максимальные метрики >0, имя жирным.
-• Лого: кастом-эмодзи через TEAM_EMOJI_JSON (abbr->custom_emoji_id). Иначе — дефолтные юникод-эмодзи.
+• Лого: кастом-эмодзи через TEAM_EMOJI_JSON (abbr->custom_emoji_id). Иначе — дефолтные юникод-эмоджи.
 """
 
 import os, sys, re, json
@@ -47,8 +47,9 @@ def make_session():
     s = requests.Session()
     ad = _mk_adapter()
     s.mount("https://", ad); s.mount("http://", ad)
+    # ВАЖНО: User-Agent только ASCII, иначе urllib3 пытается latin-1 и падает
     s.headers.update({
-        "User-Agent": "NBA-DailyResultsBot/4.5 (sports.ru near-«завершен», espn records, spoilers, custom_emoji)",
+        "User-Agent": "NBA-DailyResultsBot/4.6 (sportsru-near-zavershen; espn-records; spoilers; custom-emoji)",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
         "Connection": "close",
     })
@@ -236,24 +237,21 @@ def _parse_players_table(node) -> list[dict]:
 
     return rows_out
 
-# --- НОВОЕ: извлечение итогового счёта рядом с «завершен/завершён» или по сумме четвертей ---
+# --- итоговый счёт рядом с «завершен/завершён» или по сумме четвертей ---
 def _extract_total_score_from_page(soup: BeautifulSoup) -> tuple[int,int]:
     txt = soup.get_text("\n", strip=True)
     low = txt.lower().replace("ё", "е")
 
-    # 1) окно перед «завершен/завершена/завершено/завершена игра»
-    m_end = re.search(r"заверш[её]н|\bзавершена|\bзавершено", low)
+    m_end = re.search(r"завершен|завершен[ао]|завершена|завершено", low)
     if m_end:
         start = max(0, m_end.start() - 300)
         window = txt[start:m_end.start()]
         pairs = re.findall(r"(\d{1,3})\s*[:]\s*(\d{1,3})", window)
         if pairs:
-            a, b = map(int, pairs[-1])  # ближайшая перед «заверш…»
+            a, b = map(int, pairs[-1])
             log(f"[DBG] SCORE NEAR-END -> {a}:{b}")
             return (a, b)
 
-    # 2) «итоговый» + затем 4–7 пар четвертей/ОВ; сверяем суммы
-    #    Собираем пары вместе с индексами, чтобы проверять последовательности
     pairs_pos = [(m.start(), m.end(), int(m.group(1)), int(m.group(2)))
                  for m in re.finditer(r"(\d{1,3})\s*[:]\s*(\d{1,3})", txt)]
     n = len(pairs_pos)
@@ -267,7 +265,6 @@ def _extract_total_score_from_page(soup: BeautifulSoup) -> tuple[int,int]:
                 log(f"[DBG] SCORE BY-SUM k={k} -> {A}:{B}")
                 return (A, B)
 
-    # 3) фоллбек — пара с максимальной суммой, но с порогом >= 120
     all_pairs = [(int(a),int(b)) for (a,b) in re.findall(r"(\d{1,3})\s*[:]\s*(\d{1,3})", txt)]
     if all_pairs:
         big = [p for p in all_pairs if (p[0]+p[1]) >= 120]
