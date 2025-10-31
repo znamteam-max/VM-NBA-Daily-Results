@@ -174,90 +174,131 @@ def _is_players_table(table) -> bool:
 # ========= Parse a match page (players-table strict) =========
 def parse_match(url: str) -> dict | None:
     soup = _soup(url)
-    if not soup: return None
+    if not soup:
+        return None
 
-    # найдём заголовки «<Команда>. Статистика игроков»
-    # и убедимся, что следующая таблица действительно имеет колонку «Игрок»
-    blocks = []
-    for h in soup.find_all(["h2","h3","h4"]):
-        txt = h.get_text(" ", strip=True)
-        if "статистика игроков" not in txt.lower():
-            continue
-        team_left = txt.split(".", 1)[0].strip()
-        team_ru = _canonical_ru_team(team_left)
-        if not team_ru:
-            continue
-        table = h.find_next("table")
-        if not table:
-            continue
-        # проверим, что первая строка-хедер содержит «Игрок»
-        hdr_tr = table.find("tr")
-        if not hdr_tr:
-            continue
-        hdr_cells = [c.get_text(" ", strip=True) for c in hdr_tr.find_all(["th","td"])]
-        if not any("игрок" == hc.lower() for hc in hdr_cells):
-            # это не таблица игроков (например, командная статистика) — пропускаем
-            continue
-        blocks.append((team_ru, table))
+    # Попробуем вытащить пары команд из og:title (например: "Шарлотт — Орландо")
+    teamA_from_title = teamB_from_title = None
+    meta = soup.find("meta", attrs={"property":"og:title"})
+    title = meta.get("content") if meta and meta.get("content") else (soup.title.string if soup.title else "")
+    if title and "—" in title:
+        left, right = [x.strip() for x in title.split("—", 1)]
+        teamA_from_title = _canonical_ru_team(left)
+        teamB_from_title = _canonical_ru_team(right)
 
-    if len(blocks) < 2:
+    # Соберём все таблицы, которые выглядят как "Статистика игроков"
+    tables = [t for t in soup.find_all("table") if _is_players_table(t)]
+    if len(tables) < 2:
         log("[DBG] PLAYERS-TABLES < 2, skip", url)
         return None
 
-    # извлечём игроков и очки команды по названию столбцов
+    # Для каждой таблицы попробуем найти ближайший предыдущий заголовок (h2/h3/h4) с названием команды
+    def nearest_team_for_table(table) -> str | None:
+        h = table.find_previous(["h2","h3","h4"])
+        steps = 0
+        while h and steps < 6:  # далеко не уходим
+            txt = h.get_text(" ", strip=True)
+            cand = _canonical_ru_team(txt.split(".")[0])
+            if cand:
+                return cand
+            h = h.find_previous(["h2","h3","h4"])
+            steps += 1
+        return None
+
+    tables_with_teams = []
+    for t in tables:
+        team_guess = nearest_team_for_table(t)
+        tables_with_teams.append((team_guess, t))
+
+    # Если у таблиц не нашлись явные команды — подстрахуемся og:title
+    # Возьмём первые две таблицы и соотнесём их по порядку с og:title
+    if not any(x[0] for x in tables_with_teams) and (teamA_from_title and teamB_from_title):
+        tA, tB = tables[:2]
+        tables_with_teams = [(teamA_from_title, tA), (teamB_from_title, tB)]
+
+    # Теперь должны иметь минимум две таблицы с разными командами
+    pairs = []
+    seen_teams = set()
+    for guess, t in tables_with_teams:
+        if not guess:
+            continue
+        if guess in seen_teams:
+            continue
+        pairs.append((guess, t))
+        seen_teams.add(guess)
+        if len(pairs) == 2:
+            break
+
+    # Если всё ещё нет двух разных команд — попробуем забрать по порядку и подставить из og:title
+    if len(pairs) < 2 and (teamA_from_title and teamB_from_title):
+        need = 2 - len(pairs)
+        for t in tables:
+            if all(t is not p[1] for p in pairs):
+                pairs.append((None, t))
+                if len(pairs) == 2:
+                    break
+        # заполним названия
+        names_fill = [teamA_from_title, teamB_from_title]
+        for i in range(len(pairs)):
+            if pairs[i][0] is None:
+                pairs[i] = (names_fill[i], pairs[i][1])
+
+    if len(pairs) < 2:
+        log("[DBG] STILL <2 teams for", url)
+        return None
+
+    # Парсим таблицу игроков по заголовкам колонок
     def to_int(x: str) -> int:
         s = (x or "").strip()
-        if s in {"—","-",""}: return 0
+        if s in {"—","-",""}:
+            return 0
         m = re.match(r"^-?\d+", s)
         return int(m.group(0)) if m else 0
 
-    def parse_table(table) -> tuple[list[dict], int]:
-        # построим карту колонок по заголовкам
-        header = None
-        for tr in table.find_all("tr"):
-            cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th","td"])]
-            if not cells: 
-                continue
-            if any("игрок" == c.lower() for c in cells):
-                header = cells
-                break
-        if not header:
-            return [], 0
+    def parse_players_and_pts(table) -> tuple[list[dict], int]:
+        # найдём хедер
+        thead = table.find("thead")
+        hdr_tr = thead.find("tr") if thead else table.find("tr")
+        hdr_cells = [c.get_text(" ", strip=True) for c in hdr_tr.find_all(["th","td"])]
+        hl = [h.lower() for h in hdr_cells]
 
-        # индексы нужных колонок
+        # индексы
         name_idx = None
         pts_idx = reb_idx = ast_idx = stl_idx = blk_idx = None
-
-        for i, h in enumerate(header):
-            hl = h.lower()
-            if hl == "игрок": name_idx = i
-            if hl in {"о","очки","pts"}: pts_idx = i
-            if hl in {"пб","подборы","reb"}: reb_idx = i
-            if hl in {"ап","передачи","ast"}: ast_idx = i
-            if hl in {"пх","перехваты","stl"}: stl_idx = i
-            if hl in {"бш","блок-шоты","blk","блокшоты"}: blk_idx = i
+        for i, h in enumerate(hl):
+            if "игрок" in h: name_idx = i
+            if (h in {"о","очки","pts"}) or ("оч" in h) or ("pts" in h): pts_idx = i
+            if (h in {"пб","подборы","reb"}) or ("подбор" in h) or ("reb" in h): reb_idx = i
+            if (h in {"ап","передачи","ast"}) or ("передач" in h) or ("ast" in h): ast_idx = i
+            if (h in {"пх","перехваты","stl"}) or ("перехват" in h) or ("stl" in h): stl_idx = i
+            if (h in {"бш","блок-шоты","blk","блокшоты"}) or ("блок" in h) or ("blk" in h): blk_idx = i
 
         if name_idx is None or pts_idx is None:
-            # без имени/очков это не то
             return [], 0
 
         players = []
         team_pts = None
+        # все строки после хедера
+        rows = []
+        if thead:
+            tbody = table.find("tbody")
+            if tbody:
+                rows = tbody.find_all("tr")
+        if not rows:
+            rows = table.find_all("tr")[1:]
 
-        rows = table.find_all("tr")[1:]  # после хедера
         for tr in rows:
             cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td","th"])]
-            if not cells: 
+            if not cells:
                 continue
-
-            # итоговая строка
             name_cell = (cells[name_idx] if len(cells) > name_idx else "").strip()
+
+            # «Итого»
             if name_cell.lower() in {"итого","итог","total"}:
                 if len(cells) > pts_idx:
                     team_pts = to_int(cells[pts_idx])
                 continue
 
-            # обычная строка игрока: в «Игрок» должны быть буквы
             if not re.search(r"[A-Za-zА-Яа-яЁё]", name_cell):
                 continue
 
@@ -277,26 +318,21 @@ def parse_match(url: str) -> dict | None:
 
         if team_pts is None:
             team_pts = sum(p["pts"] for p in players)
-
         return players, team_pts
 
-    # возьмём первые две разные команды
-    A_ru, A_tbl = blocks[0]
-    B_ru, B_tbl = None, None
-    for t_ru, t_tbl in blocks[1:]:
-        if t_ru != A_ru:
-            B_ru, B_tbl = t_ru, t_tbl
-            break
-    if not B_ru:
+    # Разобрали две команды
+    (A_ru, A_tbl), (B_ru, B_tbl) = pairs[0], pairs[1]
+    if not (A_ru and B_ru):
+        log("[DBG] team names missing", url)
         return None
-
-    A_rows, A_pts = parse_table(A_tbl)
-    B_rows, B_pts = parse_table(B_tbl)
 
     a_abbr = TEAM_RU_TO_ABBR.get(A_ru, "")
     b_abbr = TEAM_RU_TO_ABBR.get(B_ru, "")
     if not (a_abbr and b_abbr):
         return None
+
+    A_rows, A_pts = parse_players_and_pts(A_tbl)
+    B_rows, B_pts = parse_players_and_pts(B_tbl)
 
     info = {
         "teamA": {"name": A_ru, "abbr": a_abbr, "emoji": emoji(a_abbr), "score": A_pts},
