@@ -9,7 +9,7 @@ jobs:
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TEAM_EMOJI_JSON: ${{ secrets.TEAM_EMOJI_JSON }}
-      TEST_CHAT_ID: ${{ secrets.TEST_CHAT_ID }} # обязательный для отправки предпросмотра
+      TEST_CHAT_ID: ${{ secrets.TEST_CHAT_ID }} # обязателен для шага отправки предпросмотров
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -77,18 +77,19 @@ jobs:
           python - << 'PY'
           import os, json, re, sys
           mapping = json.loads(os.getenv('TEAM_EMOJI_JSON','{}'))
+          # Сконструируем тестовый текст с токенами {EMO:(ABBR)}ABBR
           text = " ".join([f'{{EMO:\\n({abbr})\\n}}{abbr}' for abbr in sorted(mapping)])
+          # Правильный расчёт offset в UTF-16 код-юнитах
           def u16len(s): return len(s.encode('utf-16-le'))//2
+          # ГИБКИЙ шаблон: любые пробелы/переводы строк вокруг EMO: и скобок
+          pat = re.compile(r"\\{\\s*EMO:\\s*\\(([A-Z]{2,3})\\)\\s*\\}")
           entities=[]; out_parts=[]; last=0
-          for m in re.finditer(r"\\{EMO:\\n\\(([A-Z]{2,3})\\)\\n\\}", text):
+          for m in pat.finditer(text):
             abbr=m.group(1)
             out_parts.append(text[last:m.start()])
             start=u16len(''.join(out_parts))
-            if abbr in mapping:
-              out_parts.append('⬤')
-              entities.append({'type':'custom_emoji','offset':start,'length':1,'custom_emoji_id':str(mapping[abbr])})
-            else:
-              out_parts.append('🏀')
+            out_parts.append('⬤')
+            entities.append({'type':'custom_emoji','offset':start,'length':1,'custom_emoji_id':str(mapping.get(abbr,''))})
             last=m.end()
           out_parts.append(text[last:])
           final=''.join(out_parts)
@@ -104,15 +105,11 @@ jobs:
         run: |
           python - << 'PY'
           import os, json, re, requests, sys, math
-
           token=os.getenv('TELEGRAM_BOT_TOKEN','').strip()
           chat=os.getenv('TEST_CHAT_ID','').strip()
           if not token or not chat:
             sys.exit('No TELEGRAM_BOT_TOKEN or TEST_CHAT_ID')
-
           mapping=json.loads(os.getenv('TEAM_EMOJI_JSON','{}'))  # {ABBR: custom_emoji_id}
-
-          # Русские названия (как в твоём боте)
           ABBR_TO_RU = {
             "ATL":"Атланта","BOS":"Бостон","BKN":"Бруклин","CHA":"Шарлотт","CHI":"Чикаго",
             "CLE":"Кливленд","DAL":"Даллас","DEN":"Денвер","DET":"Детройт","GSW":"Голден Стэйт",
@@ -121,35 +118,25 @@ jobs:
             "OKC":"Оклахома-Сити","ORL":"Орландо","PHI":"Филадельфия","PHX":"Финикс","POR":"Портленд",
             "SAC":"Сакраменто","SAS":"Сан-Антонио","TOR":"Торонто","UTA":"Юта","WAS":"Вашингтон",
           }
-
-          # Строим строки вида: {EMO:(BOS)} BOS — Бостон
           abbrs = sorted(mapping.keys())
           lines = [f'{{EMO:\\n({abbr})\\n}} {abbr} — {ABBR_TO_RU.get(abbr, abbr)}' for abbr in abbrs]
-
-          def u16len(s: str) -> int:
-            return len(s.encode('utf-16-le')) // 2
-
-          def build_text_and_entities(text: str, mapping: dict) -> tuple[str, list]:
-            entities=[]; out_parts=[]; last=0
-            for m in re.finditer(r"\\{EMO:\\n\\(([A-Z]{2,3})\\)\\n\\}", text):
+          def u16len(s: str) -> int: return len(s.encode('utf-16-le')) // 2
+          pat = re.compile(r"\\{\\s*EMO:\\s*\\(([A-Z]{2,3})\\)\\s*\\}")
+          def build(text: str):
+            entities=[]; out=[]; last=0
+            for m in pat.finditer(text):
               abbr=m.group(1)
-              out_parts.append(text[last:m.start()])
-              start=u16len(''.join(out_parts))
-              if abbr in mapping:
-                out_parts.append('⬤')
-                entities.append({'type':'custom_emoji','offset':start,'length':1,'custom_emoji_id':str(mapping[abbr])})
-              else:
-                out_parts.append('🏀')
+              out.append(text[last:m.start()])
+              start=u16len(''.join(out))
+              out.append('⬤')
+              entities.append({'type':'custom_emoji','offset':start,'length':1,'custom_emoji_id':str(mapping.get(abbr,''))})
               last=m.end()
-            out_parts.append(text[last:])
-            return ''.join(out_parts), entities
-
-          # Бьём по 10 строк в сообщение
+            out.append(text[last:])
+            return ''.join(out), entities
           CHUNK=10
           for i in range(0, len(lines), CHUNK):
-            chunk_lines = lines[i:i+CHUNK]
-            text = "\\n".join(chunk_lines)
-            final, entities = build_text_and_entities(text, mapping)
+            text="\\n".join(lines[i:i+CHUNK])
+            final, entities = build(text)
             r = requests.post(
               f'https://api.telegram.org/bot{token}/sendMessage',
               json={'chat_id':chat,'text':final,'parse_mode':'HTML','disable_web_page_preview':True,'entities':entities},
