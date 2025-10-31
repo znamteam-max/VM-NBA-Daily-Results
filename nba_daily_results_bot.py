@@ -159,7 +159,6 @@ def norm_header(s: str) -> str:
     return t
 
 def map_header_indices(tbl) -> dict[str,int]:
-    # ищем thead, если его нет — пробуем первую строку из th
     thead = tbl.find("thead")
     headers = []
     if thead:
@@ -185,13 +184,11 @@ def map_header_indices(tbl) -> dict[str,int]:
     return idx
 
 def extract_team_block(soup: BeautifulSoup, team_ru: str):
-    # ищем ближайший к заголовку «Статистика игроков <Команда>»
     for h in soup.find_all(["h2","h3","h4"]):
         txt = h.get_text(" ", strip=True)
         if "статистика игроков" in txt.lower() and team_ru.lower() in txt.lower():
             tbl = h.find_next("table")
             if tbl: return tbl
-    # fallback: первый встречный блок статистики игроков
     for h in soup.find_all(["h2","h3","h4"]):
         if "статистика игроков" in h.get_text(" ", strip=True).lower():
             tbl = h.find_next("table")
@@ -199,7 +196,6 @@ def extract_team_block(soup: BeautifulSoup, team_ru: str):
     return None
 
 def parse_players_from_table(tbl) -> tuple[list[dict], bool]:
-    """Возвращает (players, header_ok). Если header_ok=False — не использовать (триггерим ESPN)."""
     idx = map_header_indices(tbl)
     if not idx:
         return [], False
@@ -208,11 +204,10 @@ def parse_players_from_table(tbl) -> tuple[list[dict], bool]:
     for tr in tbody.find_all("tr"):
         cells = tr.find_all(["td","th"])
         if not cells: continue
-        # имя — ищем первый «не номер», чаще в <a>
         name = ""
         for j in range(min(3, len(cells))):
             cand = cells[j].get_text(" ", strip=True)
-            if re.fullmatch(r"[#№]?\d{1,3}", cand):  # номер
+            if re.fullmatch(r"[#№]?\d{1,3}", cand):
                 continue
             a = cells[j].find("a")
             name = (a.get_text(" ", strip=True) if a else cand).strip()
@@ -241,22 +236,18 @@ def parse_sports_match(url: str) -> dict | None:
     if not (a_abbr and b_abbr): return None
     nameA = TEAM_RU.get(a_abbr, a_abbr); nameB = TEAM_RU.get(b_abbr, b_abbr)
 
-    # Счёт: ищем «Итого/Всего» в таблицах; если не нашли — общий паттерн на странице
     scoreA = scoreB = 0
     ot = detect_ot(soup)
 
-    # Пытаемся собрать игроков из таблиц
     tblA = extract_team_block(soup, nameA)
     tblB = extract_team_block(soup, nameB)
     playersA, okA = ([], False)
     playersB, okB = ([], False)
     if tblA:
         playersA, okA = parse_players_from_table(tblA)
-        # из итоговой строки возьмём очки, если есть
         for tr in (tblA.find("tbody") or tblA).find_all("tr"):
             t0 = tr.find(["th","td"])
             if t0 and re.search(r"^(итого|всего)\s*$", t0.get_text(" ", strip=True), re.I):
-                # возьмём очки из колонки pts
                 idx = map_header_indices(tblA)
                 if "pts" in idx:
                     tds = tr.find_all(["td","th"])
@@ -277,7 +268,6 @@ def parse_sports_match(url: str) -> dict | None:
                         if m: scoreB = int(m.group(0))
                 break
 
-    # если очков нет — возьмём первое совпадение на странице
     if not (scoreA and scoreB):
         txt = soup.get_text(" ", strip=True)
         m = re.search(r"\b(\d{1,3})\s*:\s*(\d{1,3})\b", txt)
@@ -341,7 +331,6 @@ def espn_box_players(event_id: str) -> dict[str, list[dict]]:
                 ast=iget("assists","ast"); stl=iget("steals","stl"); blk=iget("blocks","blk")
                 if any([pts,reb,ast,stl,blk]):
                     arr.append({"name_ru": nm, "pts": pts, "reb": reb, "ast": ast, "stl": stl, "blk": blk, "_src":"espn"})
-        # merge by name
         merged={}
         for p in arr:
             key=p["name_ru"]
@@ -412,7 +401,6 @@ def to_initials_ru(full_or_en: str) -> str:
 def normalize_name_ru(p: dict) -> str:
     if p.get("_src") != "espn":
         return to_initials_ru(p.get("name_ru",""))
-    # ESPN → попытка русификации через профиль/поиск
     full = p.get("name_ru","")
     parts=[x for x in full.split() if x]
     if len(parts)>=2:
@@ -421,7 +409,6 @@ def normalize_name_ru(p: dict) -> str:
         if url:
             nm=_sru_name_from(url)
             if nm:
-                # в заголовке обычно «Имя Фамилия» — делаем «И. Фамилия»
                 parts_ru=[w for w in nm.split() if w]
                 if len(parts_ru)>=2:
                     return f"{parts_ru[0][0]}. {parts_ru[-1]}"
@@ -438,7 +425,6 @@ def score_key(p: dict): return (p["pts"], p["reb"]+p["ast"], p["stl"]+p["blk"])
 def pick_team_players(abbr: str, rows: list[dict]) -> list[tuple[dict,bool,bool]]:
     if not rows: return []
     rows = sorted(rows, key=score_key, reverse=True)
-    # спец: Демин/Голдин
     special=None
     key_tail = "demin" if abbr=="BKN" else ("goldin" if abbr=="MIA" else None)
     if key_tail:
@@ -484,7 +470,6 @@ def fmt_player_line(p: dict, bold=False, special=False) -> str:
         if p["stl"]>=4: chunks.append(f"{p['stl']} {ru_plural(p['stl'], ('перехват','перехвата','перехватов'))}")
         if p["blk"]>=4: chunks.append(f"{p['blk']} {ru_plural(p['blk'], ('блок-шот','блок-шота','блок-шотов'))}")
         line = f"{name}: " + ", ".join(chunks)
-    # 🔥
     if (p["pts"]>=35) or (p["reb"]>=15) or (p["ast"]>=12) or (p["stl"]>=5) or (p["blk"]>=5):
         line += " 🔥"
     return sp(line)
@@ -495,14 +480,17 @@ def build_block(game: dict, with_records: dict[str,str] | None = None) -> str:
     ab1, ab2 = t1["abbr"], t2["abbr"]
     e1, e2 = team_emoji(ab1), team_emoji(ab2)
     a_win = t1["score"] > t2["score"]; b_win = t2["score"] > t1["score"]
-    rec1 = (with_records or {}).get(ab1, ""); rec2 = (with_records or {}).get(ab2, "")
     ot_tag = " (ОТ)" if game["ot"] else ""
 
+    # избегаем вложенных кавычек во f-строках
+    score1_txt = f"<b>{t1['score']}</b>" if a_win else f"{t1['score']}"
+    score2_txt = f"<b>{t2['score']}</b>" if b_win else f"{t2['score']}"
+
     head = (
-        f"{e1} {name1}: {sp(f'<b>{t1['score']}</b>' if a_win else f'{t1['score']}')}\n"
-        f"{e2} {name2}: {sp(f'<b>{t2['score']}</b>' if b_win else f'{t2['score']}')}{ot_tag}\n\n"
+        f"{e1} {name1}: {sp(score1_txt)}\n"
+        f"{e2} {name2}: {sp(score2_txt)}{ot_tag}\n\n"
     )
-    # команда 1
+
     lines=[]
     p1 = pick_team_players(ab1, t1.get("players") or [])
     p2 = pick_team_players(ab2, t2.get("players") or [])
@@ -524,7 +512,6 @@ def enrich_players_with_espn(game: dict, day: date):
         logdbg("ESPN fallback: event not found for", game["teams"][0]["abbr"], game["teams"][1]["abbr"])
         return
     by_tid = espn_box_players(eid)
-    # разложим по сторонам
     ab2list = {game["teams"][0]["abbr"]: [], game["teams"][1]["abbr"]: []}
     for tid, lst in by_tid.items():
         ab = id2abbr.get(tid)
@@ -537,7 +524,6 @@ def enrich_players_with_espn(game: dict, day: date):
 # ========== BUILD POST ==========
 def pick_report_day() -> date:
     d_today = et_today()
-    # если на Sports.ru сегодня есть хотя бы один NBA-матч — берём сегодня, иначе вчера
     today_cnt = len(fetch_day_links(d_today))
     if today_cnt > 0:
         logdbg("DAY PICK", d_today, "(today)")
@@ -555,7 +541,6 @@ def build_post(d: date) -> str:
             if g: games.append(g)
         except Exception as e:
             logdbg("PARSE ERROR", u, repr(e))
-    # Подтянем игроков из ESPN где нужно
     for g in games:
         enrich_players_with_espn(g, d)
 
