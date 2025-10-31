@@ -25,7 +25,6 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          # Включить отладку при необходимости:
-          # DEBUG_NBA: "1"
+          DEBUG_NBA: "1"   # ← включаем отладку на один запуск
         run: |
           python nba_daily_results_bot.py
