@@ -62,7 +62,7 @@ def log(*a):
 # -------- DATES --------
 RU_MONTHS = {1:"января",2:"февраля",3:"марта",4:"апреля",5:"мая",6:"июня",
              7:"июля",8:"августа",9:"сентября",10:"октября",11:"ноября",12:"декабря"}
-def ru_date(d: date) -> str: return f"{d.day} {RU_MONTHS[d.month]}"
+def (d: date) -> str: return f"{d.day} {RU_MONTHS[d.month]}"
 def ru_plural(n: int, forms: tuple[str,str,str]) -> str:
     n = abs(int(n)) % 100; n1 = n % 10
     if 11 <= n <= 19: return forms[2]
@@ -91,7 +91,7 @@ def espn_dates_for_pt_day(d_pt: date) -> list[date]:
     end_pt   = datetime(d_pt.year, d_pt.month, d_pt.day, 23, 59, tzinfo=tz_pt)
     return sorted({ start_pt.astimezone(tz_et).date(), end_pt.astimezone(tz_et).date() })
 
-def sportsru_dates_for_pt_day(d_pt: date) -> list[date]:
+def sportss_for_pt_day(d_pt: date) -> list[date]:
     """Какие sports.ru-даты (MSK) покрывают один PT-день."""
     tz_pt = ZoneInfo("America/Los_Angeles"); tz_msk = ZoneInfo("Europe/Moscow")
     start_pt = datetime(d_pt.year, d_pt.month, d_pt.day, 0, 0, tzinfo=tz_pt)
@@ -678,7 +678,7 @@ def fetch_sports_games_for_day(d: date) -> list[dict]:
 def fetch_sports_games_for_pt_day(d_pt: date) -> list[dict]:
     """Собрать все матчи дня по PT, учитывая, что на sports.ru это могут быть 2 разных календарных даты (MSK)."""
     all_games=[]
-    for d_msk in sportsru_dates_for_pt_day(d_pt):
+    for d_msk in sportss_for_pt_day(d_pt):
         all_games.extend(fetch_sports_games_for_day(d_msk))
     # дедуп по паре команд
     uniq={}
@@ -782,14 +782,11 @@ def build_post() -> str:
     # Обогащаем рекордами/резервным счётом
     enrich_scores_and_records_from_espn(games, d_pt)
 
-    title_count = len(games)
-    title = f"НБА • {ru_date(d_pt)} • {title_count} {ru_plural(title_count, ('матч','матча','матчей'))}
-"
-    title += "Результаты надёжно спрятаны 👇
-"
-    title += SEP + "
-
-"
+   title = (
+    f"НБА • {ru_date(d_pt)} • {title_count} {ru_plural(title_count, ('матч','матча','матчей'))}\n"
+    "Результаты надёжно спрятаны 👇\n"
+    f"{SEP}\n\n"
+)
 
     if title_count == 0:
         return title.rstrip()
