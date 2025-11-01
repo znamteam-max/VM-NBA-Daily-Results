@@ -778,7 +778,7 @@ def build_post() -> str:
     enrich_scores_and_records_from_espn(games, d_pt)
 
     title_count = len(games)
-    title = f"НБА • {ru_date(d_pt)} • {title_count} {ru_plural(title_count, ('матч','матча','матчей'))}
+    title = f"НБА • {ru_date(d_pt)} • {title_count} {ru_plural(title_count, ('матч','матча','матчей'))}\n"
 "
     title += "Результаты надёжно спрятаны 👇
 "
