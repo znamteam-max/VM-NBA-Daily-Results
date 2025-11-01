@@ -1,0 +1,108 @@
+name: NBA Auto Post (ESPN-complete)
+
+on:
+  schedule:
+    # проверяем каждые 10 минут
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}  # можно запустить вручную, если у тебя есть права
+
+permissions:
+  contents: write  # нужно, чтобы поставить маркер-коммит .posted/YYYYMMDD.done
+
+concurrency:
+  group: nba-autopost
+  cancel-in-progress: true
+
+jobs:
+  autopost:
+    runs-on: ubuntu-latest
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+      TEAM_EMOJI_JSON:    ${{ secrets.TEAM_EMOJI_JSON }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # чтобы видеть историю и пушить маркеры
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          pip install requests beautifulsoup4
+
+      - name: Check if ESPN day is fully completed
+        id: check
+        run: |
+          python - << 'PY'
+          import os, sys, json, requests
+          from datetime import datetime, timedelta, timezone
+          from zoneinfo import ZoneInfo
+          from pathlib import Path
+
+          # 1) Определяем "день" по Восточному времени (ET)
+          now_et = datetime.now(ZoneInfo("America/New_York"))
+          base_et = now_et.date() if now_et.hour >= 8 else (now_et.date() - timedelta(days=1))
+          ymd = base_et.strftime("%Y%m%d")
+
+          # 2) Не запускаться повторно — если уже есть маркер
+          marker = Path(".posted") / f"{ymd}.done"
+          if marker.exists():
+            print(f"Already posted for {ymd}, skip.")
+            print(f"ready=false\nyearmonthday={ymd}")
+            with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"ready=false\nyearmonthday={ymd}\n")
+            sys.exit(0)
+
+          # 3) Смотрим ESPN
+          url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates={ymd}"
+          try:
+            r = requests.get(url, timeout=20)
+            j = r.json()
+          except Exception as e:
+            print("ESPN error:", e, "status:", getattr(r, "status_code", "?"))
+            ready = "false"
+          else:
+            events = j.get("events") or []
+            if not events:
+              print(f"No events on ESPN for {ymd} yet.")
+              ready = "false"
+            else:
+              def is_completed(ev):
+                t = ((ev or {}).get("status") or {}).get("type") or {}
+                return bool(t.get("completed", False))
+              all_done = all(is_completed(ev) for ev in events)
+              print(f"ESPN {ymd}: events={len(events)} all_completed={all_done}")
+              ready = "true" if all_done else "false"
+
+          # 4) Выводим в outputs
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+            fh.write(f"ready={ready}\n")
+            fh.write(f"yearmonthday={ymd}\n")
+          PY
+
+      - name: Run bot (post results)
+        if: steps.check.outputs.ready == 'true'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEAM_EMOJI_JSON:    ${{ secrets.TEAM_EMOJI_JSON }}
+          # Можно включить отладку, если нужно:
+          # DEBUG_NBA: "1"
+        run: |
+          python3 nba_daily_results_bot.py
+
+      - name: Mark day as posted
+        if: steps.check.outputs.ready == 'true'
+        run: |
+          mkdir -p .posted
+          echo "posted at $(date -u +'%Y-%m-%dT%H:%M:%SZ')" > ".posted/${{ steps.check.outputs.yearmonthday }}.done"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .posted
+          git commit -m "NBA posted for ${{ steps.check.outputs.yearmonthday }}"
+          git push
