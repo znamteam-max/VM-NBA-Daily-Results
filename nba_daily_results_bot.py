@@ -779,12 +779,8 @@ def build_post() -> str:
 
     title_count = len(games)
     title = f"НБА • {ru_date(d_pt)} • {title_count} {ru_plural(title_count, ('матч','матча','матчей'))}\n"
-"
-    title += "Результаты надёжно спрятаны 👇
-"
-    title += SEP + "
-
-"
+    title += "Результаты надёжно спрятаны 👇\n"
+    title += SEP + "\n\n"
 
     if title_count == 0:
         return title.rstrip()
@@ -793,10 +789,7 @@ def build_post() -> str:
     for i, g in enumerate(games, 1):
         blocks.append(build_block(g))
         if i < title_count:
-            blocks.append("
-" + SEP + "
-
-")
+            blocks.append("\n" + SEP + "\n\n")
 
     return (title + "".join(blocks)).strip()
 
