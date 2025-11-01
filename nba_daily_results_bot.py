@@ -487,9 +487,13 @@ def fetch_espn_events_for_day(d: date) -> list[dict]:
             if not bool(status.get("completed", False)):
                 continue  # только финалы
 
+            # Дата старта матча: на уровне competitions бывает startDate/date — берём их приоритетно
+            comp_date = comp.get("startDate") or comp.get("date") or ev.get("date") or ""
+
             out.append({
                 "eventId": str(ev.get("id") or ""),
-                "utcDate": str(ev.get("date") or ""),  # ISO8601 UTC
+                "utcDate": str(ev.get("date") or ""),  # ISO8601 UTC (fallback)
+                "utcCompDate": str(comp_date),             # ISO8601 UTC (старт по competitions)
                 "home": {
                     "abbr": abbr_h, "teamId": str(th.get("id") or ""),
                     "score": _intish(home.get("score", 0)),
@@ -521,17 +525,17 @@ def fetch_espn_events_multi(days: list[date]) -> dict[frozenset, dict]:
     return seen
 
 def fetch_espn_events_for_pt_day_map(pt_day: date) -> dict[frozenset, dict]:
-    """Собираем события ESPN, относящиеся ИМЕННО к этому PT-дню (по дате начала в PT)."""
+    """Собираем события ESPN, относящиеся ИМЕННО к этому PT-дню (по времени старта в PT)."""
     tz_pt = ZoneInfo("America/Los_Angeles")
     # соберём все финальные события за нужные ET-даты
     raw=[]
     for d in espn_dates_for_pt_day(pt_day):
         raw.extend(fetch_espn_events_for_day(d))
-    # фильтруем по PT-дате
+    # фильтруем по PT-дате старта матча
     filt=[]
     for e in raw:
         try:
-            iso = (e.get("utcDate") or "").replace("Z","+00:00")
+            iso = (e.get("utcCompDate") or e.get("utcDate") or "").replace("Z","+00:00")
             if not iso: continue
             dt = datetime.fromisoformat(iso).astimezone(tz_pt)
             if dt.date() == pt_day:
@@ -548,6 +552,7 @@ def fetch_espn_events_for_pt_day_map(pt_day: date) -> dict[frozenset, dict]:
                 key = frozenset([h, a])
                 if key not in seen:
                     seen[key] = e
+    log(f"[DBG] ESPN PT-map: kept {len(filt)} events for PT {pt_day}")
     return seen
 
 # -------- Игроки/формат --------
@@ -778,9 +783,13 @@ def build_post() -> str:
     enrich_scores_and_records_from_espn(games, d_pt)
 
     title_count = len(games)
-    title = f"НБА • {ru_date(d_pt)} • {title_count} {ru_plural(title_count, ('матч','матча','матчей'))}\n"
-    title += "Результаты надёжно спрятаны 👇\n"
-    title += SEP + "\n\n"
+    title = f"НБА • {ru_date(d_pt)} • {title_count} {ru_plural(title_count, ('матч','матча','матчей'))}
+"
+    title += "Результаты надёжно спрятаны 👇
+"
+    title += SEP + "
+
+"
 
     if title_count == 0:
         return title.rstrip()
@@ -789,7 +798,10 @@ def build_post() -> str:
     for i, g in enumerate(games, 1):
         blocks.append(build_block(g))
         if i < title_count:
-            blocks.append("\n" + SEP + "\n\n")
+            blocks.append("
+" + SEP + "
+
+")
 
     return (title + "".join(blocks)).strip()
 
