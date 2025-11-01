@@ -2,12 +2,12 @@ name: NBA Auto Post (PT day complete)
 
 on:
   schedule:
-    # проверяем каждые 10 минут
+    # Проверяем каждые 10 минут
     - cron: "*/10 * * * *"
-  workflow_dispatch: {}  # ручной запуск тоже оставим
+  workflow_dispatch: {}  # Оставим ручной запуск на всякий случай
 
 permissions:
-  contents: write  # чтобы коммитить маркер .posted/pt-YYYYMMDD.done
+  contents: write  # нужно, чтобы коммитить маркер .posted/pt-YYYYMMDD.done
 
 concurrency:
   group: nba-autopost-pt
@@ -24,7 +24,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0  # чтобы видеть историю и пушить маркеры
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -32,13 +32,14 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: pip install requests beautifulsoup4
+        run: |
+          pip install requests beautifulsoup4
 
       - name: Check if PT day is fully completed on ESPN
         id: check
         run: |
           python - << 'PY'
-          import os, sys, json, requests
+          import os, sys, requests
           from datetime import datetime, timedelta
           from zoneinfo import ZoneInfo
           from pathlib import Path
@@ -50,12 +51,14 @@ jobs:
           # Между 00:00–06:00 PT считаем, что речь ещё о ВЧЕРАШНЕМ PT-дне
           base_pt = now_pt.date() if now_pt.hour >= 6 else (now_pt.date() - timedelta(days=1))
           ymd_pt  = base_pt.strftime("%Y-%m-%d")
-          # Маркер, чтобы не постить повторно
+
+          # Не запускаться повторно — если уже есть маркер
           marker = Path(".posted") / f"pt-{base_pt.strftime('%Y%m%d')}.done"
           if marker.exists():
             print(f"Already posted for PT {ymd_pt}, skip.")
             with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
-              fh.write(f"ready=false\npt_ymd={ymd_pt}\n")
+              fh.write(f"ready=false\n")
+              fh.write(f"pt_ymd={ymd_pt}\n")
             sys.exit(0)
 
           # Какие ET-даты покрывают один PT-день
@@ -70,13 +73,13 @@ jobs:
             r.raise_for_status()
             return r.json().get("events") or []
 
-          # Грузим события двух ET-дней, фильтруем по PT-дате
+          # Грузим события двух ET-дней
           events = []
           for d in et_dates:
             events.extend(fetch_et(d))
 
           def ev_pt_date(ev):
-            # берём ISO-время события (UTC), конвертим в PT и берём date()
+            # Время события (UTC) -> PT -> date()
             dt = datetime.fromisoformat(ev["date"].replace("Z","+00:00")).astimezone(tz_pt)
             return dt.date()
 
@@ -101,7 +104,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           TEAM_EMOJI_JSON:    ${{ secrets.TEAM_EMOJI_JSON }}
-          REPORT_DATE_PT:     ${{ steps.check.outputs.pt_ymd }}  # <-- ключ: пробрасываем PT-день в скрипт
+          REPORT_DATE_PT:     ${{ steps.check.outputs.pt_ymd }}  # <-- пробрасываем PT-день в скрипт
         run: |
           python3 nba_daily_results_bot.py
 
@@ -109,7 +112,9 @@ jobs:
         if: steps.check.outputs.ready == 'true'
         run: |
           mkdir -p .posted
-          touch ".posted/pt-${{ steps.check.outputs.pt_ymd//-/}}.done"
+          Y="${{ steps.check.outputs.pt_ymd }}"
+          Y="${Y//-/}"  # удалить дефисы
+          echo "posted at $(date -u +'%Y-%m-%dT%H:%M:%SZ')" > ".posted/pt-${Y}.done"
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .posted
