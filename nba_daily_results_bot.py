@@ -475,22 +475,38 @@ def fetch_espn_events_for_day(d: date) -> list[dict]:
     return out
 
 
+def _espn_pt_start_dt(e: dict):
+    """Пытаемся достать точное время старта матча из разных полей ESPN и вернуть aware-datetime в PT."""
+    tz_pt = ZoneInfo("America/Los_Angeles")
+    iso = None
+    try:
+        comp = (e.get("competitions") or [None])[0] or {}
+        iso = comp.get("startDate") or comp.get("date")
+        if not iso:
+            # Иногда бывает в status.type.startDate
+            st = (e.get("status") or {}).get("type") or {}
+            iso = st.get("startDate") or st.get("date")
+        if not iso:
+            iso = e.get("utcCompDate") or e.get("utcDate") or e.get("date")
+        if iso:
+            iso = iso.replace("Z","+00:00")
+            return datetime.fromisoformat(iso).astimezone(tz_pt)
+    except Exception:
+        pass
+    return None
+
 def fetch_espn_events_for_pt_day_map(pt_day: date) -> dict[frozenset, dict]:
     """Собираем события ESPN, относящиеся к этому PT-дню (по времени старта в PT)."""
-    tz_pt = ZoneInfo("America/Los_Angeles")
+    # Соберём сырые события за две ET-даты
     raw=[]
     for d in espn_dates_for_pt_day(pt_day):
         raw.extend(fetch_espn_events_for_day(d))
+    # Фильтруем по PT-дате старта
     filt=[]
     for e in raw:
-        try:
-            iso = (e.get("utcCompDate") or e.get("utcDate") or "").replace("Z","+00:00")
-            if not iso: continue
-            dt = datetime.fromisoformat(iso).astimezone(tz_pt)
-            if dt.date() == pt_day:
-                filt.append(e)
-        except Exception:
-            continue
+        dt = _espn_pt_start_dt(e) or None
+        if dt and dt.date() == pt_day:
+            filt.append(e)
     seen={}
     for e in filt:
         homes = abbr_variants(e["home"]["abbr"])
@@ -638,30 +654,78 @@ def fetch_sports_games_for_pt_day(d_pt: date) -> list[dict]:
 
 # ——— ESPN-фильтр: оставить только матчи выбранного PT-дня ———
 
-def fetch_espn_events_for_pt_day_map_cached(pt_day: date) -> dict[frozenset, dict]:
-    return fetch_espn_events_for_pt_day_map(pt_day)
+def _espn_events_map_all_for_pt_window(pt_day: date) -> dict[frozenset, dict]:
+    """Карта всех финальных событий за две ET-даты без PT-фильтра (для сопоставления и обогащения)."""
+    seen={}
+    for d in espn_dates_for_pt_day(pt_day):
+        for e in fetch_espn_events_for_day(d):
+            homes = abbr_variants(e["home"]["abbr"]) ; aways = abbr_variants(e["away"]["abbr"]) 
+            for h in homes:
+                for a in aways:
+                    key = frozenset([h,a])
+                    if key not in seen:
+                        seen[key] = e
+    return seen
 
-def filter_games_to_pt_day(games: list[dict], pt_day: date) -> tuple[list[dict], dict]:
-    espn_map = fetch_espn_events_for_pt_day_map_cached(pt_day)
+def filter_games_to_pt_day(games: list[dict], pt_day: date) -> tuple[list[dict], dict, dict]:
+    """Оставляем только матчи PT-дня. Логика: если ESPN уверенно говорит, что пара не относится к PT-дню — отбрасываем;
+    если ESPN пару не находит вовсе — оставляем (чтобы ничего не потерять).
+    Возвращаем: (список, карта_PT, карта_ALL)
+    """
+    espn_pt = fetch_espn_events_for_pt_day_map(pt_day)
+    espn_all = _espn_events_map_all_for_pt_window(pt_day)
     out=[]
     for info in games:
         a = info["teamA"]["abbr"]; b = info["teamB"]["abbr"]
-        ok=False
+        matched_ev = None
+        # Ищем событие в общей карте
         for va in abbr_variants(a):
             for vb in abbr_variants(b):
-                if frozenset([va, vb]) in espn_map:
-                    ok=True; break
-            if ok: break
-        if ok:
-            out.append(info)
+                ev = espn_all.get(frozenset([va, vb]))
+                if ev:
+                    matched_ev = ev; break
+            if matched_ev: break
+        if matched_ev:
+            # Проверяем PT-дату старта
+            dt = _espn_pt_start_dt(matched_ev)
+            if dt and dt.date() == pt_day:
+                out.append(info)
+            else:
+                log(f"[DBG] DROP by ESPN PT start mismatch: {a}-{b} -> {dt.date() if dt else '??'}")
         else:
-            log(f"[DBG] DROP non-PT game by ESPN filter: {a}-{b}")
-    return out, espn_map
+            # ESPN не нашёл пару — не рискуем, оставляем
+            log(f"[DBG] KEEP (no ESPN match) by sports.ru: {a}-{b}")
+            out.append(info)
+    return out, espn_pt, espn_all
 
 # -------- ESPN: добавим рекорды и (если надо) счёт --------
 
-def enrich_scores_and_records_from_espn(games: list[dict], pt_day: date):
+def enrich_scores_and_records_from_espn(games: list[dict], pt_day: date, espn_map_pref: dict | None = None, espn_map_fallback: dict | None = None):
     if not games: return
+    espn_pref = espn_map_pref or fetch_espn_events_for_pt_day_map(pt_day)
+    espn_fb   = espn_map_fallback or _espn_events_map_all_for_pt_window(pt_day)
+    for info in games:
+        A,B = info["teamA"], info["teamB"]
+        ev = None
+        for va in abbr_variants(A["abbr"]):
+            for vb in abbr_variants(B["abbr"]):
+                ev = espn_pref.get(frozenset([va, vb])) or espn_fb.get(frozenset([va, vb]))
+                if ev: break
+            if ev: break
+        if not ev:
+            continue
+        rec_map = {
+            ev["home"]["abbr"]: ev["home"].get("record",""),
+            ev["away"]["abbr"]: ev["away"].get("record",""),
+        }
+        info["records"] = rec_map
+        totalA, totalB = A["score"], B["score"]
+        if (totalA == 0 and totalB == 0) or (totalA > 160) or (totalB > 160) or (totalA + totalB > 280):
+            if ev["home"]["abbr"] == A["abbr"]:
+                A["score"] = ev["home"]["score"]; B["score"] = ev["away"]["score"]
+            else:
+                A["score"] = ev["away"]["score"]; B["score"] = ev["home"]["score"]
+    return
     espn_by_pair = fetch_espn_events_for_pt_day_map(pt_day)
     for info in games:
         A,B = info["teamA"], info["teamB"]
@@ -686,7 +750,7 @@ def enrich_scores_and_records_from_espn(games: list[dict], pt_day: date):
 def build_post() -> str:
     d_pt = pick_report_date_pacific_env()
     games_all = fetch_sports_games_for_pt_day(d_pt)
-    games, _esm = filter_games_to_pt_day(games_all, d_pt)
+    games, espn_pt_map, espn_all_map = filter_games_to_pt_day(games_all, d_pt)
     enrich_scores_and_records_from_espn(games, d_pt)
 
     title_count = len(games)
