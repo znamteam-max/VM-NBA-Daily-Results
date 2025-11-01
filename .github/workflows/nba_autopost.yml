@@ -1,16 +1,16 @@
-name: NBA Auto Post (ESPN-complete)
+name: NBA Auto Post (PT day complete)
 
 on:
   schedule:
     # проверяем каждые 10 минут
     - cron: "*/10 * * * *"
-  workflow_dispatch: {}  # можно запустить вручную, если у тебя есть права
+  workflow_dispatch: {}  # ручной запуск тоже оставим
 
 permissions:
-  contents: write  # нужно, чтобы поставить маркер-коммит .posted/YYYYMMDD.done
+  contents: write  # чтобы коммитить маркер .posted/pt-YYYYMMDD.done
 
 concurrency:
-  group: nba-autopost
+  group: nba-autopost-pt
   cancel-in-progress: true
 
 jobs:
@@ -24,7 +24,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # чтобы видеть историю и пушить маркеры
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -32,77 +32,86 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: |
-          pip install requests beautifulsoup4
+        run: pip install requests beautifulsoup4
 
-      - name: Check if ESPN day is fully completed
+      - name: Check if PT day is fully completed on ESPN
         id: check
         run: |
           python - << 'PY'
           import os, sys, json, requests
-          from datetime import datetime, timedelta, timezone
+          from datetime import datetime, timedelta
           from zoneinfo import ZoneInfo
           from pathlib import Path
 
-          # 1) Определяем "день" по Восточному времени (ET)
-          now_et = datetime.now(ZoneInfo("America/New_York"))
-          base_et = now_et.date() if now_et.hour >= 8 else (now_et.date() - timedelta(days=1))
-          ymd = base_et.strftime("%Y%m%d")
+          tz_pt = ZoneInfo("America/Los_Angeles")
+          tz_et = ZoneInfo("America/New_York")
 
-          # 2) Не запускаться повторно — если уже есть маркер
-          marker = Path(".posted") / f"{ymd}.done"
+          now_pt = datetime.now(tz_pt)
+          # Между 00:00–06:00 PT считаем, что речь ещё о ВЧЕРАШНЕМ PT-дне
+          base_pt = now_pt.date() if now_pt.hour >= 6 else (now_pt.date() - timedelta(days=1))
+          ymd_pt  = base_pt.strftime("%Y-%m-%d")
+          # Маркер, чтобы не постить повторно
+          marker = Path(".posted") / f"pt-{base_pt.strftime('%Y%m%d')}.done"
           if marker.exists():
-            print(f"Already posted for {ymd}, skip.")
-            print(f"ready=false\nyearmonthday={ymd}")
+            print(f"Already posted for PT {ymd_pt}, skip.")
             with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
-              fh.write(f"ready=false\nyearmonthday={ymd}\n")
+              fh.write(f"ready=false\npt_ymd={ymd_pt}\n")
             sys.exit(0)
 
-          # 3) Смотрим ESPN
-          url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates={ymd}"
-          try:
-            r = requests.get(url, timeout=20)
-            j = r.json()
-          except Exception as e:
-            print("ESPN error:", e, "status:", getattr(r, "status_code", "?"))
-            ready = "false"
-          else:
-            events = j.get("events") or []
-            if not events:
-              print(f"No events on ESPN for {ymd} yet.")
-              ready = "false"
-            else:
-              def is_completed(ev):
-                t = ((ev or {}).get("status") or {}).get("type") or {}
-                return bool(t.get("completed", False))
-              all_done = all(is_completed(ev) for ev in events)
-              print(f"ESPN {ymd}: events={len(events)} all_completed={all_done}")
-              ready = "true" if all_done else "false"
+          # Какие ET-даты покрывают один PT-день
+          start_pt = datetime(base_pt.year, base_pt.month, base_pt.day, 0, 0, tzinfo=tz_pt)
+          end_pt   = datetime(base_pt.year, base_pt.month, base_pt.day, 23, 59, tzinfo=tz_pt)
+          et_dates = sorted({ start_pt.astimezone(tz_et).date(), end_pt.astimezone(tz_et).date() })
+          print("PT day:", ymd_pt, "covers ET dates:", [d.strftime("%Y-%m-%d") for d in et_dates])
 
-          # 4) Выводим в outputs
+          def fetch_et(d):
+            url = f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates={d.strftime('%Y%m%d')}"
+            r = requests.get(url, timeout=20)
+            r.raise_for_status()
+            return r.json().get("events") or []
+
+          # Грузим события двух ET-дней, фильтруем по PT-дате
+          events = []
+          for d in et_dates:
+            events.extend(fetch_et(d))
+
+          def ev_pt_date(ev):
+            # берём ISO-время события (UTC), конвертим в PT и берём date()
+            dt = datetime.fromisoformat(ev["date"].replace("Z","+00:00")).astimezone(tz_pt)
+            return dt.date()
+
+          events_pt = [ev for ev in events if ev_pt_date(ev) == base_pt]
+          print(f"ESPN events for PT {ymd_pt}: {len(events_pt)}")
+
+          def is_completed(ev):
+            t = ((ev or {}).get("status") or {}).get("type") or {}
+            return bool(t.get("completed", False))
+
+          ready = "true" if (events_pt and all(is_completed(ev) for ev in events_pt)) else "false"
+          print("all_completed:", ready)
+
           with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
             fh.write(f"ready={ready}\n")
-            fh.write(f"yearmonthday={ymd}\n")
+            fh.write(f"pt_ymd={ymd_pt}\n")
           PY
 
-      - name: Run bot (post results)
+      - name: Run bot for that PT day
         if: steps.check.outputs.ready == 'true'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           TEAM_EMOJI_JSON:    ${{ secrets.TEAM_EMOJI_JSON }}
-          # Можно включить отладку, если нужно:
-          # DEBUG_NBA: "1"
+          REPORT_DATE_PT:     ${{ steps.check.outputs.pt_ymd }}  # <-- ключ: пробрасываем PT-день в скрипт
         run: |
           python3 nba_daily_results_bot.py
 
-      - name: Mark day as posted
+      - name: Mark PT day as posted
         if: steps.check.outputs.ready == 'true'
         run: |
           mkdir -p .posted
-          echo "posted at $(date -u +'%Y-%m-%dT%H:%M:%SZ')" > ".posted/${{ steps.check.outputs.yearmonthday }}.done"
+          touch ".posted/pt-${{ steps.check.outputs.pt_ymd//-/}}.done"
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .posted
-          git commit -m "NBA posted for ${{ steps.check.outputs.yearmonthday }}"
+          git commit -m "NBA posted for PT ${{ steps.check.outputs.pt_ymd }}"
           git push
