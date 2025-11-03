@@ -1,0 +1,52 @@
+name: NBA Live Results (per game)
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # каждые 5 минут
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4
+
+      - name: Run live bot (per game)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEAM_EMOJI_JSON: ${{ secrets.TEAM_EMOJI_JSON }}
+          DEBUG_NBA: "1"
+          REPORT_DATE_PT: ""
+        run: |
+          python -u nba_results_live_bot.py
+
+      - name: Commit .posted markers (if any)
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "actions@github.com"
+          git pull --rebase
+          if ! git diff --quiet -- .posted; then
+            git add .posted
+            git commit -m "NBA live posted $(date -u +'%Y-%m-%d %H:%M:%S')"
+            git push
+          else
+            echo "No new markers to commit."
+          fi
