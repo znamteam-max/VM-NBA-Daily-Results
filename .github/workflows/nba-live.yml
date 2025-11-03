@@ -3,7 +3,35 @@ name: NBA Live Results (per game)
 on:
   schedule:
     - cron: "*/5 * * * *"   # каждые 5 минут
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      send_test_message:
+        description: "Отправить ping в Telegram (не шлёт результаты)"
+        type: boolean
+        default: false
+      list_events:
+        description: "Вывести в логи список завершенных матчей за REPORT_DATE_PT и выйти"
+        type: boolean
+        default: false
+      report_date_pt:
+        description: "PT-дата для теста (YYYY-MM-DD). Пусто = авто."
+        type: string
+        required: false
+        default: ""
+      only_event_id:
+        description: "Публиковать только этот eventId (для безопасного ретро-теста)"
+        type: string
+        required: false
+        default: ""
+      dry_run:
+        description: "Не отправлять в Telegram, только логи"
+        type: boolean
+        default: false
+      alt_chat_id:
+        description: "Отправить тест в другой чат (например, себе)"
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -34,11 +62,17 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TEAM_EMOJI_JSON: ${{ secrets.TEAM_EMOJI_JSON }}
           DEBUG_NBA: "1"
-          REPORT_DATE_PT: ""
+          REPORT_DATE_PT: ${{ inputs.report_date_pt }}
+          SEND_TEST_MESSAGE: ${{ inputs.send_test_message }}
+          LIST_EVENTS: ${{ inputs.list_events }}
+          ONLY_EVENT_ID: ${{ inputs.only_event_id }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          ALT_CHAT_ID: ${{ inputs.alt_chat_id }}
         run: |
           python -u nba_results_live_bot.py
 
       - name: Commit .posted markers (if any)
+        if: ${{ !inputs.dry_run && !inputs.send_test_message && !inputs.list_events }}
         run: |
           git config --global user.name "github-actions"
           git config --global user.email "actions@github.com"
@@ -49,4 +83,3 @@ jobs:
             git push
           else
             echo "No new markers to commit."
-          fi
