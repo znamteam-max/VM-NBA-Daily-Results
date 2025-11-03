@@ -12,10 +12,17 @@ NBA Results → Telegram (per game, instant)
 • Запускать по расписанию (например, каждые 3–5 минут) — он пришлёт только новенькие финалы.
 
 ENV:
-- TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID — обязательны
+- TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID — обязательны (или ALT_CHAT_ID)
 - TEAM_EMOJI_JSON — JSON вида {"BOS":"<custom_emoji_id>", ...} (опционально)
 - REPORT_DATE_PT — YYYY-MM-DD, для тестов (опционально)
 - DEBUG_NBA=1 — подробные логи (опционально)
+
+Тест-флаги:
+- SEND_TEST_MESSAGE=1 — отправить ping-сообщение и выйти.
+- LIST_EVENTS=1 — вывести в логи завершённые матчи за REPORT_DATE_PT и выйти.
+- ONLY_EVENT_ID=<id> — публиковать только этот eventId (для ретро-теста).
+- DRY_RUN=1 — ничего не отправлять в Telegram, только логи.
+- ALT_CHAT_ID=<id> — отправлять сообщения в альтернативный чат.
 """
 
 import os, sys, re, json
@@ -38,6 +45,12 @@ CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TEAM_EMOJI_JSON = os.getenv("TEAM_EMOJI_JSON", "").strip()
 DEBUG = bool(os.getenv("DEBUG_NBA", "").strip())
 
+ONLY_EVENT_ID   = os.getenv("ONLY_EVENT_ID", "").strip()
+DRY_RUN         = bool(os.getenv("DRY_RUN", "").strip())
+SEND_TEST_MSG   = bool(os.getenv("SEND_TEST_MESSAGE", "").strip())
+LIST_EVENTS     = bool(os.getenv("LIST_EVENTS", "").strip())
+ALT_CHAT_ID     = os.getenv("ALT_CHAT_ID", "").strip()
+
 # -------- HTTP --------
 HTTP_TIMEOUT = 12
 
@@ -57,7 +70,7 @@ def make_session():
     ad = _mk_adapter()
     s.mount("https://", ad); s.mount("http://", ad)
     s.headers.update({
-        "User-Agent": "NBA-LiveResultsBot/1.0 (per-game; pt-day; espn-finish; sportsru-players; custom-emoji)",
+        "User-Agent": "NBA-LiveResultsBot/1.1 (per-game; pt-day; espn-finish; sportsru-players; custom-emoji)",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
         "Connection": "close",
     })
@@ -71,7 +84,8 @@ def log(*a):
 RU_MONTHS = {1:"января",2:"февраля",3:"марта",4:"апреля",5:"мая",6:"июня",
              7:"июля",8:"августа",9:"сентября",10:"октября",11:"ноября",12:"декабря"}
 
-def ru_date(d: date) -> str: return f"{d.day} {RU_MONTHS[d.month]}"
+def ru_date(d: date) -> str:
+    return f"{d.day} {RU_MONTHS[d.month]}"
 
 def pick_report_date_pacific_env() -> date:
     env = os.getenv("REPORT_DATE_PT", "").strip()
@@ -153,7 +167,7 @@ def day_url(d: date) -> str:
     return f"https://www.sports.ru/stat/basketball/center/end/{d:%Y/%m/%d}.html"
 
 def _normalize_match_url(u: str) -> str:
-    full = "https://www.sports.ru" + u if u.startswith("/") else u
+    full = "https://www.sports.ru" + u если u.startswith("/") else u
     p = urlparse(full); return urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
 
 def _soup(url: str):
@@ -573,8 +587,11 @@ def _u16len(s: str) -> int:
     return len(s.encode("utf-16-le")) // 2
 
 def tg_send(text: str):
-    if not (BOT_TOKEN and CHAT_ID):
-        raise RuntimeError("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID не заданы")
+    if not BOT_TOKEN or not (CHAT_ID or ALT_CHAT_ID):
+        raise RuntimeError("TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID/ALT_CHAT_ID не заданы")
+    chat_id = ALT_CHAT_ID or CHAT_ID
+
+    # замена {EMO:(ABBR)} на кастом-эмодзи entity или дефолт
     entities=[]
     out_parts=[]; last=0
     for m in re.finditer(r"\{\s*EMO:\s*\(([A-Z]{2,3})\)\s*\}", text):
@@ -594,22 +611,40 @@ def tg_send(text: str):
         last = m.end()
     out_parts.append(text[last:])
     final_text = "".join(out_parts)
+
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": final_text, "parse_mode": "HTML", "disable_web_page_preview": True}
+    payload = {"chat_id": chat_id, "text": final_text, "parse_mode": "HTML", "disable_web_page_preview": True}
     if entities: payload["entities"] = entities
     r = S.post(url, json=payload, timeout=HTTP_TIMEOUT)
     if r.status_code != 200:
         raise RuntimeError(f"Telegram error {r.status_code}: {r.text}")
 
-# -------- MAIN LOOP (per run) --------
+# -------- MAIN --------
 def main():
+    # PING-тест
+    if SEND_TEST_MSG:
+        tg_send(f"✅ NBA Live bot ping {datetime.now().isoformat()}")
+        print("OK ping")
+        return
+
     d_pt = pick_report_date_pacific_env()
     Path(".posted").mkdir(parents=True, exist_ok=True)
 
-    # 1) ESPN: все завершённые события этого PT-дня
-    evs = espn_completed_events_for_pt_day(d_pt)
+    # Список матчей для указанной даты и выход
+    if LIST_EVENTS:
+        evs = espn_completed_events_for_pt_day(d_pt)
+        for e in evs:
+            print(f"{e['eventId']}  {canon_abbr(e['away']['abbr'])}@{canon_abbr(e['home']['abbr'])}  "
+                  f"{e['home']['score']}-{e['away']['score']}")
+        print("OK list")
+        return
 
-    # 2) sports.ru: собираем матчи для возможного сопоставления игроков
+    # 1) ESPN завершённые события
+    evs = espn_completed_events_for_pt_day(d_pt)
+    if ONLY_EVENT_ID:
+        evs = [e for e in evs if e["eventId"] == ONLY_EVENT_ID]
+
+    # 2) sports.ru для сопоставления игроков
     sru_games = fetch_sports_games_for_pt_day(d_pt)
 
     posted_now = 0
@@ -619,23 +654,22 @@ def main():
         if marker.exists():
             continue  # уже отправляли
 
-        # пробуем найти матч на sports.ru, иначе синтез из ESPN
         g = find_sportsru_match_for_event(sru_games, e)
         info = g if g else synthesize_game_from_espn(e)
-        # рекорды — всегда из ESPN
         info["records"] = {
             canon_abbr(e["home"]["abbr"]): e["home"].get("record",""),
             canon_abbr(e["away"]["abbr"]): e["away"].get("record",""),
         }
 
-        # отправка
         text = build_block(info)
-        tg_send(text)
 
-        # маркер
-        marker.write_text(datetime.now().isoformat())
-        posted_now += 1
-        log(f"[DBG] posted event {eid}")
+        if DRY_RUN:
+            log(f"[DRY] would post event {eid}: {canon_abbr(e['away']['abbr'])}@{canon_abbr(e['home']['abbr'])}")
+        else:
+            tg_send(text)
+            marker.write_text(datetime.now().isoformat())
+            posted_now += 1
+            log(f"[DBG] posted event {eid}")
 
     print(f"OK posted={posted_now}")
 
