@@ -167,7 +167,7 @@ def day_url(d: date) -> str:
     return f"https://www.sports.ru/stat/basketball/center/end/{d:%Y/%m/%d}.html"
 
 def _normalize_match_url(u: str) -> str:
-    full = "https://www.sports.ru" + u если u.startswith("/") else u
+    full = "https://www.sports.ru" + u if u.startswith("/") else u
     p = urlparse(full); return urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
 
 def _soup(url: str):
@@ -612,6 +612,10 @@ def tg_send(text: str):
     out_parts.append(text[last:])
     final_text = "".join(out_parts)
 
+    if DRY_RUN:
+        log("[DRY tg_send] " + final_text[:120].replace("\n"," ") + ("..." if len(final_text)>120 else ""))
+        return
+
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": final_text, "parse_mode": "HTML", "disable_web_page_preview": True}
     if entities: payload["entities"] = entities
@@ -630,7 +634,7 @@ def main():
     d_pt = pick_report_date_pacific_env()
     Path(".posted").mkdir(parents=True, exist_ok=True)
 
-    # Список матчей для указанной даты и выход
+    # Список матчей и выход (для проверки ESPN)
     if LIST_EVENTS:
         evs = espn_completed_events_for_pt_day(d_pt)
         for e in evs:
