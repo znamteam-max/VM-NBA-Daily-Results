@@ -52,7 +52,7 @@ def make_session():
     ad = _mk_adapter()
     s.mount("https://", ad); s.mount("http://", ad)
     s.headers.update({
-        "User-Agent": "NBA-DailyResultsBot/5.0 (pt-day; espn-records; spoilers; custom-emoji)",
+        "User-Agent": "NBA-DailyResultsBot/5.2 (pt-day; espn-records; spoilers; custom-emoji; espn-synth)",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
         "Connection": "close",
     })
@@ -90,12 +90,16 @@ def pick_report_date_pacific_env() -> date:
     # До 06:00 PT считаем, что ещё вчерашний игровой день
     return now_pt.date() if now_pt.hour >= 6 else (now_pt.date() - timedelta(days=1))
 
-# Какие ET-даты покрывают один PT-день
+# Какие ET-даты покрывают один PT-день (расширенное окно: ±1 день безопасности)
 def espn_dates_for_pt_day(d_pt: date) -> list[date]:
     tz_pt = ZoneInfo("America/Los_Angeles"); tz_et = ZoneInfo("America/New_York")
     start_pt = datetime(d_pt.year, d_pt.month, d_pt.day, 0, 0, tzinfo=tz_pt)
     end_pt   = datetime(d_pt.year, d_pt.month, d_pt.day, 23, 59, tzinfo=tz_pt)
-    return sorted({ start_pt.astimezone(tz_et).date(), end_pt.astimezone(tz_et).date() })
+    base = { start_pt.astimezone(tz_et).date(), end_pt.astimezone(tz_et).date() }
+    ext = set()
+    for d in base:
+        ext.add(d); ext.add(d - timedelta(days=1)); ext.add(d + timedelta(days=1))
+    return sorted(ext)
 
 # Какие sports.ru-даты (MSK) покрывают PT-день
 def sportsru_dates_for_pt_day(d_pt: date) -> list[date]:
@@ -123,28 +127,10 @@ TEAM_EMOJI_DEFAULT = {
 }
 
 # --- Аббревиатуры: канонизация и синонимы ESPN ↔ sports.ru ---
-_ABBR_CANON_SWAP = {
-    "GS": "GSW",
-    "PHO": "PHX",
-    "CHO": "CHA",
-    "WSH": "WAS",
-    "UTH": "UTA",
-    "SA":  "SAS",
-    "NO":  "NOP",
-    "NY":  "NYK",
-    "BRK": "BKN",
-}
-
+_ABBR_CANON_SWAP = {"GS":"GSW","PHO":"PHX","CHO":"CHA","WSH":"WAS","UTH":"UTA","SA":"SAS","NO":"NOP","NY":"NYK","BRK":"BKN"}
 _ABBR_VARIANTS = {
-    "GSW": {"GSW","GS"},
-    "PHX": {"PHX","PHO"},
-    "CHA": {"CHA","CHO"},
-    "WAS": {"WAS","WSH"},
-    "UTA": {"UTA","UTH"},
-    "SAS": {"SAS","SA"},
-    "NOP": {"NOP","NO"},
-    "NYK": {"NYK","NY"},
-    "BKN": {"BKN","BRK"},
+    "GSW":{"GSW","GS"}, "PHX":{"PHX","PHO"}, "CHA":{"CHA","CHO"}, "WAS":{"WAS","WSH"},
+    "UTA":{"UTA","UTH"}, "SAS":{"SAS","SA"}, "NOP":{"NOP","NO"}, "NYK":{"NYK","NY"}, "BKN":{"BKN","BRK"},
 }
 
 def canon_abbr(s: str | None) -> str:
@@ -152,8 +138,7 @@ def canon_abbr(s: str | None) -> str:
     return _ABBR_CANON_SWAP.get(x, x)
 
 def abbr_variants(s: str | None) -> set[str]:
-    c = canon_abbr(s)
-    out = {c}
+    c = canon_abbr(s); out = {c}
     v = _ABBR_VARIANTS.get(c)
     if v: out |= v
     return out
@@ -297,7 +282,7 @@ def _parse_players_table(node) -> list[dict]:
 
     return rows_out
 
-# --- Итоговый счёт: «последняя пара перед завершён», пропуская 4–7 пар-четвертей/ОТ ---
+# --- Итоговый счёт со страницы sports.ru ---
 def _extract_total_score_from_page(soup: BeautifulSoup) -> tuple[int,int]:
     txt = soup.get_text("\n", strip=True)
 
@@ -340,6 +325,7 @@ def _extract_total_score_from_page(soup: BeautifulSoup) -> tuple[int,int]:
                     if has_total:
                         log(f"[DBG] SCORE BY-FRAME-SUM -> {sumA}:{sumB}")
                         return (sumA, sumB)
+    # последнее — самая «большая» пара на странице
     plausible = [ (a,b) for (a,b,_) in pairs_all if (a+b) >= 140 ]
     if plausible:
         a,b = max(plausible, key=lambda p: p[0]+p[1])
@@ -359,22 +345,26 @@ def parse_sports_match(url: str) -> dict | None:
         teamA = _canonical_ru_team(left)
         right = right.split(":")[0].strip()
         teamB = _canonical_ru_team(right)
-    if not (teamA and teamB): return None
+    if not (teamA and teamB):
+        return None
 
     a_abbr = TEAM_RU_TO_ABBR.get(teamA,""); b_abbr = TEAM_RU_TO_ABBR.get(teamB,"")
     if not a_abbr or not b_abbr: return None
 
     ancA = _anchor_team_players(soup, teamA)
     ancB = _anchor_team_players(soup, teamB)
-    if not ancA or not ancB: return None
+    if not ancA or not ancB:
+        return None
 
     tabA = _find_table_after(ancA)
     tabB = _find_table_after(ancB)
-    if not tabA or not tabB: return None
+    if not tabA or not tabB:
+        return None
 
     rowsA = _parse_players_table(tabA)
     rowsB = _parse_players_table(tabB)
-    if not (rowsA or rowsB): return None
+    if not (rowsA or rowsB):
+        return None
 
     scoreA, scoreB = _extract_total_score_from_page(soup)
 
@@ -488,7 +478,7 @@ def _espn_pt_start_dt(e: dict):
     return None
 
 def _espn_events_map_all_for_pt_window(pt_day: date) -> dict[frozenset, dict]:
-    """Карта всех финальных событий за две ET-даты без PT-фильтра (для сопоставления/обогащения)."""
+    """Карта всех финальных событий за расширенное ET-окно (для сопоставления/обогащения)."""
     seen={}
     for d in espn_dates_for_pt_day(pt_day):
         for e in fetch_espn_events_for_day(d):
@@ -518,6 +508,25 @@ def fetch_espn_events_for_pt_day_map(pt_day: date) -> dict[frozenset, dict]:
                     seen[key] = e
     log(f"[DBG] ESPN PT-map: kept {len(filt)} events for PT {pt_day}")
     return seen
+
+# --- Синтез матча из ESPN, если sports.ru ещё «пустой» ---
+def synthesize_game_from_espn(e: dict) -> dict:
+    """Делаем минимальный блок из ESPN, если sports.ru ещё не дал таблицы игроков."""
+    Aabbr = canon_abbr(e["home"]["abbr"])
+    Babbr = canon_abbr(e["away"]["abbr"])
+    Aname = ABBR_TO_RU.get(Aabbr, Aabbr)
+    Bname = ABBR_TO_RU.get(Babbr, Babbr)
+    info = {
+        "teamA": {"name": Aname, "abbr": Aabbr, "score": int(e["home"]["score"])},
+        "teamB": {"name": Bname, "abbr": Babbr, "score": int(e["away"]["score"])},
+        "players": {Aname: [], Bname: []},  # игроков нет — sports.ru ещё не готов
+        "records": {
+            Aabbr: e["home"].get("record", ""),
+            Babbr: e["away"].get("record", "")
+        },
+        "url": f"espn:{e.get('eventId','')}",
+    }
+    return info
 
 # -------- Игроки/формат --------
 def initials_ru(full: str) -> str:
@@ -642,24 +651,25 @@ def fetch_sports_games_for_pt_day(d_pt: date) -> list[dict]:
     all_games=[]
     for d_msk in sportsru_dates_for_pt_day(d_pt):
         all_games.extend(fetch_sports_games_for_day(d_msk))
-    # Дедуп строго по URL (а не по паре аббревиатур), чтобы не терять матчи
-    uniq={}
+    # Дедуп строго по URL (а не по паре аббревиатур), чтобы не потерять матч при b2b сериях
+    uniq = {}
     for g in all_games:
         uniq[g["url"]] = g
     return list(uniq.values())
 
-# ——— ESPN-фильтр: оставить ТОЛЬКО матчи выбранного PT-дня (строго) ———
+# ——— МЯГКИЙ PT-фильтр: не теряем игры, если ESPN не нашёл пару ———
 def filter_games_to_pt_day(games: list[dict], pt_day: date) -> tuple[list[dict], dict, dict]:
-    """Строгий фильтр PT-дня:
-    - оставляем игру только если нашли её в ESPN (в окне двух ET-дней) и PT-дата старта == pt_day;
-    - иначе отбрасываем (включая случаи, когда ESPN пару не нашёл).
+    """Soft PT filter:
+    - если ESPN нашёл пару и PT-дата старта == pt_day — оставляем;
+    - если ESPN нашёл пару, но PT-дата иная — отбрасываем;
+    - если ESPN пару не нашёл — ОСТАВЛЯЕМ (фолбэк на sports.ru).
     Возвращаем: (список, карта_PT, карта_ALL)
     """
     espn_pt = fetch_espn_events_for_pt_day_map(pt_day)
     espn_all = _espn_events_map_all_for_pt_window(pt_day)
 
     out=[]
-    kept=0; drop_no_match=0; drop_pt_mismatch=0
+    kept=0; kept_no_match=0; drop_pt_mismatch=0
 
     for info in games:
         a = info["teamA"]["abbr"]; b = info["teamB"]["abbr"]
@@ -671,20 +681,20 @@ def filter_games_to_pt_day(games: list[dict], pt_day: date) -> tuple[list[dict],
                     matched_ev = ev; break
             if matched_ev: break
 
-        if not matched_ev:
-            drop_no_match += 1
-            log(f"[DBG] DROP (no ESPN match): {a}-{b}")
-            continue
-
-        dt = _espn_pt_start_dt(matched_ev)
-        if dt and dt.date() == pt_day:
-            kept += 1
-            out.append(info)
+        if matched_ev:
+            dt = _espn_pt_start_dt(matched_ev)
+            if dt and dt.date() == pt_day:
+                kept += 1
+                out.append(info)
+            else:
+                drop_pt_mismatch += 1
+                log(f"[DBG] DROP by ESPN PT start mismatch: {a}-{b} -> {dt.date() if dt else '??'} (need {pt_day})")
         else:
-            drop_pt_mismatch += 1
-            log(f"[DBG] DROP by ESPN PT start mismatch: {a}-{b} -> {dt.date() if dt else '??'} (need {pt_day})")
+            kept_no_match += 1
+            log(f"[DBG] KEEP (no ESPN match) by sports.ru: {a}-{b}")
+            out.append(info)
 
-    log(f"[DBG] FILTER PT-day strict: kept={kept} drop_no_match={drop_no_match} drop_pt_mismatch={drop_pt_mismatch}")
+    log(f"[DBG] FILTER PT-day soft: kept={kept} kept_no_match={kept_no_match} drop_pt_mismatch={drop_pt_mismatch}")
     return out, espn_pt, espn_all
 
 # -------- ESPN: добавим рекорды и (если надо) счёт --------
@@ -707,6 +717,7 @@ def enrich_scores_and_records_from_espn(
                 if ev: break
             if ev: break
         if not ev:
+            # рекорды останутся пустыми — ок
             continue
 
         info["records"] = {
@@ -714,7 +725,7 @@ def enrich_scores_and_records_from_espn(
             ev["away"]["abbr"]: ev["away"].get("record",""),
         }
 
-        # Страховка по счёту
+        # Страховка по счёту (если sports.ru дал мусор/ноль)
         totalA, totalB = A["score"], B["score"]
         if (totalA == 0 and totalB == 0) or (totalA > 160) or (totalB > 160) or (totalA + totalB > 280):
             if ev["home"]["abbr"] == A["abbr"]:
@@ -728,12 +739,24 @@ def build_post() -> str:
     games_all = fetch_sports_games_for_pt_day(d_pt)
     games, espn_pt_map, espn_all_map = filter_games_to_pt_day(games_all, d_pt)
 
-    # Передаём карты ESPN в обогащение, чтобы не перегружать и не рассинхронить сопоставления
+    # Обогащаем тем, что знаем из ESPN (рекорды + страховка счёта)
     enrich_scores_and_records_from_espn(
         games, d_pt,
         espn_map_pref=espn_pt_map,
         espn_map_fallback=espn_all_map
     )
+
+    # Если какие-то финалы ESPN по PT-дню не нашли себе пару на sports.ru — добавим «синтетические» блоки
+    have_keys = { frozenset([g["teamA"]["abbr"], g["teamB"]["abbr"]]) for g in games }
+    added = 0
+    for ev in espn_pt_map.values():
+        ev_key = frozenset([canon_abbr(ev["home"]["abbr"]), canon_abbr(ev["away"]["abbr"])])
+        if ev_key not in have_keys:
+            games.append(synthesize_game_from_espn(ev))
+            have_keys.add(ev_key)
+            added += 1
+    if DEBUG:
+        log(f"[DBG] ESPN synth added: {added}")
 
     title_count = len(games)
     title = (
