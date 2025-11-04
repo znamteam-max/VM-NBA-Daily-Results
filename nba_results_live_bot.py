@@ -4,25 +4,25 @@
 """
 NBA Results → Telegram (per game, instant)
 
-Поведение:
-• Как только игра завершается (по ESPN), бот формирует и отправляет ОДИН пост по этому матчу.
-• Игроки берутся со sports.ru (если уже доступны); иначе — быстрый пост без игроков (fallback ESPN).
-• Дубликаты исключаются: на каждую игру ESPN eventId пишется маркер .posted/event_<id>.done.
-• Дата игрового дня — по Pacific Time (PT), чтобы все матчи дня попадали в одно число.
-• Запускать по расписанию (например, каждые 3–5 минут) — он пришлёт только новенькие финалы.
+• Пост по матчу уходит сразу после статуса "completed" в ESPN.
+• Игроки тянутся со sports.ru, если уже есть таблицы; иначе — быстрый пост без игроков.
+• Анти-дубликат: .posted/event_<eventId>.done. Плюс починили коммит маркеров в workflow.
+• День — по PT (Pacific Time), чтобы все матчи дня были в одном числе.
+• Защита от «кривых» счётов со sports.ru: если подозрительно — берем счёт из ESPN.
+• Исправлена канонизация аббревиатур (в т.ч. UTAH→UTA) и замена custom emoji при 2–5 буквах.
 
 ENV:
-- TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID — обязательны (или ALT_CHAT_ID)
-- TEAM_EMOJI_JSON — JSON вида {"BOS":"<custom_emoji_id>", ...} (опционально)
-- REPORT_DATE_PT — YYYY-MM-DD, для тестов (опционально)
-- DEBUG_NBA=1 — подробные логи (опционально)
+- TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+- TEAM_EMOJI_JSON — {"BOS":"<custom_emoji_id>", ...}
+- REPORT_DATE_PT — YYYY-MM-DD (тест)
+- DEBUG_NBA=1 — подробные логи
 
 Тест-флаги:
-- SEND_TEST_MESSAGE=1 — отправить ping-сообщение и выйти.
-- LIST_EVENTS=1 — вывести в логи завершённые матчи за REPORT_DATE_PT и выйти.
-- ONLY_EVENT_ID=<id> — публиковать только этот eventId (для ретро-теста).
-- DRY_RUN=1 — ничего не отправлять в Telegram, только логи.
-- ALT_CHAT_ID=<id> — отправлять сообщения в альтернативный чат.
+- SEND_TEST_MESSAGE=1 — отправить ping и выйти
+- LIST_EVENTS=1 — вывести финалы за REPORT_DATE_PT и выйти
+- ONLY_EVENT_ID=<id> — публиковать только этот матч
+- DRY_RUN=1 — не отправлять в TG, только логи
+- ALT_CHAT_ID=<id> — слать в альтернативный чат
 """
 
 import os, sys, re, json
@@ -70,7 +70,7 @@ def make_session():
     ad = _mk_adapter()
     s.mount("https://", ad); s.mount("http://", ad)
     s.headers.update({
-        "User-Agent": "NBA-LiveResultsBot/1.1 (per-game; pt-day; espn-finish; sportsru-players; custom-emoji)",
+        "User-Agent": "NBA-LiveResultsBot/1.2 (per-game; pt-day; espn-finish; sportsru-players; custom-emoji; fix-scores)",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
         "Connection": "close",
     })
@@ -93,7 +93,7 @@ def pick_report_date_pacific_env() -> date:
         try: return date.fromisoformat(env)
         except Exception: pass
     now_pt = datetime.now(ZoneInfo("America/Los_Angeles"))
-    # до 06:00 PT считаем, что ещё вчерашний игровой день
+    # до 06:00 PT считаем вчера
     return now_pt.date() if now_pt.hour >= 6 else (now_pt.date() - timedelta(days=1))
 
 def espn_dates_for_pt_day(d_pt: date) -> list[date]:
@@ -101,7 +101,6 @@ def espn_dates_for_pt_day(d_pt: date) -> list[date]:
     start_pt = datetime(d_pt.year, d_pt.month, d_pt.day, 0, 0, tzinfo=tz_pt)
     end_pt   = datetime(d_pt.year, d_pt.month, d_pt.day, 23, 59, tzinfo=tz_pt)
     base = { start_pt.astimezone(tz_et).date(), end_pt.astimezone(tz_et).date() }
-    # + страховочные ±1 день по ET
     ext = set()
     for d in base:
         ext.add(d); ext.add(d - timedelta(days=1)); ext.add(d + timedelta(days=1))
@@ -131,36 +130,29 @@ TEAM_EMOJI_DEFAULT = {
     "TOR":"🦖","UTA":"🎷","WAS":"🧙",
 }
 
-# Канонизация и синонимы аббревиатур ESPN ↔ sports.ru
-_ABBR_CANON_SWAP = {"GS":"GSW","PHO":"PHX","CHO":"CHA","WSH":"WAS","UTH":"UTA","SA":"SAS","NO":"NOP","NY":"NYK","BRK":"BKN"}
-_ABBR_VARIANTS = {
-    "GSW":{"GSW","GS"}, "PHX":{"PHX","PHO"}, "CHA":{"CHA","CHO"}, "WAS":{"WAS","WSH"},
-    "UTA":{"UTA","UTH"}, "SAS":{"SAS","SA"}, "NOP":{"NOP","NO"}, "NYK":{"NYK","NY"}, "BKN":{"BKN","BRK"},
+# Канон. аббревиатур ESPN ↔ sports.ru (расширено)
+_ABBR_CANON_SWAP = {
+    "GS":"GSW","PHO":"PHX","CHO":"CHA","WSH":"WAS","UTH":"UTA","SA":"SAS","NO":"NOP","NY":"NYK","BRK":"BKN",
+    "UTAH":"UTA","PHILA":"PHI","PHIL":"PHI","NOLA":"NOP","LAKERS":"LAL","CLIPPERS":"LAC"
 }
 
 def canon_abbr(s: str | None) -> str:
     x = (s or "").upper().strip()
     return _ABBR_CANON_SWAP.get(x, x)
 
-def abbr_variants(s: str | None) -> set[str]:
-    c = canon_abbr(s); out = {c}
-    v = _ABBR_VARIANTS.get(c)
-    if v: out |= v
-    return out
-
 def load_custom_emoji():
     if not TEAM_EMOJI_JSON: return {}
     try:
         d = json.loads(TEAM_EMOJI_JSON)
         if isinstance(d, dict):
-            return {k.upper(): str(v) for k,v in d.items() if v}
+            return {canon_abbr(k): str(v) for k,v in d.items() if v}
     except Exception:
         pass
     return {}
 CUSTOM_EMOJI = load_custom_emoji()
 
 def emoji_token(abbr: str) -> str:
-    return f"{{EMO:({(abbr or '').upper()})}}"
+    return f"{{EMO:({canon_abbr(abbr)})}}"
 
 # -------- SPORTS.RU --------
 def day_url(d: date) -> str:
@@ -290,16 +282,7 @@ def _extract_total_score_from_page(soup: BeautifulSoup) -> tuple[int,int]:
             if i >= 0:
                 a,b = pairs[i]; log(f"[DBG] SCORE FINAL-BEFORE-FINISHED -> {a}:{b}"); return a,b
             a,b = pairs[-1]; log(f"[DBG] SCORE FALLBACK-LASTPAIR -> {a}:{b}"); return a,b
-    # защитный финал
-    pairs_all = []
-    for mm in re.finditer(r"(\d{1,3})\s*:\s*(\d{1,3})", txt):
-        a = int(mm.group(1)); b = int(mm.group(2))
-        pairs_all.append((a, b, mm.start()))
-    plausible = [ (a,b) for (a,b,_) in pairs_all if (a+b) >= 140 ]
-    if plausible:
-        a,b = max(plausible, key=lambda p: p[0]+p[1])
-        log(f"[DBG] SCORE MAXPAIR -> {a}:{b}")
-        return a,b
+    # если не нашли — не пытаемся угадывать (чтобы не ловить 23:59)
     return (0,0)
 
 def parse_sports_match(url: str) -> dict | None:
@@ -339,7 +322,6 @@ def fetch_sports_games_for_pt_day(d_pt: date) -> list[dict]:
             info = parse_sports_match(url)
             if info:
                 all_games.append(info)
-    # дедуп по URL
     uniq={}
     for g in all_games: uniq[g["url"]] = g
     return list(uniq.values())
@@ -436,7 +418,7 @@ def espn_completed_events_for_pt_day(d_pt: date) -> list[dict]:
     log(f"[DBG] ESPN completed for {d_pt}: {len(out)}")
     return out
 
-# -------- MATCHING & BUILD --------
+# -------- MATCHING & FIXUPS --------
 def find_sportsru_match_for_event(sru_games: list[dict], e: dict) -> dict | None:
     eh, ea = canon_abbr(e["home"]["abbr"]), canon_abbr(e["away"]["abbr"])
     ev_key = frozenset([eh, ea])
@@ -454,7 +436,7 @@ def find_sportsru_match_for_event(sru_games: list[dict], e: dict) -> dict | None
         if (A["abbr"]==eh and A["score"]==e["home"]["score"] and B["score"]==e["away"]["score"]) or \
            (B["abbr"]==eh and B["score"]==e["home"]["score"] and A["score"]==e["away"]["score"]):
             return g
-    # иначе берём тот, где уже есть игроки (больше строк)
+    # иначе — тот, где больше игроков (скорее всего финальная таблица уже есть)
     best = max(candidates, key=lambda g: len(g["players"].get(g["teamA"]["name"],[]))+len(g["players"].get(g["teamB"]["name"],[])))
     return best
 
@@ -463,18 +445,37 @@ def synthesize_game_from_espn(e: dict) -> dict:
     Babbr = canon_abbr(e["away"]["abbr"])
     Aname = ABBR_TO_RU.get(Aabbr, Aabbr)
     Bname = ABBR_TO_RU.get(Babbr, Babbr)
-    info = {
+    return {
         "teamA": {"name": Aname, "abbr": Aabbr, "score": int(e["home"]["score"])},
         "teamB": {"name": Bname, "abbr": Babbr, "score": int(e["away"]["score"])},
-        "players": {Aname: [], Bname: []},  # игроков нет — sports.ru ещё не готов
+        "players": {Aname: [], Bname: []},
         "records": {
             Aabbr: e["home"].get("record", ""),
             Babbr: e["away"].get("record", "")
         },
         "url": f"espn:{e.get('eventId','')}",
     }
-    return info
 
+def _score_suspicious(a: int, b: int) -> bool:
+    # Явные мусоры от sports.ru (0:0, 200+, 23:59-ловушки и т.д.)
+    if a is None or b is None: return True
+    if a == 0 and b == 0: return True
+    if a >= 200 or b >= 200: return True
+    s = a + b
+    if s < 60 or s > 300: return True
+    return False
+
+def fix_scores_with_espn(info: dict, e: dict):
+    A,B = info["teamA"], info["teamB"]
+    a,b = int(A.get("score") or 0), int(B.get("score") or 0)
+    if _score_suspicious(a,b):
+        # подменяем на ESPN
+        if canon_abbr(e["home"]["abbr"]) == A["abbr"]:
+            A["score"] = int(e["home"]["score"]); B["score"] = int(e["away"]["score"])
+        else:
+            A["score"] = int(e["away"]["score"]); B["score"] = int(e["home"]["score"])
+
+# -------- FORMAT --------
 def initials_ru(full: str) -> str:
     parts = [p for p in re.split(r"\s+", (full or "").strip()) if p]
     if not parts: return full or ""
@@ -538,6 +539,8 @@ def pick_team_players(abbr: str, rows: list[dict]) -> list[tuple[dict,bool,bool]
             if second_ok(p): out.append((p, False, False)); break
     return out[:2]
 
+def sp(s: str) -> str: return f'<span class="tg-spoiler">{s}</span>'
+
 def format_player_regular(p: dict, bold=False) -> str:
     name = initials_ru(p["name"])
     if bold: name = f"<b>{name}</b>"
@@ -555,8 +558,6 @@ def format_player_special(p: dict) -> str:
     chosen=stats[:3]
     return f"{name}: " + ", ".join(ru_forms(k,v) for k,v in chosen) + hot_mark(p)
 
-def sp(s: str) -> str: return f'<span class="tg-spoiler">{s}</span>'
-
 def format_score_line(name_ru: str, abbr: str, score: int, winner: bool, record: str) -> str:
     score_txt = f"<b>{score}</b>" if winner else f"{score}"
     if record: score_txt += f" ({record})"
@@ -568,10 +569,10 @@ def build_block(info: dict) -> str:
     recB = info.get("records", {}).get(B["abbr"], "")
     a_win = A["score"] > B["score"]; b_win = B["score"] > A["score"]
     head = (
-        f"{format_score_line(A['name'], A['abbr'], A['score'], a_win, recA)}\n"
-        f"{format_score_line(B['name'], B['abbr'], B['score'], b_win, recB)}\n\n"
+        f"{format_score_line(ABBR_TO_RU.get(A['abbr'], A['name']), A['abbr'], A['score'], a_win, recA)}\n"
+        f"{format_score_line(ABBR_TO_RU.get(B['abbr'], B['name']), B['abbr'], B['score'], b_win, recB)}\n\n"
     )
-    rowsA = info["players"].get(A["name"], []); rowsB = info["players"].get(B["name"], [])
+    rowsA = info["players"].get(ABBR_TO_RU.get(A["abbr"], A["name"]), []); rowsB = info["players"].get(ABBR_TO_RU.get(B["abbr"], B["name"]), [])
     al = [sp(format_player_special(p) if det else format_player_regular(p, bold))
           for (p,bold,det) in pick_team_players(A["abbr"], rowsA)]
     bl = [sp(format_player_special(p) if det else format_player_regular(p, bold))
@@ -591,11 +592,12 @@ def tg_send(text: str):
         raise RuntimeError("TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID/ALT_CHAT_ID не заданы")
     chat_id = ALT_CHAT_ID or CHAT_ID
 
-    # замена {EMO:(ABBR)} на кастом-эмодзи entity или дефолт
+    # {EMO:(ABBR)} → custom emoji / default
     entities=[]
     out_parts=[]; last=0
-    for m in re.finditer(r"\{\s*EMO:\s*\(([A-Z]{2,3})\)\s*\}", text):
-        abbr = m.group(1).upper()
+    for m in re.finditer(r"\{\s*EMO:\s*\(([A-Z]{2,5})\)\s*\}", text):
+        raw = m.group(1).upper()
+        abbr = canon_abbr(raw)
         out_parts.append(text[last:m.start()])
         start_offset = _u16len("".join(out_parts))
         if abbr in CUSTOM_EMOJI:
@@ -613,7 +615,7 @@ def tg_send(text: str):
     final_text = "".join(out_parts)
 
     if DRY_RUN:
-        log("[DRY tg_send] " + final_text[:120].replace("\n"," ") + ("..." if len(final_text)>120 else ""))
+        log("[DRY tg_send] " + final_text[:160].replace("\n"," ") + ("..." if len(final_text)>160 else ""))
         return
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -625,7 +627,7 @@ def tg_send(text: str):
 
 # -------- MAIN --------
 def main():
-    # PING-тест
+    # PING
     if SEND_TEST_MSG:
         tg_send(f"✅ NBA Live bot ping {datetime.now().isoformat()}")
         print("OK ping")
@@ -634,7 +636,7 @@ def main():
     d_pt = pick_report_date_pacific_env()
     Path(".posted").mkdir(parents=True, exist_ok=True)
 
-    # Список матчей и выход (для проверки ESPN)
+    # LIST
     if LIST_EVENTS:
         evs = espn_completed_events_for_pt_day(d_pt)
         for e in evs:
@@ -643,12 +645,12 @@ def main():
         print("OK list")
         return
 
-    # 1) ESPN завершённые события
+    # ESPN финалы
     evs = espn_completed_events_for_pt_day(d_pt)
     if ONLY_EVENT_ID:
         evs = [e for e in evs if e["eventId"] == ONLY_EVENT_ID]
 
-    # 2) sports.ru для сопоставления игроков
+    # sports.ru
     sru_games = fetch_sports_games_for_pt_day(d_pt)
 
     posted_now = 0
@@ -656,24 +658,30 @@ def main():
         eid = e["eventId"]
         marker = Path(f".posted/event_{eid}.done")
         if marker.exists():
-            continue  # уже отправляли
+            log(f"[DBG] SKIP already posted {eid}")
+            continue
 
         g = find_sportsru_match_for_event(sru_games, e)
         info = g if g else synthesize_game_from_espn(e)
+        info["teamA"]["abbr"] = canon_abbr(info["teamA"]["abbr"])
+        info["teamB"]["abbr"] = canon_abbr(info["teamB"]["abbr"])
         info["records"] = {
             canon_abbr(e["home"]["abbr"]): e["home"].get("record",""),
             canon_abbr(e["away"]["abbr"]): e["away"].get("record",""),
         }
+        # перепроверяем счёт
+        fix_scores_with_espn(info, e)
 
         text = build_block(info)
 
         if DRY_RUN:
-            log(f"[DRY] would post event {eid}: {canon_abbr(e['away']['abbr'])}@{canon_abbr(e['home']['abbr'])}")
+            log(f"[DRY] would post event {eid}: {canon_abbr(e['away']['abbr'])}@{canon_abbr(e['home']['abbr'])}  "
+                f"{info['teamA']['score']}-{info['teamB']['score']}")
         else:
             tg_send(text)
             marker.write_text(datetime.now().isoformat())
             posted_now += 1
-            log(f"[DBG] posted event {eid}")
+            log(f"[DBG] posted event {eid} -> {info['teamA']['score']}-{info['teamB']['score']}")
 
     print(f"OK posted={posted_now}")
 
