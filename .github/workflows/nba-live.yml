@@ -10,7 +10,7 @@ on:
         type: boolean
         default: false
       list_events:
-        description: "Вывести в логи список завершенных матчей за REPORT_DATE_PT и выйти"
+        description: "Вывести список завершённых матчей за REPORT_DATE_PT и выйти"
         type: boolean
         default: false
       report_date_pt:
@@ -28,13 +28,17 @@ on:
         type: boolean
         default: false
       alt_chat_id:
-        description: "Отправить тест в другой чат (например, себе)"
+        description: "Отправить тест в другой чат (numeric chat id)"
         type: string
         required: false
         default: ""
 
 permissions:
   contents: write
+
+concurrency:
+  group: nba-live
+  cancel-in-progress: true
 
 jobs:
   run:
@@ -68,36 +72,41 @@ jobs:
           ONLY_EVENT_ID: ${{ inputs.only_event_id }}
           DRY_RUN: ${{ inputs.dry_run }}
           ALT_CHAT_ID: ${{ inputs.alt_chat_id }}
+          # маркеры пишем в posted/
+          MARKER_DIR: "posted"
         run: |
           python -u nba_results_live_bot.py
 
- - name: Commit markers (if any)
-  if: ${{ !inputs.dry_run && !inputs.send_test_message && !inputs.list_events }}
-  run: |
-    git config --global user.name "github-actions"
-    git config --global user.email "actions@github.com"
-    git pull --rebase
+      - name: Commit markers (posted/)
+        env:
+          SEND_TEST_MESSAGE: ${{ inputs.send_test_message }}
+          LIST_EVENTS: ${{ inputs.list_events }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        shell: bash
+        run: |
+          # Пропустить коммит в режимах ping/list/dry_run
+          if [ "${SEND_TEST_MESSAGE}" = "true" ] || [ "${LIST_EVENTS}" = "true" ] || [ "${DRY_RUN}" = "true" ]; then
+            echo "Skip committing markers (test/list/dry-run mode)."
+            exit 0
+          fi
 
-    # Покажем, что реально изменилось (для отладки)
-    git status --porcelain || true
+          git config --global user.name "github-actions"
+          git config --global user.email "actions@github.com"
 
-    # Если есть каталог с маркерами — добавляем ВСЕ (включая неотслеживаемые)
-    if [ -d posted ]; then
-      if [ -n "$(git status --porcelain posted)" ]; then
-        git add -A posted
-        git commit -m "NBA live markers $(date -u +'%Y-%m-%d %H:%M:%S')"
-        git push
-      else
-        echo "No new markers in posted/"
-      fi
-    elif [ -d .posted ]; then
-      if [ -n "$(git status --porcelain .posted)" ]; then
-        git add -A .posted
-        git commit -m "NBA live markers $(date -u +'%Y-%m-%d %H:%M:%S')"
-        git push
-      else
-        echo "No new markers in .posted/"
-      fi
-    else
-      echo "No marker directory present."
-    fi
+          # Обновим локальную ветку
+          git pull --rebase
+
+          # Нет каталога с маркерами — нечего коммитить
+          if [ ! -d posted ]; then
+            echo "No posted/ directory; nothing to commit."
+            exit 0
+          fi
+
+          # Есть ли изменения в posted/ (включая новые файлы)
+          if [ -n "$(git status --porcelain posted)" ]; then
+            git add -A posted
+            git commit -m "NBA live markers $(date -u +'%Y-%m-%d %H:%M:%S')"
+            git push
+          else
+            echo "No new markers in posted/."
+          fi
