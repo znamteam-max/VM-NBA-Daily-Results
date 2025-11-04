@@ -71,16 +71,33 @@ jobs:
         run: |
           python -u nba_results_live_bot.py
 
-      - name: Commit .posted markers (if any)
-        if: ${{ !inputs.dry_run && !inputs.send_test_message && !inputs.list_events }}
-        run: |
-          git config --global user.name "github-actions"
-          git config --global user.email "actions@github.com"
-          git pull --rebase
-          if [ -d .posted ] && ! git diff --quiet -- .posted; then
-            git add .posted
-            git commit -m "NBA live posted $(date -u +'%Y-%m-%d %H:%M:%S')"
-            git push
-          else
-            echo "No new markers to commit."
-          fi
+ - name: Commit markers (if any)
+  if: ${{ !inputs.dry_run && !inputs.send_test_message && !inputs.list_events }}
+  run: |
+    git config --global user.name "github-actions"
+    git config --global user.email "actions@github.com"
+    git pull --rebase
+
+    # Покажем, что реально изменилось (для отладки)
+    git status --porcelain || true
+
+    # Если есть каталог с маркерами — добавляем ВСЕ (включая неотслеживаемые)
+    if [ -d posted ]; then
+      if [ -n "$(git status --porcelain posted)" ]; then
+        git add -A posted
+        git commit -m "NBA live markers $(date -u +'%Y-%m-%d %H:%M:%S')"
+        git push
+      else
+        echo "No new markers in posted/"
+      fi
+    elif [ -d .posted ]; then
+      if [ -n "$(git status --porcelain .posted)" ]; then
+        git add -A .posted
+        git commit -m "NBA live markers $(date -u +'%Y-%m-%d %H:%M:%S')"
+        git push
+      else
+        echo "No new markers in .posted/"
+      fi
+    else
+      echo "No marker directory present."
+    fi
