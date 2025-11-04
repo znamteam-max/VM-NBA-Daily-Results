@@ -2,7 +2,7 @@ name: NBA Live Results (per game)
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # каждые 5 минут
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       send_test_message:
@@ -77,9 +77,10 @@ jobs:
           git config --global user.name "github-actions"
           git config --global user.email "actions@github.com"
           git pull --rebase
-          if ! git diff --quiet -- .posted; then
+          if [ -d .posted ] && ! git diff --quiet -- .posted; then
             git add .posted
             git commit -m "NBA live posted $(date -u +'%Y-%m-%d %H:%M:%S')"
             git push
           else
             echo "No new markers to commit."
+          fi
