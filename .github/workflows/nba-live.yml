@@ -45,10 +45,10 @@ on:
 permissions:
   contents: write
 
-# Never cancel a run that may already have sent a result but has not committed
-# its marker yet. New scheduled runs wait for the previous one instead.
+# Production schedule/manual runs serialize against each other. Push smoke tests
+# use a separate group so they can never cancel or delay live publishing.
 concurrency:
-  group: nba-live
+  group: ${{ github.event_name == 'push' && 'nba-live-smoke' || 'nba-live' }}
   cancel-in-progress: false
 
 jobs:
@@ -84,9 +84,9 @@ jobs:
           SEND_TEST_MESSAGE: ${{ inputs.send_test_message && '1' || '' }}
           LIST_EVENTS: ${{ inputs.list_events && '1' || '' }}
           ONLY_EVENT_ID: ${{ inputs.only_event_id }}
-          # Pushes are always smoke-tested without sending anything.
-          DRY_RUN: ${{ github.event_name == 'push' && '1' || (inputs.dry_run && '1' || '') }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
           ALT_CHAT_ID: ${{ inputs.alt_chat_id }}
+          SMOKE_TEST: ${{ github.event_name == 'push' && '1' || '' }}
           MARKER_DIR: "posted"
         shell: bash
         run: |
@@ -129,13 +129,14 @@ jobs:
         env:
           SEND_TEST_MESSAGE: ${{ inputs.send_test_message && '1' || '' }}
           LIST_EVENTS: ${{ inputs.list_events && '1' || '' }}
-          DRY_RUN: ${{ github.event_name == 'push' && '1' || (inputs.dry_run && '1' || '') }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
           ALT_CHAT_ID: ${{ inputs.alt_chat_id }}
+          SMOKE_TEST: ${{ github.event_name == 'push' && '1' || '' }}
         shell: bash
         run: |
-          # No marker writes for explicit ping/list/dry-run/alternate-chat modes.
-          if [ "$SEND_TEST_MESSAGE" = "1" ] || [ "$LIST_EVENTS" = "1" ] || [ "$DRY_RUN" = "1" ] || [ -n "$ALT_CHAT_ID" ]; then
-            echo "Skip committing markers (test/list/dry-run/alternate-chat mode)."
+          # No marker writes for explicit ping/list/dry-run/alternate-chat/smoke modes.
+          if [ "$SEND_TEST_MESSAGE" = "1" ] || [ "$LIST_EVENTS" = "1" ] || [ "$DRY_RUN" = "1" ] || [ -n "$ALT_CHAT_ID" ] || [ "$SMOKE_TEST" = "1" ]; then
+            echo "Skip committing markers (test/list/dry-run/alternate-chat/smoke mode)."
             exit 0
           fi
 
