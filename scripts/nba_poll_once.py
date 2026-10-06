@@ -12,8 +12,9 @@ full-day crawl.
 from __future__ import annotations
 
 import os
+import re
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -122,7 +123,6 @@ def _is_nba_sofa_event(ev: dict) -> bool:
 
 
 def _sofa_events_for_pt_day(d_pt) -> list[dict]:
-    """Fetch the two UTC dates that can contain starts from one Pacific day."""
     tz_pt = ZoneInfo("America/Los_Angeles")
     tz_utc = ZoneInfo("UTC")
     start = datetime(d_pt.year, d_pt.month, d_pt.day, 0, 0, tzinfo=tz_pt).astimezone(tz_utc)
@@ -159,6 +159,7 @@ def _fast_soup(url: str):
         }
         r = requests.get(url, headers=headers, timeout=4)
         if r.status_code != 200:
+            bot.log(f"[DBG] Sports HTTP {r.status_code} {url}")
             return None
         return bot.BeautifulSoup(r.text, "html.parser")
     except Exception as exc:
@@ -178,16 +179,71 @@ def _nearby_text(anchor) -> str:
 
     node = anchor
     best = anchor.get_text(" ", strip=True)
-    for _ in range(4):
+    for _ in range(5):
         node = getattr(node, "parent", None)
         if node is None or not getattr(node, "get_text", None):
             break
         txt = node.get_text(" ", strip=True)
-        if 0 < len(txt) <= 1200:
+        if 0 < len(txt) <= 1800:
             best = txt
-        elif len(txt) > 1200:
+        elif len(txt) > 1800:
             break
     return best
+
+
+def _nba_team_names_in_text(text: str) -> list[str]:
+    low = text.lower()
+    return [name for name in bot.TEAM_RU_TO_ABBR if name.lower() in low]
+
+
+def _sports_debug_probe(d_pt) -> None:
+    """Smoke-only: inspect compact NBA cards/pages without the old 150-page crawl."""
+    candidates = []
+    seen = set()
+    for d_msk in bot.sportsru_dates_for_pt_day(d_pt):
+        url = bot.day_url(d_msk)
+        soup = _fast_soup(url)
+        if not soup:
+            continue
+        print(f"SPORTS DAY {d_msk} title={soup.title.get_text(' ', strip=True)[:180] if soup.title else ''}")
+        for a in soup.find_all("a", href=True):
+            href = a.get("href") or ""
+            if "/basketball/match/" not in href:
+                continue
+            match_url = bot._normalize_match_url(href)
+            if match_url in seen:
+                continue
+            ctx = _nearby_text(a)
+            teams = _nba_team_names_in_text(ctx)
+            if len(set(teams)) < 2:
+                continue
+            seen.add(match_url)
+            candidates.append((match_url, ctx))
+            compact = re.sub(r"\s+", " ", ctx).strip()[:700]
+            print(f"SPORTS CARD teams={teams[:4]} url={match_url} ctx={compact}")
+
+    print(f"SPORTS NBA CANDIDATES={len(candidates)}")
+    for match_url, _ctx in candidates[:12]:
+        soup = _fast_soup(match_url)
+        if not soup:
+            continue
+        meta = soup.find("meta", attrs={"property": "og:title"})
+        title = (meta.get("content") if meta and meta.get("content") else (soup.title.get_text(" ", strip=True) if soup.title else ""))
+        text = soup.get_text(" ", strip=True)
+        low = text.lower()
+        pairs = re.findall(r"(?<!\d)(\d{1,3})\s*[:\-]\s*(\d{1,3})(?!\d)", text)
+        plausible = []
+        for aa, bb in pairs:
+            x, y = int(aa), int(bb)
+            if 50 <= x <= 199 and 50 <= y <= 199:
+                plausible.append((x, y))
+                if len(plausible) >= 8:
+                    break
+        print(
+            f"SPORTS PAGE url={match_url} title={title[:260]} "
+            f"finished={'заверш' in low} final_words={('окончен' in low) or ('закончен' in low)} "
+            f"plausible_scores={plausible} textlen={len(text)}"
+        )
 
 
 def _fast_sports_games_for_events(events: list[dict], d_pt) -> list[dict]:
@@ -237,8 +293,6 @@ def _fast_sports_games_for_events(events: list[dict], d_pt) -> list[dict]:
     try:
         for eid, target in targets.items():
             found = False
-            # Usually exactly one URL. Cap at 3 so markup oddities can never
-            # recreate the old 70+ page crawl.
             for url in target["urls"][:3]:
                 if url in parsed_urls:
                     continue
@@ -269,27 +323,13 @@ def _run_smoke(d_pt) -> None:
     espn = _all_espn_events_for_pt_day(d_pt)
     sofa = _sofa_events_for_pt_day(d_pt)
     sofa_finished = [e for e in sofa if (e.get("status") or {}).get("type") == "finished"]
-
-    sofa_sample = []
-    for e in sofa[:10]:
-        a = e.get("awayTeam") or {}
-        h = e.get("homeTeam") or {}
-        sofa_sample.append(
-            f"{e.get('id')}:{a.get('name')}@{h.get('name')}:"
-            f"status={(e.get('status') or {}).get('type')}:"
-            f"score={(e.get('awayScore') or {}).get('current')}-{(e.get('homeScore') or {}).get('current')}"
-        )
-
-    # Probe at most one ESPN game card so smoke runs stay short and never send.
     espn_done = [e for e in espn if e.get("completed")]
-    probe = espn_done[-1:] or espn[:1]
-    enriched = _fast_sports_games_for_events(probe, d_pt) if probe else []
+
     print(
-        f"OK smoke date_pt={d_pt} espn_events={len(espn)} espn_completed={len(espn_done)} "
-        f"sofa_events={len(sofa)} sofa_finished={len(sofa_finished)} sports_match={len(enriched)}"
+        f"OK source probe date_pt={d_pt} espn_events={len(espn)} espn_completed={len(espn_done)} "
+        f"sofa_events={len(sofa)} sofa_finished={len(sofa_finished)}"
     )
-    if sofa_sample:
-        print("SOFA sample: " + " | ".join(sofa_sample))
+    _sports_debug_probe(d_pt)
 
 
 def main() -> None:
@@ -315,9 +355,6 @@ def main() -> None:
     ids = ",".join(e["eventId"] for e in pending)
     print(f"NEW finals={len(pending)} event_ids={ids}; running targeted publisher")
 
-    # Route legacy main() through the already-fetched current finals and only
-    # targeted Sports.ru pages. This keeps its Telegram formatting/markers while
-    # avoiding a second ESPN fetch and the old full-day crawl.
     bot.espn_completed_events_for_pt_day = lambda _d: completed
     bot.fetch_sports_games_for_pt_day = lambda _d: _fast_sports_games_for_events(pending, d_pt)
     bot.main()
