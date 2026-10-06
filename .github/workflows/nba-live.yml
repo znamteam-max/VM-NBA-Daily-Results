@@ -2,10 +2,14 @@ name: NBA Live Results (per game)
 
 on:
   schedule:
-    # GitHub cron cannot run more often than every 5 minutes.
-    # Moscow is UTC+3: these starts cover 22:00-09:59 MSK, while the job
-    # itself performs five checks ~60 seconds apart inside each 5-minute slot.
-    - cron: "*/5 19-23,0-6 * * *"
+    # GitHub Actions cron has a 5-minute minimum. Each regular scheduled run
+    # fills its own 5-minute slot with five start-to-start checks ~60s apart.
+    # Keep the schedule in Moscow time explicitly so the requirement is obvious.
+    - cron: "*/5 22-23,0-9 * * *"
+      timezone: "Europe/Moscow"
+    # Exact final boundary check at 10:00 MSK (one poll only, handled below).
+    - cron: "0 10 * * *"
+      timezone: "Europe/Moscow"
   push:
     branches: [main]
     paths:
@@ -96,6 +100,13 @@ jobs:
             exit $?
           fi
 
+          # 10:00 MSK is the inclusive final boundary: exactly one last check.
+          if [ "${{ github.event.schedule }}" = "0 10 * * *" ]; then
+            echo "=== final 10:00 MSK poll ==="
+            python -u scripts/nba_poll_once.py
+            exit $?
+          fi
+
           # Scheduled cron fires every 5 minutes; fill that interval with five
           # start-to-start minute checks. If one tick is slow, the next starts
           # immediately rather than adding another 60-second delay.
@@ -119,7 +130,7 @@ jobs:
 
           echo "Minute polling finished; failed_ticks=${failures}/5"
           # A transient failed tick is recovered by the following minute.
-          # Mark the job failed only if ESPN/bot failed for the entire slot.
+          # Mark the job failed only if every tick in the slot failed.
           if [ "$failures" -eq 5 ]; then
             exit 1
           fi
