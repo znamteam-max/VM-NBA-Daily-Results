@@ -16,6 +16,7 @@ on:
       - ".github/workflows/nba-live.yml"
       - "nba_results_live_bot.py"
       - "scripts/nba_poll_once.py"
+      - "scripts/nba_poll_once_v2.py"
   workflow_dispatch:
     inputs:
       send_test_message:
@@ -96,14 +97,14 @@ jobs:
         run: |
           # Manual dispatch and push smoke-test = one intentional check only.
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "push" ]; then
-            python -u scripts/nba_poll_once.py
+            python -u scripts/nba_poll_once_v2.py
             exit $?
           fi
 
           # 10:00 MSK is the inclusive final boundary: exactly one last check.
           if [ "${{ github.event.schedule }}" = "0 10 * * *" ]; then
             echo "=== final 10:00 MSK poll ==="
-            python -u scripts/nba_poll_once.py
+            python -u scripts/nba_poll_once_v2.py
             exit $?
           fi
 
@@ -114,7 +115,7 @@ jobs:
           for i in 1 2 3 4 5; do
             started=$(date +%s)
             echo "=== minute poll ${i}/5 at $(date -u +'%Y-%m-%dT%H:%M:%SZ') ==="
-            if ! python -u scripts/nba_poll_once.py; then
+            if ! python -u scripts/nba_poll_once_v2.py; then
               failures=$((failures + 1))
               echo "Poll ${i} failed; continuing to next minute."
             fi
