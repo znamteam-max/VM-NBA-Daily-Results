@@ -3,10 +3,10 @@
 
 """Fast one-minute guard for NBA live results.
 
-The scheduled workflow calls this every minute. A lightweight official source
-is used as the finish signal; Sports.ru is queried only for specific newly
-finished games, so player-stat enrichment can never turn a minute poll into a
-full-day crawl.
+The scheduled workflow calls this every minute. ESPN is queried across NBA
+season types (preseason/regular/postseason) as the lightweight finish signal.
+Sports.ru is queried only for specific newly finished games, so player-stat
+enrichment can never turn a minute poll into a full-day crawl.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ import nba_results_live_bot as bot  # noqa: E402
 
 
 SMOKE_TEST = os.getenv("SMOKE_TEST", "").strip().lower() in {"1", "true", "yes", "on"}
-NBA_SCHEDULE_URL = "https://cdn.nba.com/static/json/staticData/scheduleLeagueV2_1.json"
+SEASON_TYPES = ("1", "2", "3")  # preseason, regular season, postseason
 
 
 def _manual_or_test_mode() -> bool:
@@ -51,10 +51,28 @@ def _manual_or_test_mode() -> bool:
     )
 
 
+def _fetch_espn_events_for_day_all_types(d) -> list[dict]:
+    """Use the existing parser, but explicitly include every NBA season type."""
+    base = bot.ESPN_SB
+    out = []
+    seen = set()
+    try:
+        for season_type in SEASON_TYPES:
+            bot.ESPN_SB = base + f"&seasontype={season_type}"
+            for e in bot.fetch_espn_events_for_day(d):
+                eid = e.get("eventId")
+                if eid and eid not in seen:
+                    seen.add(eid)
+                    out.append(e)
+    finally:
+        bot.ESPN_SB = base
+    return out
+
+
 def _all_espn_events_for_pt_day(d_pt):
     raw = []
     for d in bot.espn_dates_for_pt_day(d_pt):
-        raw.extend(bot.fetch_espn_events_for_day(d))
+        raw.extend(_fetch_espn_events_for_day_all_types(d))
     out = []
     seen = set()
     for e in raw:
@@ -68,29 +86,11 @@ def _all_espn_events_for_pt_day(d_pt):
     return out
 
 
-def _fetch_nba_schedule_games_for_day(d_pt) -> list[dict]:
-    """Return raw official NBA schedule entries for an NBA calendar date."""
-    try:
-        r = requests.get(
-            NBA_SCHEDULE_URL,
-            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.nba.com/"},
-            timeout=8,
-        )
-        r.raise_for_status()
-        data = r.json()
-    except Exception as exc:
-        bot.log(f"[DBG] NBA schedule fetch failed: {exc!r}")
-        return []
-
-    target = d_pt.strftime("%m/%d/%Y")
-    league = data.get("leagueSchedule") or {}
-    out = []
-    for block in league.get("gameDates") or []:
-        raw_date = str(block.get("gameDate") or "")
-        if not raw_date.startswith(target):
-            continue
-        out.extend(block.get("games") or [])
-    return out
+def _completed_events_for_pt_day(d_pt) -> list[dict]:
+    events = _all_espn_events_for_pt_day(d_pt)
+    completed = [e for e in events if e.get("completed")]
+    bot.log(f"[DBG] ESPN all-season-types completed for {d_pt}: {len(completed)} / events={len(events)}")
+    return completed
 
 
 def _fast_soup(url: str):
@@ -201,7 +201,7 @@ def _fast_sports_games_for_events(events: list[dict], d_pt) -> list[dict]:
                     bot.log(f"[DBG] fast Sports.ru matched {eid} -> {url}")
                     break
             if not found:
-                bot.log(f"[DBG] fast Sports.ru miss {eid}; score-only quick post will be used")
+                bot.log(f"[DBG] fast Sports.ru miss {eid}; ESPN score-only quick post will be used")
     finally:
         bot._soup = original_soup
 
@@ -209,26 +209,24 @@ def _fast_sports_games_for_events(events: list[dict], d_pt) -> list[dict]:
 
 
 def _run_smoke(d_pt) -> None:
-    espn_events = _all_espn_events_for_pt_day(d_pt)
-    espn_completed = [e for e in espn_events if e.get("completed")]
+    events = _all_espn_events_for_pt_day(d_pt)
+    completed = [e for e in events if e.get("completed")]
+    sample = []
+    for e in events[:10]:
+        sample.append(
+            f"{e.get('eventId')}:{e['away']['abbr']}@{e['home']['abbr']}:"
+            f"{e['away']['score']}-{e['home']['score']}:done={e.get('completed')}"
+        )
 
-    nba_games = _fetch_nba_schedule_games_for_day(d_pt)
-    nba_completed = [g for g in nba_games if int(g.get("gameStatus") or 0) == 3]
-    nba_sample = []
-    for g in nba_games[:8]:
-        away = (g.get("awayTeam") or {}).get("teamTricode") or "?"
-        home = (g.get("homeTeam") or {}).get("teamTricode") or "?"
-        nba_sample.append(f"{g.get('gameId')}:{away}@{home}:s={g.get('gameStatus')}:{g.get('gameStatusText')}")
-
-    # Probe Sports.ru only against an ESPN event here; never send anything.
-    probe = espn_completed[-1:] or espn_events[:1]
+    # Probe at most one actual game card so smoke runs stay short and never send.
+    probe = completed[-1:] or events[:1]
     enriched = _fast_sports_games_for_events(probe, d_pt) if probe else []
     print(
-        f"OK smoke date_pt={d_pt} espn_events={len(espn_events)} espn_completed={len(espn_completed)} "
-        f"nba_games={len(nba_games)} nba_completed={len(nba_completed)} sports_match={len(enriched)}"
+        f"OK smoke date_pt={d_pt} espn_events={len(events)} espn_completed={len(completed)} "
+        f"sports_match={len(enriched)}"
     )
-    if nba_sample:
-        print("NBA sample: " + " | ".join(nba_sample))
+    if sample:
+        print("ESPN sample: " + " | ".join(sample))
 
 
 def main() -> None:
@@ -244,7 +242,7 @@ def main() -> None:
         return
 
     Path(bot.MARKER_DIR).mkdir(parents=True, exist_ok=True)
-    completed = bot.espn_completed_events_for_pt_day(d_pt)
+    completed = _completed_events_for_pt_day(d_pt)
     pending = [e for e in completed if bot.read_marker_state(e["eventId"]) is None]
 
     if not pending:
@@ -254,8 +252,10 @@ def main() -> None:
     ids = ",".join(e["eventId"] for e in pending)
     print(f"NEW finals={len(pending)} event_ids={ids}; running targeted publisher")
 
-    # Replace the old full-day Sports.ru crawl only for this production tick.
-    # The legacy publisher still owns formatting, Telegram entities and markers.
+    # Route legacy main() through the already-fetched current finals and only
+    # targeted Sports.ru pages. This keeps its Telegram formatting/markers while
+    # avoiding a second ESPN fetch and the old full-day crawl.
+    bot.espn_completed_events_for_pt_day = lambda _d: completed
     bot.fetch_sports_games_for_pt_day = lambda _d: _fast_sports_games_for_events(pending, d_pt)
     bot.main()
 
