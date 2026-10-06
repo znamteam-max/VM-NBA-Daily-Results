@@ -50,7 +50,6 @@ on:
       - "scripts/nba_poll_once.py"
       - "scripts/nba_poll_once_v2.py"
       - "scripts/persist_nba_markers.sh"
-      - ".live_test_once"
 
 permissions:
   contents: write
@@ -99,16 +98,8 @@ jobs:
           EXTERNAL_CRON_EPOCH: ${{ inputs.external_cron_epoch }}
         shell: bash
         run: |
-          # Normal pushes are safe regression tests. A deliberately-created
-          # .live_test_once file is the only exception and is used for one
-          # controlled end-to-end Telegram test, then removed immediately.
+          # A push is only a safe regression test and never sends Telegram posts.
           if [ "${{ github.event_name }}" = "push" ]; then
-            if [ -f .live_test_once ]; then
-              echo "ONE-TIME LIVE TEST: running one real production poll."
-              export SMOKE_TEST=""
-              python -u scripts/nba_poll_once_v2.py
-              exit $?
-            fi
             python -u scripts/nba_poll_once_v2.py
             exit $?
           fi
@@ -161,8 +152,6 @@ jobs:
         shell: bash
         run: |
           # Never mutate markers in test/list/dry-run/alternate-chat/smoke modes.
-          # The one-time live push is intentionally persisted manually after its
-          # Telegram send is verified, so push jobs always skip this step.
           if [ "$SEND_TEST_MESSAGE" = "1" ] || [ "$LIST_EVENTS" = "1" ] || [ "$DRY_RUN" = "1" ] || [ -n "$ALT_CHAT_ID" ] || [ "$SMOKE_TEST" = "1" ]; then
             echo "Skip marker persistence (test/list/dry-run/alternate-chat/smoke mode)."
             exit 0
