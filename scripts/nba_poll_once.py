@@ -3,9 +3,10 @@
 
 """Fast one-minute guard for NBA live results.
 
-The scheduled workflow calls this every minute. ESPN is the authoritative
-finish signal. Sports.ru is queried only for the specific newly-finished games,
-so player-stat enrichment can never turn a minute poll into a full-day crawl.
+The scheduled workflow calls this every minute. A lightweight official source
+is used as the finish signal; Sports.ru is queried only for specific newly
+finished games, so player-stat enrichment can never turn a minute poll into a
+full-day crawl.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ import nba_results_live_bot as bot  # noqa: E402
 
 
 SMOKE_TEST = os.getenv("SMOKE_TEST", "").strip().lower() in {"1", "true", "yes", "on"}
+NBA_SCHEDULE_URL = "https://cdn.nba.com/static/json/staticData/scheduleLeagueV2_1.json"
 
 
 def _manual_or_test_mode() -> bool:
@@ -63,6 +65,31 @@ def _all_espn_events_for_pt_day(d_pt):
         if dt and dt.date() == d_pt:
             seen.add(eid)
             out.append(e)
+    return out
+
+
+def _fetch_nba_schedule_games_for_day(d_pt) -> list[dict]:
+    """Return raw official NBA schedule entries for an NBA calendar date."""
+    try:
+        r = requests.get(
+            NBA_SCHEDULE_URL,
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.nba.com/"},
+            timeout=8,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as exc:
+        bot.log(f"[DBG] NBA schedule fetch failed: {exc!r}")
+        return []
+
+    target = d_pt.strftime("%m/%d/%Y")
+    league = data.get("leagueSchedule") or {}
+    out = []
+    for block in league.get("gameDates") or []:
+        raw_date = str(block.get("gameDate") or "")
+        if not raw_date.startswith(target):
+            continue
+        out.extend(block.get("games") or [])
     return out
 
 
@@ -174,7 +201,7 @@ def _fast_sports_games_for_events(events: list[dict], d_pt) -> list[dict]:
                     bot.log(f"[DBG] fast Sports.ru matched {eid} -> {url}")
                     break
             if not found:
-                bot.log(f"[DBG] fast Sports.ru miss {eid}; ESPN quick post will be used")
+                bot.log(f"[DBG] fast Sports.ru miss {eid}; score-only quick post will be used")
     finally:
         bot._soup = original_soup
 
@@ -182,15 +209,26 @@ def _fast_sports_games_for_events(events: list[dict], d_pt) -> list[dict]:
 
 
 def _run_smoke(d_pt) -> None:
-    events = _all_espn_events_for_pt_day(d_pt)
-    completed = [e for e in events if e.get("completed")]
-    # Probe at most one actual game card so smoke runs stay short and never send.
-    probe = completed[-1:] or events[:1]
+    espn_events = _all_espn_events_for_pt_day(d_pt)
+    espn_completed = [e for e in espn_events if e.get("completed")]
+
+    nba_games = _fetch_nba_schedule_games_for_day(d_pt)
+    nba_completed = [g for g in nba_games if int(g.get("gameStatus") or 0) == 3]
+    nba_sample = []
+    for g in nba_games[:8]:
+        away = (g.get("awayTeam") or {}).get("teamTricode") or "?"
+        home = (g.get("homeTeam") or {}).get("teamTricode") or "?"
+        nba_sample.append(f"{g.get('gameId')}:{away}@{home}:s={g.get('gameStatus')}:{g.get('gameStatusText')}")
+
+    # Probe Sports.ru only against an ESPN event here; never send anything.
+    probe = espn_completed[-1:] or espn_events[:1]
     enriched = _fast_sports_games_for_events(probe, d_pt) if probe else []
     print(
-        f"OK smoke date_pt={d_pt} events={len(events)} completed={len(completed)} "
-        f"sports_match={len(enriched)}"
+        f"OK smoke date_pt={d_pt} espn_events={len(espn_events)} espn_completed={len(espn_completed)} "
+        f"nba_games={len(nba_games)} nba_completed={len(nba_completed)} sports_match={len(enriched)}"
     )
+    if nba_sample:
+        print("NBA sample: " + " | ".join(nba_sample))
 
 
 def main() -> None:
