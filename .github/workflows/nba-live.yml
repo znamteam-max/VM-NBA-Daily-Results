@@ -2,7 +2,10 @@ name: NBA Live Results (per game)
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    # GitHub cron cannot run more often than every 5 minutes.
+    # Moscow is UTC+3: these starts cover 22:00-09:59 MSK, while the job
+    # itself performs five checks ~60 seconds apart inside each 5-minute slot.
+    - cron: "*/5 19-23,0-6 * * *"
   workflow_dispatch:
     inputs:
       send_test_message:
@@ -36,13 +39,16 @@ on:
 permissions:
   contents: write
 
+# Never cancel a run that may already have sent a result but has not committed
+# its marker yet. New scheduled runs wait for the previous one instead.
 concurrency:
   group: nba-live
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 12
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -60,53 +66,98 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4
 
-      - name: Run live bot (per game)
+      - name: Run live bot (per minute)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TEAM_EMOJI_JSON: ${{ secrets.TEAM_EMOJI_JSON }}
           DEBUG_NBA: "1"
           REPORT_DATE_PT: ${{ inputs.report_date_pt }}
-          SEND_TEST_MESSAGE: ${{ inputs.send_test_message }}
-          LIST_EVENTS: ${{ inputs.list_events }}
+          # Boolean workflow inputs must be blank when false. The legacy bot
+          # uses bool(env_string), where the literal string "false" is True.
+          SEND_TEST_MESSAGE: ${{ inputs.send_test_message && '1' || '' }}
+          LIST_EVENTS: ${{ inputs.list_events && '1' || '' }}
           ONLY_EVENT_ID: ${{ inputs.only_event_id }}
-          DRY_RUN: ${{ inputs.dry_run }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
           ALT_CHAT_ID: ${{ inputs.alt_chat_id }}
-          # маркеры пишем в posted/
           MARKER_DIR: "posted"
-        run: |
-          python -u nba_results_live_bot.py
-
-      - name: Commit markers (posted/)
-        env:
-          SEND_TEST_MESSAGE: ${{ inputs.send_test_message }}
-          LIST_EVENTS: ${{ inputs.list_events }}
-          DRY_RUN: ${{ inputs.dry_run }}
         shell: bash
         run: |
-          # Пропустить коммит в режимах ping/list/dry_run
-          if [ "${SEND_TEST_MESSAGE}" = "true" ] || [ "${LIST_EVENTS}" = "true" ] || [ "${DRY_RUN}" = "true" ]; then
-            echo "Skip committing markers (test/list/dry-run mode)."
+          # Manual dispatch = one intentional check/test only.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            python -u scripts/nba_poll_once.py
+            exit $?
+          fi
+
+          # Scheduled cron fires every 5 minutes; fill that interval with five
+          # start-to-start minute checks. If one tick is slow, the next starts
+          # immediately rather than adding another 60-second delay.
+          failures=0
+          for i in 1 2 3 4 5; do
+            started=$(date +%s)
+            echo "=== minute poll ${i}/5 at $(date -u +'%Y-%m-%dT%H:%M:%SZ') ==="
+            if ! python -u scripts/nba_poll_once.py; then
+              failures=$((failures + 1))
+              echo "Poll ${i} failed; continuing to next minute."
+            fi
+
+            if [ "$i" -lt 5 ]; then
+              elapsed=$(( $(date +%s) - started ))
+              sleep_for=$(( 60 - elapsed ))
+              if [ "$sleep_for" -gt 0 ]; then
+                sleep "$sleep_for"
+              fi
+            fi
+          done
+
+          echo "Minute polling finished; failed_ticks=${failures}/5"
+          # A transient failed tick is recovered by the following minute.
+          # Mark the job failed only if ESPN/bot failed for the entire slot.
+          if [ "$failures" -eq 5 ]; then
+            exit 1
+          fi
+
+      - name: Commit markers (posted/)
+        if: ${{ always() }}
+        env:
+          SEND_TEST_MESSAGE: ${{ inputs.send_test_message && '1' || '' }}
+          LIST_EVENTS: ${{ inputs.list_events && '1' || '' }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+          ALT_CHAT_ID: ${{ inputs.alt_chat_id }}
+        shell: bash
+        run: |
+          # No marker writes for explicit ping/list/dry-run/alternate-chat modes.
+          if [ "$SEND_TEST_MESSAGE" = "1" ] || [ "$LIST_EVENTS" = "1" ] || [ "$DRY_RUN" = "1" ] || [ -n "$ALT_CHAT_ID" ]; then
+            echo "Skip committing markers (test/list/dry-run/alternate-chat mode)."
             exit 0
           fi
 
-          git config --global user.name "github-actions"
-          git config --global user.email "actions@github.com"
-
-          # Обновим локальную ветку
-          git pull --rebase
-
-          # Нет каталога с маркерами — нечего коммитить
           if [ ! -d posted ]; then
             echo "No posted/ directory; nothing to commit."
             exit 0
           fi
 
-          # Есть ли изменения в posted/ (включая новые файлы)
-          if [ -n "$(git status --porcelain posted)" ]; then
-            git add -A posted
-            git commit -m "NBA live markers $(date -u +'%Y-%m-%d %H:%M:%S')"
-            git push
-          else
+          if [ -z "$(git status --porcelain posted)" ]; then
             echo "No new markers in posted/."
+            exit 0
           fi
+
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add -A posted
+          git commit -m "NBA live markers $(date -u +'%Y-%m-%d %H:%M:%S')"
+
+          # Commit locally first, then rebase/push. This also works when an
+          # existing quick marker was modified to full.
+          for attempt in 1 2 3; do
+            if git pull --rebase origin main && git push origin HEAD:main; then
+              echo "Markers pushed."
+              exit 0
+            fi
+            echo "Marker push attempt ${attempt} failed; retrying."
+            git rebase --abort 2>/dev/null || true
+            sleep $((attempt * 2))
+          done
+
+          echo "Failed to persist posted/ markers after 3 attempts."
+          exit 1
