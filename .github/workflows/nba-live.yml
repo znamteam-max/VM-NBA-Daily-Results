@@ -50,6 +50,7 @@ on:
       - "scripts/nba_poll_once.py"
       - "scripts/nba_poll_once_v2.py"
       - "scripts/persist_nba_markers.sh"
+      - ".live_test_once"
 
 permissions:
   contents: write
@@ -98,8 +99,16 @@ jobs:
           EXTERNAL_CRON_EPOCH: ${{ inputs.external_cron_epoch }}
         shell: bash
         run: |
-          # A push is only a safe regression test and never sends Telegram posts.
+          # Normal pushes are safe regression tests. A deliberately-created
+          # .live_test_once file is the only exception and is used for one
+          # controlled end-to-end Telegram test, then removed immediately.
           if [ "${{ github.event_name }}" = "push" ]; then
+            if [ -f .live_test_once ]; then
+              echo "ONE-TIME LIVE TEST: running one real production poll."
+              export SMOKE_TEST=""
+              python -u scripts/nba_poll_once_v2.py
+              exit $?
+            fi
             python -u scripts/nba_poll_once_v2.py
             exit $?
           fi
@@ -125,24 +134,11 @@ jobs:
             hm=$(TZ=Europe/Moscow date -d "@$planned" +%H%M)
             hm_num=$((10#$hm))
 
-            # cron-job.org scheduled executions are aligned to :00 seconds.
-            # Its interactive Test run uses the actual current second. That lets
-            # us exercise one real poll outside the production window without
-            # widening the normal 22:00-10:00 schedule.
-            sec=$((planned % 60))
-            interactive_test=0
-            if [ "$sec" -ne 0 ]; then
-              interactive_test=1
-            fi
-
-            # Inclusive production window based on cron-job.org planned time:
-            # 22:00:00 through 10:00:59 MSK. Runner startup delay does not matter.
-            if [ "$hm_num" -ge 2200 ] || [ "$hm_num" -le 1000 ] || [ "$interactive_test" -eq 1 ]; then
-              if [ "$interactive_test" -eq 1 ]; then
-                echo "CRON-JOB.ORG interactive Test run: allowing one real poll outside production hours."
-              else
-                echo "EXTERNAL minute poll planned=$(TZ=Europe/Moscow date -d "@$planned" +'%Y-%m-%dT%H:%M:%S%z') age=${age}s"
-              fi
+            # Strict production window based only on Moscow clock time.
+            # Do not infer cron-job.org Test run from the epoch seconds: regular
+            # cron executions can also begin a second or two after the minute.
+            if [ "$hm_num" -ge 2200 ] || [ "$hm_num" -le 1000 ]; then
+              echo "EXTERNAL minute poll planned=$(TZ=Europe/Moscow date -d "@$planned" +'%Y-%m-%dT%H:%M:%S%z') age=${age}s"
               python -u scripts/nba_poll_once_v2.py
               exit $?
             fi
@@ -165,6 +161,8 @@ jobs:
         shell: bash
         run: |
           # Never mutate markers in test/list/dry-run/alternate-chat/smoke modes.
+          # The one-time live push is intentionally persisted manually after its
+          # Telegram send is verified, so push jobs always skip this step.
           if [ "$SEND_TEST_MESSAGE" = "1" ] || [ "$LIST_EVENTS" = "1" ] || [ "$DRY_RUN" = "1" ] || [ -n "$ALT_CHAT_ID" ] || [ "$SMOKE_TEST" = "1" ]; then
             echo "Skip marker persistence (test/list/dry-run/alternate-chat/smoke mode)."
             exit 0
