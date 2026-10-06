@@ -15,12 +15,10 @@ Do not put this token into the repository or workflow file.
 
 ## 2. cron-job.org request
 
-Create a cron job with:
+Both cron jobs use the same request:
 
-- Title: `VM NBA Live Results`
 - URL: `https://api.github.com/repos/znamteam-max/VM-NBA-Daily-Results/actions/workflows/nba-live.yml/dispatches`
 - Method: `POST`
-- Schedule: every minute. It is safe to run 24/7 because the workflow itself only polls for results for planned trigger times from 22:00 through 10:00 Moscow time.
 
 Custom headers:
 
@@ -37,7 +35,29 @@ Request body:
 
 cron-job.org replaces `%cjo:unixtime%` with the planned execution timestamp. The workflow uses that timestamp (not delayed runner start time) to enforce the Moscow 22:00–10:00 window.
 
-## 3. Safety behavior
+## 3. Recommended schedule
+
+Use timezone **Europe/Moscow** and two jobs so GitHub does not waste runners outside the required window:
+
+### Job A — `VM NBA Live Results — minute`
+
+- Hours: `22, 23, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9`
+- Minutes: every minute (`0–59`)
+- Every day / every month / every weekday
+
+This gives one trigger every minute from **22:00 through 09:59 MSK**.
+
+### Job B — `VM NBA Live Results — 10:00 final`
+
+- Hour: `10`
+- Minute: `00`
+- Every day / every month / every weekday
+
+This gives the final inclusive check at **10:00 MSK**.
+
+The workflow also has its own 22:00–10:00 MSK guard, so a mistaken extra trigger outside the window will not poll or post.
+
+## 4. Safety behavior
 
 - One external call = exactly one NBA poll.
 - At most one never-posted final may be sent per minute.
@@ -46,6 +66,6 @@ cron-job.org replaces `%cjo:unixtime%` with the planned execution timestamp. The
 - A successful result writes its marker back to `main` after the tick.
 - Pushes to the repository run smoke/regression tests only; they never send result posts.
 
-## 4. Test
+## 5. Test
 
 Use cron-job.org **Test run** once after saving. A successful GitHub workflow dispatch normally returns HTTP `204` (or `200` if GitHub is configured to return run details). Then confirm a new `workflow_dispatch` run appears under GitHub Actions.
