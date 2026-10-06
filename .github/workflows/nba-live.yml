@@ -6,6 +6,12 @@ on:
     # Moscow is UTC+3: these starts cover 22:00-09:59 MSK, while the job
     # itself performs five checks ~60 seconds apart inside each 5-minute slot.
     - cron: "*/5 19-23,0-6 * * *"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/nba-live.yml"
+      - "nba_results_live_bot.py"
+      - "scripts/nba_poll_once.py"
   workflow_dispatch:
     inputs:
       send_test_message:
@@ -78,13 +84,14 @@ jobs:
           SEND_TEST_MESSAGE: ${{ inputs.send_test_message && '1' || '' }}
           LIST_EVENTS: ${{ inputs.list_events && '1' || '' }}
           ONLY_EVENT_ID: ${{ inputs.only_event_id }}
-          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+          # Pushes are always smoke-tested without sending anything.
+          DRY_RUN: ${{ github.event_name == 'push' && '1' || (inputs.dry_run && '1' || '') }}
           ALT_CHAT_ID: ${{ inputs.alt_chat_id }}
           MARKER_DIR: "posted"
         shell: bash
         run: |
-          # Manual dispatch = one intentional check/test only.
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          # Manual dispatch and push smoke-test = one intentional check only.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "push" ]; then
             python -u scripts/nba_poll_once.py
             exit $?
           fi
@@ -122,7 +129,7 @@ jobs:
         env:
           SEND_TEST_MESSAGE: ${{ inputs.send_test_message && '1' || '' }}
           LIST_EVENTS: ${{ inputs.list_events && '1' || '' }}
-          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+          DRY_RUN: ${{ github.event_name == 'push' && '1' || (inputs.dry_run && '1' || '') }}
           ALT_CHAT_ID: ${{ inputs.alt_chat_id }}
         shell: bash
         run: |
