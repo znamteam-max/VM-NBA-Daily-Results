@@ -3,17 +3,19 @@
 
 """Fast one-minute guard for NBA live results.
 
-The scheduled workflow calls this every minute. ESPN is queried across NBA
-season types (preseason/regular/postseason) as the lightweight finish signal.
-Sports.ru is queried only for specific newly finished games, so player-stat
-enrichment can never turn a minute poll into a full-day crawl.
+The scheduled workflow calls this every minute. Lightweight scoreboard sources
+are used only as the finish signal. Sports.ru is queried only for specific newly
+finished games, so player-stat enrichment can never turn a minute poll into a
+full-day crawl.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -36,6 +38,7 @@ import nba_results_live_bot as bot  # noqa: E402
 
 SMOKE_TEST = os.getenv("SMOKE_TEST", "").strip().lower() in {"1", "true", "yes", "on"}
 SEASON_TYPES = ("1", "2", "3")  # preseason, regular season, postseason
+SOFA_DAY_URL = "https://www.sofascore.com/api/v1/sport/basketball/scheduled-events/{ymd}"
 
 
 def _manual_or_test_mode() -> bool:
@@ -86,11 +89,65 @@ def _all_espn_events_for_pt_day(d_pt):
     return out
 
 
-def _completed_events_for_pt_day(d_pt) -> list[dict]:
+def _completed_espn_events_for_pt_day(d_pt) -> list[dict]:
     events = _all_espn_events_for_pt_day(d_pt)
     completed = [e for e in events if e.get("completed")]
     bot.log(f"[DBG] ESPN all-season-types completed for {d_pt}: {len(completed)} / events={len(events)}")
     return completed
+
+
+def _fetch_sofa_raw_day(d) -> list[dict]:
+    try:
+        r = requests.get(
+            SOFA_DAY_URL.format(ymd=d.isoformat()),
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+            timeout=8,
+        )
+        if r.status_code != 200:
+            bot.log(f"[DBG] Sofa HTTP {r.status_code} for {d}")
+            return []
+        return (r.json() or {}).get("events") or []
+    except Exception as exc:
+        bot.log(f"[DBG] Sofa fetch failed {d}: {exc!r}")
+        return []
+
+
+def _is_nba_sofa_event(ev: dict) -> bool:
+    tournament = ev.get("tournament") or {}
+    unique = tournament.get("uniqueTournament") or {}
+    name = " ".join(
+        str(x or "") for x in (tournament.get("name"), unique.get("name"), unique.get("slug"))
+    ).lower()
+    return unique.get("id") == 132 or "nba" in name
+
+
+def _sofa_events_for_pt_day(d_pt) -> list[dict]:
+    """Fetch the two UTC dates that can contain starts from one Pacific day."""
+    tz_pt = ZoneInfo("America/Los_Angeles")
+    tz_utc = ZoneInfo("UTC")
+    start = datetime(d_pt.year, d_pt.month, d_pt.day, 0, 0, tzinfo=tz_pt).astimezone(tz_utc)
+    end = datetime(d_pt.year, d_pt.month, d_pt.day, 23, 59, tzinfo=tz_pt).astimezone(tz_utc)
+    dates = {start.date(), end.date()}
+
+    out = []
+    seen = set()
+    for d in sorted(dates):
+        for ev in _fetch_sofa_raw_day(d):
+            if not _is_nba_sofa_event(ev):
+                continue
+            try:
+                ts = int(ev.get("startTimestamp") or 0)
+                dt_pt = datetime.fromtimestamp(ts, tz=tz_utc).astimezone(tz_pt)
+            except Exception:
+                continue
+            if dt_pt.date() != d_pt:
+                continue
+            eid = str(ev.get("id") or "")
+            if not eid or eid in seen:
+                continue
+            seen.add(eid)
+            out.append(ev)
+    return out
 
 
 def _fast_soup(url: str):
@@ -201,7 +258,7 @@ def _fast_sports_games_for_events(events: list[dict], d_pt) -> list[dict]:
                     bot.log(f"[DBG] fast Sports.ru matched {eid} -> {url}")
                     break
             if not found:
-                bot.log(f"[DBG] fast Sports.ru miss {eid}; ESPN score-only quick post will be used")
+                bot.log(f"[DBG] fast Sports.ru miss {eid}; score-only quick post will be used")
     finally:
         bot._soup = original_soup
 
@@ -209,24 +266,30 @@ def _fast_sports_games_for_events(events: list[dict], d_pt) -> list[dict]:
 
 
 def _run_smoke(d_pt) -> None:
-    events = _all_espn_events_for_pt_day(d_pt)
-    completed = [e for e in events if e.get("completed")]
-    sample = []
-    for e in events[:10]:
-        sample.append(
-            f"{e.get('eventId')}:{e['away']['abbr']}@{e['home']['abbr']}:"
-            f"{e['away']['score']}-{e['home']['score']}:done={e.get('completed')}"
+    espn = _all_espn_events_for_pt_day(d_pt)
+    sofa = _sofa_events_for_pt_day(d_pt)
+    sofa_finished = [e for e in sofa if (e.get("status") or {}).get("type") == "finished"]
+
+    sofa_sample = []
+    for e in sofa[:10]:
+        a = e.get("awayTeam") or {}
+        h = e.get("homeTeam") or {}
+        sofa_sample.append(
+            f"{e.get('id')}:{a.get('name')}@{h.get('name')}:"
+            f"status={(e.get('status') or {}).get('type')}:"
+            f"score={(e.get('awayScore') or {}).get('current')}-{(e.get('homeScore') or {}).get('current')}"
         )
 
-    # Probe at most one actual game card so smoke runs stay short and never send.
-    probe = completed[-1:] or events[:1]
+    # Probe at most one ESPN game card so smoke runs stay short and never send.
+    espn_done = [e for e in espn if e.get("completed")]
+    probe = espn_done[-1:] or espn[:1]
     enriched = _fast_sports_games_for_events(probe, d_pt) if probe else []
     print(
-        f"OK smoke date_pt={d_pt} espn_events={len(events)} espn_completed={len(completed)} "
-        f"sports_match={len(enriched)}"
+        f"OK smoke date_pt={d_pt} espn_events={len(espn)} espn_completed={len(espn_done)} "
+        f"sofa_events={len(sofa)} sofa_finished={len(sofa_finished)} sports_match={len(enriched)}"
     )
-    if sample:
-        print("ESPN sample: " + " | ".join(sample))
+    if sofa_sample:
+        print("SOFA sample: " + " | ".join(sofa_sample))
 
 
 def main() -> None:
@@ -242,7 +305,7 @@ def main() -> None:
         return
 
     Path(bot.MARKER_DIR).mkdir(parents=True, exist_ok=True)
-    completed = _completed_events_for_pt_day(d_pt)
+    completed = _completed_espn_events_for_pt_day(d_pt)
     pending = [e for e in completed if bot.read_marker_state(e["eventId"]) is None]
 
     if not pending:
