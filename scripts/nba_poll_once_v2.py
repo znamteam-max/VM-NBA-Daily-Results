@@ -9,6 +9,7 @@ Key guarantees:
 - already-published `quick` results may be upgraded to `full` silently in the same tick;
 - the final score from the Sports.ru day card is authoritative over any score scraped from
   the player-stat page;
+- result posts normally show two standout players from each team (four total);
 - push smoke tests never send Telegram messages and regression-test a known NBA slate.
 """
 
@@ -47,6 +48,61 @@ def _force_authoritative_final_score(info: dict, event: dict) -> None:
 # day-card final is authoritative even when the stats page happens to contain a
 # plausible but unrelated score elsewhere in its HTML.
 bot.fix_scores_with_espn = _force_authoritative_final_score
+
+
+def _pick_two_team_players(abbr: str, rows: list[dict]) -> list[tuple[dict, bool, bool]]:
+    """Pick two useful lines per team whenever at least two player rows exist.
+
+    Keep the existing special treatment for Demin/Goldin, but remove the old
+    20-point/double-double gate for the second ordinary player. The old gate was
+    why a normal result could contain only one player from each team.
+    """
+    if not rows:
+        return []
+
+    rows = sorted(rows, key=bot.score_key, reverse=True)
+    special_keys: list[str] = []
+    if abbr == "BKN":
+        special_keys = ["дёмин", "demin"]
+    elif abbr == "MIA":
+        special_keys = ["голдин", "goldin"]
+
+    special = None
+    for player in rows:
+        name = (player.get("name") or "").lower()
+        if any(key in name for key in special_keys):
+            special = player
+            break
+
+    top = rows[0]
+    picked: list[tuple[dict, bool, bool]] = []
+    picked_names: set[str] = set()
+
+    if special and special.get("name") == top.get("name"):
+        picked.append((special, True, True))
+        picked_names.add(special.get("name") or "")
+    elif special:
+        picked.append((top, False, False))
+        picked.append((special, True, True))
+        picked_names.add(top.get("name") or "")
+        picked_names.add(special.get("name") or "")
+    else:
+        picked.append((top, False, False))
+        picked_names.add(top.get("name") or "")
+
+    if len(picked) < 2:
+        for player in rows[1:]:
+            name = player.get("name") or ""
+            if name in picked_names:
+                continue
+            picked.append((player, False, False))
+            break
+
+    return picked[:2]
+
+
+# Production formatter uses this function inside build_block().
+bot.pick_team_players = _pick_two_team_players
 
 
 def _event_pair(event: dict) -> frozenset[str]:
@@ -100,10 +156,28 @@ def _smoke_render_known_slate() -> None:
         if not text.strip():
             raise RuntimeError(f"Regression smoke: empty render for {event['eventId']}")
 
+        A = info["teamA"]
+        B = info["teamB"]
+        Aname = bot.ABBR_TO_RU.get(A["abbr"], A["name"])
+        Bname = bot.ABBR_TO_RU.get(B["abbr"], B["name"])
+        rows_a = info["players"].get(Aname, [])
+        rows_b = info["players"].get(Bname, [])
+        selected_players = len(bot.pick_team_players(A["abbr"], rows_a)) + len(
+            bot.pick_team_players(B["abbr"], rows_b)
+        )
+        if len(rows_a) >= 2 and len(rows_b) >= 2 and selected_players != 4:
+            raise RuntimeError(
+                f"Regression smoke: expected 4 selected players for {event['eventId']}, "
+                f"got {selected_players}"
+            )
+
         rendered += 1
         players = bot.players_count(info)
-        preview = text.replace("\n", " | ")[:220]
-        print(f"SMOKE RENDER {event['eventId']} players={players} :: {preview}")
+        preview = text.replace("\n", " | ")[:320]
+        print(
+            f"SMOKE RENDER {event['eventId']} players={players} "
+            f"selected={selected_players} :: {preview}"
+        )
 
     print(
         f"OK regression date_pt={REGRESSION_DATE_PT} pages={pages} "
