@@ -125,10 +125,24 @@ jobs:
             hm=$(TZ=Europe/Moscow date -d "@$planned" +%H%M)
             hm_num=$((10#$hm))
 
+            # cron-job.org scheduled executions are aligned to :00 seconds.
+            # Its interactive Test run uses the actual current second. That lets
+            # us exercise one real poll outside the production window without
+            # widening the normal 22:00-10:00 schedule.
+            sec=$((planned % 60))
+            interactive_test=0
+            if [ "$sec" -ne 0 ]; then
+              interactive_test=1
+            fi
+
             # Inclusive production window based on cron-job.org planned time:
             # 22:00:00 through 10:00:59 MSK. Runner startup delay does not matter.
-            if [ "$hm_num" -ge 2200 ] || [ "$hm_num" -le 1000 ]; then
-              echo "EXTERNAL minute poll planned=$(TZ=Europe/Moscow date -d "@$planned" +'%Y-%m-%dT%H:%M:%S%z') age=${age}s"
+            if [ "$hm_num" -ge 2200 ] || [ "$hm_num" -le 1000 ] || [ "$interactive_test" -eq 1 ]; then
+              if [ "$interactive_test" -eq 1 ]; then
+                echo "CRON-JOB.ORG interactive Test run: allowing one real poll outside production hours."
+              else
+                echo "EXTERNAL minute poll planned=$(TZ=Europe/Moscow date -d "@$planned" +'%Y-%m-%dT%H:%M:%S%z') age=${age}s"
+              fi
               python -u scripts/nba_poll_once_v2.py
               exit $?
             fi
