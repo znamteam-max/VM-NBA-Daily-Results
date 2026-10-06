@@ -2,13 +2,14 @@ name: NBA Live Results (per game)
 
 on:
   schedule:
-    # GitHub Actions cron has a 5-minute minimum. Each regular scheduled run
-    # fills its own 5-minute slot with five start-to-start checks ~60s apart.
-    # Keep the schedule in Moscow time explicitly so the requirement is obvious.
-    - cron: "*/5 22-23,0-9 * * *"
+    # Avoid the top-of-hour GitHub Actions load spike. The 21:57 run sleeps
+    # through 21:57-21:59 and performs the first real checks at 22:00/22:01.
+    - cron: "57 21 * * *"
       timezone: "Europe/Moscow"
-    # Exact final boundary check at 10:00 MSK (one poll only, handled below).
-    - cron: "0 10 * * *"
+    # Thereafter each run starts at :02/:07/.../:57 and performs five
+    # start-to-start minute ticks. The 09:57 run covers through 10:00 MSK;
+    # an in-job time guard prevents any poll after 10:00.
+    - cron: "2-57/5 22-23,0-9 * * *"
       timezone: "Europe/Moscow"
   push:
     branches: [main]
@@ -17,6 +18,7 @@ on:
       - "nba_results_live_bot.py"
       - "scripts/nba_poll_once.py"
       - "scripts/nba_poll_once_v2.py"
+      - "scripts/persist_nba_markers.sh"
   workflow_dispatch:
     inputs:
       send_test_message:
@@ -101,23 +103,31 @@ jobs:
             exit $?
           fi
 
-          # 10:00 MSK is the inclusive final boundary: exactly one last check.
-          if [ "${{ github.event.schedule }}" = "0 10 * * *" ]; then
-            echo "=== final 10:00 MSK poll ==="
-            python -u scripts/nba_poll_once_v2.py
-            exit $?
-          fi
-
-          # Scheduled cron fires every 5 minutes; fill that interval with five
-          # start-to-start minute checks. If one tick is slow, the next starts
-          # immediately rather than adding another 60-second delay.
           failures=0
+          persist_failures=0
+          polled=0
+
           for i in 1 2 3 4 5; do
             started=$(date +%s)
-            echo "=== minute poll ${i}/5 at $(date -u +'%Y-%m-%dT%H:%M:%SZ') ==="
-            if ! python -u scripts/nba_poll_once_v2.py; then
-              failures=$((failures + 1))
-              echo "Poll ${i} failed; continuing to next minute."
+            hm=$(TZ=Europe/Moscow date +%H%M)
+            hm_num=$((10#$hm))
+
+            # Production window is inclusive: 22:00:00 through 10:00:59 MSK.
+            if [ "$hm_num" -ge 2200 ] || [ "$hm_num" -le 1000 ]; then
+              polled=$((polled + 1))
+              echo "=== minute poll ${i}/5 at $(TZ=Europe/Moscow date +'%Y-%m-%dT%H:%M:%S%z') MSK ==="
+              if ! python -u scripts/nba_poll_once_v2.py; then
+                failures=$((failures + 1))
+                echo "Poll ${i} failed; continuing to next minute."
+              fi
+
+              # Persist idempotency state immediately after every real tick,
+              # minimizing the duplicate window if the runner dies later.
+              if ! bash scripts/persist_nba_markers.sh; then
+                persist_failures=$((persist_failures + 1))
+              fi
+            else
+              echo "=== minute slot ${i}/5 outside 22:00-10:00 MSK; no poll ==="
             fi
 
             if [ "$i" -lt 5 ]; then
@@ -129,14 +139,18 @@ jobs:
             fi
           done
 
-          echo "Minute polling finished; failed_ticks=${failures}/5"
-          # A transient failed tick is recovered by the following minute.
-          # Mark the job failed only if every tick in the slot failed.
-          if [ "$failures" -eq 5 ]; then
+          echo "Minute polling finished; polled=${polled} failed_ticks=${failures} marker_failures=${persist_failures}"
+
+          # A transient source failure is recovered by the next minute. Fail the
+          # job only if every real poll failed, or marker persistence failed.
+          if [ "$polled" -gt 0 ] && [ "$failures" -eq "$polled" ]; then
+            exit 1
+          fi
+          if [ "$persist_failures" -gt 0 ]; then
             exit 1
           fi
 
-      - name: Commit markers (posted/)
+      - name: Commit markers fallback
         if: ${{ always() }}
         env:
           SEND_TEST_MESSAGE: ${{ inputs.send_test_message && '1' || '' }}
@@ -146,38 +160,10 @@ jobs:
           SMOKE_TEST: ${{ github.event_name == 'push' && '1' || '' }}
         shell: bash
         run: |
-          # No marker writes for explicit ping/list/dry-run/alternate-chat/smoke modes.
+          # Never mutate markers in test/list/dry-run/alternate-chat/smoke modes.
           if [ "$SEND_TEST_MESSAGE" = "1" ] || [ "$LIST_EVENTS" = "1" ] || [ "$DRY_RUN" = "1" ] || [ -n "$ALT_CHAT_ID" ] || [ "$SMOKE_TEST" = "1" ]; then
-            echo "Skip committing markers (test/list/dry-run/alternate-chat/smoke mode)."
+            echo "Skip marker persistence (test/list/dry-run/alternate-chat/smoke mode)."
             exit 0
           fi
 
-          if [ ! -d posted ]; then
-            echo "No posted/ directory; nothing to commit."
-            exit 0
-          fi
-
-          if [ -z "$(git status --porcelain posted)" ]; then
-            echo "No new markers in posted/."
-            exit 0
-          fi
-
-          git config user.name "github-actions"
-          git config user.email "actions@github.com"
-          git add -A posted
-          git commit -m "NBA live markers $(date -u +'%Y-%m-%d %H:%M:%S')"
-
-          # Commit locally first, then rebase/push. This also works when an
-          # existing quick marker was modified to full.
-          for attempt in 1 2 3; do
-            if git pull --rebase origin main && git push origin HEAD:main; then
-              echo "Markers pushed."
-              exit 0
-            fi
-            echo "Marker push attempt ${attempt} failed; retrying."
-            git rebase --abort 2>/dev/null || true
-            sleep $((attempt * 2))
-          done
-
-          echo "Failed to persist posted/ markers after 3 attempts."
-          exit 1
+          bash scripts/persist_nba_markers.sh
