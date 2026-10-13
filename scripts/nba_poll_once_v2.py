@@ -10,14 +10,17 @@ Key guarantees:
 - the final score from the Sports.ru day card is authoritative over any score scraped from
   the player-stat page;
 - result posts normally show two standout players from each team (four total);
+- player lines come from the ESPN box score; the Russian name is taken from the
+  Sports.ru stat page when that page shows the identical stat line for the player;
 - push smoke tests never send Telegram messages and regression-test a known NBA slate.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import sys
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +33,13 @@ import scripts.nba_poll_once as poll  # noqa: E402
 bot = poll.bot
 
 REGRESSION_DATE_PT = date(2026, 10, 5)
+
+# ESPN box score: complete player lines for every finished game, including games whose
+# Sports.ru stat page has not been published yet.
+ESPN_SUMMARY = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event={eid}"
+STAT_KEYS = ("pts", "reb", "ast", "stl", "blk")
+# If the ESPN box score is still missing this long after tip-off, post the score alone.
+PLAYERS_WAIT = timedelta(hours=4)
 
 
 def _force_authoritative_final_score(info: dict, event: dict) -> None:
@@ -185,6 +195,114 @@ def _smoke_render_known_slate() -> None:
     )
 
 
+def _espn_box_rows(espn_event_id: str) -> dict[str, list[dict]]:
+    """Player lines per ESPN team id; empty while the box score is not there yet."""
+    try:
+        r = bot.S.get(ESPN_SUMMARY.format(eid=espn_event_id), timeout=bot.HTTP_TIMEOUT)
+        if r.status_code != 200:
+            return {}
+        data = r.json()
+    except Exception as exc:
+        bot.log(f"[DBG] ESPN box score failed {espn_event_id}: {exc!r}")
+        return {}
+
+    out: dict[str, list[dict]] = {}
+    for team in (data.get("boxscore") or {}).get("players") or []:
+        team_id = str((team.get("team") or {}).get("id") or "")
+        rows = []
+        for block in team.get("statistics") or []:
+            keys = block.get("keys") or []
+            for athlete in block.get("athletes") or []:
+                if not athlete.get("stats"):
+                    continue
+                s = dict(zip(keys, athlete["stats"]))
+                name = (athlete.get("athlete") or {}).get("displayName") or ""
+                row = {
+                    "name": name,
+                    "pts": bot._intish(s.get("points")),
+                    "reb": bot._intish(s.get("rebounds")),
+                    "ast": bot._intish(s.get("assists")),
+                    "stl": bot._intish(s.get("steals")),
+                    "blk": bot._intish(s.get("blocks")),
+                }
+                if name and any(row[k] for k in STAT_KEYS):
+                    rows.append(row)
+        if team_id and rows:
+            out[team_id] = rows
+    return out
+
+
+def _sportsru_info(event: dict) -> dict | None:
+    """Sports.ru stat page for this game; used only to get Russian player names."""
+    try:
+        games = poll._sports_games_for_events([event])
+    except Exception as exc:
+        bot.log(f"[DBG] Sports.ru names unavailable {event['eventId']}: {exc!r}")
+        return None
+    return games[0] if games else None
+
+
+def _sportsru_rows(sru_info: dict | None, abbr: str) -> list[dict]:
+    if not sru_info:
+        return []
+    for side in ("teamA", "teamB"):
+        team = sru_info[side]
+        if bot.canon_abbr(team["abbr"]) == abbr:
+            return sru_info["players"].get(team["name"], [])
+    return []
+
+
+def _with_russian_names(espn_rows: list[dict], sru_rows: list[dict]) -> list[dict]:
+    """Take the Sports.ru name when its stat line is identical to ESPN's for the same player."""
+    by_stats: dict[tuple, list[str]] = {}
+    for row in sru_rows:
+        by_stats.setdefault(tuple(row[k] for k in STAT_KEYS), []).append(row["name"])
+    out = []
+    for row in espn_rows:
+        found = by_stats.get(tuple(row[k] for k in STAT_KEYS), [])
+        out.append({**row, "name": found[0] if len(found) == 1 else row["name"]})
+    return out
+
+
+def _ready_info(event: dict, espn_by_pair: dict) -> dict | None:
+    """Game info with player lines, or None while no box score is ready.
+
+    ESPN is the main source. If ESPN has no box score for the game, the Sports.ru
+    stat page is used as before, when it is already published."""
+    espn_ev = espn_by_pair.get(poll._event_pair(event))
+    teams = _espn_box_rows(espn_ev["_raw_ev"]["id"]) if espn_ev else {}
+    sru = _sportsru_info(event)
+    if not teams:
+        if sru and any(sru["players"].values()):
+            bot.log(f"[DBG] Sports.ru box used (no ESPN box) {event['eventId']}")
+            return sru
+        return None
+
+    info = bot.synthesize_game_from_espn(event)
+    espn_ids = {
+        bot.canon_abbr(espn_ev["home"]["abbr"]): espn_ev["home"]["teamId"],
+        bot.canon_abbr(espn_ev["away"]["abbr"]): espn_ev["away"]["teamId"],
+    }
+    players = {}
+    for side in ("teamA", "teamB"):
+        abbr = info[side]["abbr"]
+        espn_rows = teams.get(espn_ids.get(abbr, ""), [])
+        ru_name = bot.ABBR_TO_RU.get(abbr, info[side]["name"])
+        players[ru_name] = _with_russian_names(espn_rows, _sportsru_rows(sru, abbr))
+    info["players"] = players
+    ru_names = sum(1 for rows in players.values() for r in rows if re.search(r"[А-Яа-яЁё]", r["name"]))
+    bot.log(f"[DBG] ESPN box {event['eventId']} players={bot.players_count(info)} ru_names={ru_names}")
+    return info
+
+
+def _wait_expired(event: dict) -> bool:
+    try:
+        start = datetime.fromisoformat(event["utcDate"].replace("Z", "+00:00"))
+    except (KeyError, ValueError, AttributeError):
+        return True
+    return datetime.now(timezone.utc) >= start + PLAYERS_WAIT
+
+
 def _run_production_tick() -> None:
     d_pt = bot.pick_report_date_pacific_env()
     Path(bot.MARKER_DIR).mkdir(parents=True, exist_ok=True)
@@ -192,8 +310,6 @@ def _run_production_tick() -> None:
     sports_events, sports_pages = poll._sports_completed_events_for_pt_day(d_pt)
     completed = sports_events if sports_pages > 0 else poll._completed_espn_events_for_pt_day(d_pt)
 
-    # Keep all quick markers actionable for silent stats upgrades, but queue at most
-    # one never-posted final for actual Telegram publication in this minute.
     quick = []
     new = []
     for event in completed:
@@ -203,13 +319,35 @@ def _run_production_tick() -> None:
         elif state is None:
             new.append(event)
 
-    selected_new = new[:1]
-    actionable = quick + selected_new
+    if not quick and not new:
+        print(f"OK poll date_pt={d_pt} completed={len(completed)} quick=0 new=0 publish_now=0")
+        return
 
+    espn_by_pair = {poll._event_pair(e): e for e in poll._completed_espn_events_for_pt_day(d_pt)}
+
+    # Quick markers are upgraded silently once their box score exists.
+    infos = []
+    for event in quick:
+        info = _ready_info(event, espn_by_pair)
+        if info is not None:
+            infos.append(info)
+
+    # At most one never-posted final per tick. It is posted only with its ESPN box
+    # score, or score-only once PLAYERS_WAIT has passed since tip-off.
+    publish = None
+    for event in new:
+        info = _ready_info(event, espn_by_pair)
+        if info is not None or _wait_expired(event):
+            publish = event
+            if info is not None:
+                infos.append(info)
+            break
+
+    actionable = quick + ([publish] if publish else [])
     if not actionable:
         print(
             f"OK poll date_pt={d_pt} completed={len(completed)} quick={len(quick)} "
-            f"new={len(new)} publish_now=0"
+            f"new={len(new)} publish_now=0 waiting_for_box_score=1"
         )
         return
 
@@ -218,18 +356,14 @@ def _run_production_tick() -> None:
     if sports_pages > 0:
         actionable = poll._enrich_with_espn(actionable, d_pt)
 
-    if len(new) > 1:
-        queued = ",".join(e["eventId"] for e in new[1:])
-        print(f"BACKLOG queued_for_later_minutes={queued}")
-
     print(
         "ACTION quick=" + ",".join(e["eventId"] for e in quick) +
-        " publish=" + ",".join(e["eventId"] for e in selected_new)
+        " publish=" + (publish["eventId"] if publish else "")
     )
 
     # Feed only the selected actions to the proven formatter/sender/marker code.
     bot.espn_completed_events_for_pt_day = lambda _d: actionable
-    bot.fetch_sports_games_for_pt_day = lambda _d: poll._sports_games_for_events(actionable)
+    bot.fetch_sports_games_for_pt_day = lambda _d: infos
     bot.main()
 
 
