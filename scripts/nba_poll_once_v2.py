@@ -198,7 +198,7 @@ def _smoke_render_known_slate() -> None:
 def _espn_box_rows(espn_event_id: str) -> dict[str, list[dict]]:
     """Player lines per ESPN team id; empty while the box score is not there yet."""
     try:
-        r = bot.S.get(ESPN_SUMMARY.format(eid=espn_event_id), timeout=bot.HTTP_TIMEOUT)
+        r = bot.S.get(ESPN_SUMMARY.format(eid=espn_event_id), headers=bot.ESPN_HEADERS, timeout=bot.HTTP_TIMEOUT)
         if r.status_code != 200:
             return {}
         data = r.json()

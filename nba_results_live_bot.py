@@ -428,6 +428,8 @@ def fetch_sports_games_for_pt_day(d_pt: date) -> list[dict]:
 # ========================= ESPN API =========================
 
 ESPN_SB = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates={ymd}"
+# ESPN answers 403 to the bot's own User-Agent, but accepts a browser-style one.
+ESPN_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
 
 def _espn_record(c: dict) -> str:
     # разные структуры у ESPN, собираем максимально универсально
@@ -464,7 +466,7 @@ def _intish(x):
 
 def fetch_espn_events_for_day(d: date) -> list[dict]:
     try:
-        r = S.get(ESPN_SB.format(ymd=d.strftime("%Y%m%d")), timeout=HTTP_TIMEOUT)
+        r = S.get(ESPN_SB.format(ymd=d.strftime("%Y%m%d")), headers=ESPN_HEADERS, timeout=HTTP_TIMEOUT)
         if r.status_code != 200:
             return []
         j = r.json()
