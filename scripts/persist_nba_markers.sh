@@ -9,14 +9,20 @@ if [ ! -d posted ]; then
   exit 0
 fi
 
-if [ -z "$(git status --porcelain posted)" ]; then
-  echo "No marker changes."
+# Player-name files written by the poll (see scripts/nba_poll_once_v2.py) are committed too.
+NAME_FILES=""
+for f in names_ru_nba.json names_pending_nba.json; do
+  if [ -e "$f" ]; then NAME_FILES="$NAME_FILES $f"; fi
+done
+
+if [ -z "$(git status --porcelain posted $NAME_FILES)" ]; then
+  echo "No marker or name changes."
   exit 0
 fi
 
 git config user.name "github-actions"
 git config user.email "actions@github.com"
-git add -A posted
+git add -A posted $NAME_FILES
 git commit -m "NBA live markers $(date -u +'%Y-%m-%d %H:%M:%S')"
 
 for attempt in 1 2 3; do

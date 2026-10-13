@@ -1,0 +1,318 @@
+{
+ "2530530": {
+  "en": "T.J. McConnell",
+  "team": "IND"
+ },
+ "3136777": {
+  "en": "Jae'Sean Tate",
+  "team": "HOU"
+ },
+ "3442": {
+  "en": "DeAndre Jordan",
+  "team": "NOP"
+ },
+ "3934673": {
+  "en": "Donte DiVincenzo",
+  "team": "MIN"
+ },
+ "4066259": {
+  "en": "De'Aaron Fox",
+  "team": "SAS"
+ },
+ "4066650": {
+  "en": "Zach Collins",
+  "team": "CHI"
+ },
+ "4278067": {
+  "en": "Nic Claxton",
+  "team": "CHI"
+ },
+ "4278395": {
+  "en": "Taylor Funk",
+  "team": "UTA"
+ },
+ "4278729": {
+  "en": "Jarkel Joiner",
+  "team": "CHA"
+ },
+ "4279143": {
+  "en": "Tyreke Key",
+  "team": "TOR"
+ },
+ "4395667": {
+  "en": "Dane Goodwin",
+  "team": "DEN"
+ },
+ "4395997": {
+  "en": "Terrell Brown Jr.",
+  "team": "UTA"
+ },
+ "4398257": {
+  "en": "Jake Stephens",
+  "team": "MIL"
+ },
+ "4431720": {
+  "en": "Lester Quinones",
+  "team": "MIA"
+ },
+ "4432586": {
+  "en": "Nate Bittle",
+  "team": "TOR"
+ },
+ "4432737": {
+  "en": "Jaden Bradley",
+  "team": "TOR"
+ },
+ "4432976": {
+  "en": "Coleman Hawkins",
+  "team": "DEN"
+ },
+ "4433138": {
+  "en": "Nimari Burnett",
+  "team": "TOR"
+ },
+ "4565698": {
+  "en": "Bryce Hopkins",
+  "team": "DEN"
+ },
+ "4593125": {
+  "en": "Santi Aldama",
+  "team": "DAL"
+ },
+ "4593815": {
+  "en": "Rashaun Agee",
+  "team": "CLE"
+ },
+ "4683730": {
+  "en": "Jaden Akins",
+  "team": "NYK"
+ },
+ "4683857": {
+  "en": "Kobe Johnson",
+  "team": "ATL"
+ },
+ "4683860": {
+  "en": "Quadir Copeland",
+  "team": "HOU"
+ },
+ "4684269": {
+  "en": "Kylan Boswell",
+  "team": "CHA"
+ },
+ "4684443": {
+  "en": "Rafael Castro",
+  "team": "LAL"
+ },
+ "4684682": {
+  "en": "Jonas Aidoo",
+  "team": "UTA"
+ },
+ "4684793": {
+  "en": "Kyle Filipowski",
+  "team": "UTA"
+ },
+ "4685802": {
+  "en": "Robert McCray V",
+  "team": "OKC"
+ },
+ "4693954": {
+  "en": "Ian Schieffelin",
+  "team": "MIA"
+ },
+ "4698719": {
+  "en": "Trevon Brazile",
+  "team": "DEN"
+ },
+ "4702049": {
+  "en": "Duke Miles",
+  "team": "PHI"
+ },
+ "4702528": {
+  "en": "Jaxson Robinson",
+  "team": "CLE"
+ },
+ "4702602": {
+  "en": "CJ Huntley",
+  "team": "PHX"
+ },
+ "4702784": {
+  "en": "J'Vonne Hadley",
+  "team": "MIA"
+ },
+ "4703396": {
+  "en": "Graham Ike",
+  "team": "GSW"
+ },
+ "4704043": {
+  "en": "Steve Settle III",
+  "team": "WAS"
+ },
+ "4708972": {
+  "en": "Jazian Gortman",
+  "team": "WAS"
+ },
+ "4712845": {
+  "en": "Isaac McKneely",
+  "team": "ATL"
+ },
+ "4712862": {
+  "en": "Malik Dia",
+  "team": "NOP"
+ },
+ "4712902": {
+  "en": "Cameron Corhen",
+  "team": "ATL"
+ },
+ "4837238": {
+  "en": "Tucker DeVries",
+  "team": "BOS"
+ },
+ "4870564": {
+  "en": "Joshua Jefferson",
+  "team": "BKN"
+ },
+ "4873153": {
+  "en": "Morez Johnson Jr.",
+  "team": "DAL"
+ },
+ "4897155": {
+  "en": "Anthony Pritchard",
+  "team": "OKC"
+ },
+ "4897504": {
+  "en": "Wyatt Fricks",
+  "team": "CHA"
+ },
+ "4898010": {
+  "en": "Jaylin Sellers",
+  "team": "CHI"
+ },
+ "4898260": {
+  "en": "Tyson Degenhart",
+  "team": "TOR"
+ },
+ "4997537": {
+  "en": "Tristan Vukcevic",
+  "team": "WAS"
+ },
+ "5037878": {
+  "en": "Ugonna Onyenso",
+  "team": "DET"
+ },
+ "5101761": {
+  "en": "Mikel Brown Jr.",
+  "team": "BKN"
+ },
+ "5101845": {
+  "en": "Jayden Quaintance",
+  "team": "SAS"
+ },
+ "5105555": {
+  "en": "Tobe Awaka",
+  "team": "CHI"
+ },
+ "5105571": {
+  "en": "Henri Veesaar",
+  "team": "ATL"
+ },
+ "5105800": {
+  "en": "Josh Dix",
+  "team": "OKC"
+ },
+ "5105817": {
+  "en": "Carson Cooper",
+  "team": "MEM"
+ },
+ "5105832": {
+  "en": "Nick Martinelli",
+  "team": "LAC"
+ },
+ "5105839": {
+  "en": "Brice Sensabaugh",
+  "team": "UTA"
+ },
+ "5105853": {
+  "en": "Fletcher Loyer",
+  "team": "LAC"
+ },
+ "5105875": {
+  "en": "Mike Sharavjamts",
+  "team": "ORL"
+ },
+ "5106261": {
+  "en": "Ernest Udeh Jr.",
+  "team": "CLE"
+ },
+ "5106272": {
+  "en": "Milos Uzan",
+  "team": "BOS"
+ },
+ "5106293": {
+  "en": "Mohamed Wague",
+  "team": "UTA"
+ },
+ "5107157": {
+  "en": "Ryan Conwell",
+  "team": "MIA"
+ },
+ "5107242": {
+  "en": "Dion Brown",
+  "team": "BKN"
+ },
+ "5107251": {
+  "en": "Izaiyah Nelson",
+  "team": "ORL"
+ },
+ "5109790": {
+  "en": "Christoph Tilly",
+  "team": "OKC"
+ },
+ "5114350": {
+  "en": "AK Okereke",
+  "team": "LAL"
+ },
+ "5116468": {
+  "en": "Andrew Holifield",
+  "team": "OKC"
+ },
+ "5142620": {
+  "en": "Darius Acuff Jr.",
+  "team": "SAC"
+ },
+ "5142621": {
+  "en": "Chris Cenac Jr.",
+  "team": "BOS"
+ },
+ "5148538": {
+  "en": "Tarik Biberovic",
+  "team": "DAL"
+ },
+ "5149115": {
+  "en": "Allen Graves",
+  "team": "TOR"
+ },
+ "5174983": {
+  "en": "Aday Mara",
+  "team": "OKC"
+ },
+ "5175737": {
+  "en": "Yaxel Lendeborg",
+  "team": "GSW"
+ },
+ "5214989": {
+  "en": "Bogoljub Markovic",
+  "team": "MIL"
+ },
+ "5254165": {
+  "en": "Keaton Wagler",
+  "team": "LAC"
+ },
+ "5279129": {
+  "en": "Sergio de Larrea",
+  "team": "DAL"
+ },
+ "6440": {
+  "en": "Tobias Harris",
+  "team": "SAS"
+ }
+}

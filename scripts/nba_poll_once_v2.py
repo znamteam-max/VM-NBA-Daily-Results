@@ -5,21 +5,26 @@
 
 Key guarantees:
 - all NBA cards are checked on every tick through the lightweight Sports.ru day pages;
+  finals that Sports.ru does not list (e.g. preseason games) come from ESPN;
 - at most ONE never-posted final is published per tick, so recovery/restarts cannot dump a batch;
 - already-published `quick` results may be upgraded to `full` silently in the same tick;
 - the final score from the Sports.ru day card is authoritative over any score scraped from
   the player-stat page;
-- result posts normally show two standout players from each team (four total);
-- player lines come from the ESPN box score; the Russian name is taken from the
-  Sports.ru stat page when that page shows the identical stat line for the player;
+- player lines come from the ESPN box score. Russian names come from the names database
+  (ESPN player id -> Russian name from the Sports.ru profile); unknown players are written
+  to names_pending_nba.json;
+- a post shows two players per team, the second one only when he is standout (or Demin/Goldin),
+  and at least three players in total;
 - push smoke tests never send Telegram messages and regression-test a known NBA slate.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
+import unicodedata
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -34,12 +39,23 @@ bot = poll.bot
 
 REGRESSION_DATE_PT = date(2026, 10, 5)
 
-# ESPN box score: complete player lines for every finished game, including games whose
-# Sports.ru stat page has not been published yet.
+# ESPN box score: complete player lines for every finished game.
 ESPN_SUMMARY = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event={eid}"
 STAT_KEYS = ("pts", "reb", "ast", "stl", "blk")
 # If the ESPN box score is still missing this long after tip-off, post the score alone.
 PLAYERS_WAIT = timedelta(hours=4)
+# Demin and Goldin always get their own line when they play.
+SPECIAL_KEYS = {"BKN": ["дёмин", "demin"], "MIA": ["голдин", "goldin"]}
+
+# Name files; the workflow commits them together with posted/.
+NAMES_DB_PATH = ROOT / "names_ru_nba.json"            # {espn_player_id: {"en": ..., "ru": ...}}
+NAMES_PENDING_PATH = ROOT / "names_pending_nba.json"  # {espn_player_id: {"en": ..., "team": ...}}
+SRU_PERSON = "https://www.sports.ru/basketball/person/{slug}/"
+
+# Teams that ESPN lists but Sports.ru does not (preseason exhibitions).
+bot.ABBR_TO_RU.setdefault("LON", "Лондон Лайонс")
+
+CYRILLIC = re.compile(r"[А-Яа-яЁё]")
 
 
 def _force_authoritative_final_score(info: dict, event: dict) -> None:
@@ -60,59 +76,176 @@ def _force_authoritative_final_score(info: dict, event: dict) -> None:
 bot.fix_scores_with_espn = _force_authoritative_final_score
 
 
-def _pick_two_team_players(abbr: str, rows: list[dict]) -> list[tuple[dict, bool, bool]]:
-    """Pick two useful lines per team whenever at least two player rows exist.
+# ========================= NAMES =========================
 
-    Keep the existing special treatment for Demin/Goldin, but remove the old
-    20-point/double-double gate for the second ordinary player. The old gate was
-    why a normal result could contain only one player from each team.
-    """
+_names_db: dict | None = None
+_names_pending: dict | None = None
+_names_dirty = False
+
+
+def _load_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+
+
+def _names() -> dict:
+    global _names_db
+    if _names_db is None:
+        _names_db = _load_json(NAMES_DB_PATH)
+    return _names_db
+
+
+def _pending() -> dict:
+    global _names_pending
+    if _names_pending is None:
+        _names_pending = _load_json(NAMES_PENDING_PATH)
+    return _names_pending
+
+
+def save_names() -> None:
+    """Write the name files only when they changed."""
+    global _names_dirty
+    if not _names_dirty:
+        return
+    dump = lambda d: json.dumps(d, ensure_ascii=False, indent=1, sort_keys=True) + "\n"
+    NAMES_DB_PATH.write_text(dump(_names()), encoding="utf-8")
+    NAMES_PENDING_PATH.write_text(dump(_pending()), encoding="utf-8")
+    _names_dirty = False
+
+
+def _remember(key: str, en: str, ru: str) -> None:
+    global _names_dirty
+    _names()[key] = {"en": en, "ru": ru}
+    _pending().pop(key, None)
+    _names_dirty = True
+
+
+def _queue(key: str, en: str, team: str) -> None:
+    global _names_dirty
+    if key not in _pending():
+        _pending()[key] = {"en": en, "team": team}
+        _names_dirty = True
+
+
+def _slug_candidates(en: str) -> list[str]:
+    """Sports.ru profile slugs built from the English name: 'Kevin McCullar Jr.' -> kevin-mccullar-jr."""
+    base = unicodedata.normalize("NFKD", en).encode("ascii", "ignore").decode().lower()
+    base = base.replace("'", "").replace("’", "").replace(".", "")
+    parts = [p for p in re.split(r"[\s\-]+", base) if p]
+    if not parts:
+        return []
+    plain = "-".join(parts)
+    if parts[-1] in {"jr", "sr", "ii", "iii", "iv"}:
+        return [plain, "-".join(parts[:-1])]
+    return [plain, plain + "-jr"]
+
+
+def _sportsru_name(en: str) -> str | None:
+    """Russian name from the Sports.ru profile page whose address is built from the English name."""
+    for slug in _slug_candidates(en):
+        try:
+            r = bot.S.get(SRU_PERSON.format(slug=slug), timeout=bot.HTTP_TIMEOUT)
+        except Exception:
+            continue
+        if r.status_code != 200:
+            continue
+        h1 = bot.BeautifulSoup(r.text, "html.parser").find("h1")
+        name = h1.get_text(" ", strip=True) if h1 else ""
+        if CYRILLIC.search(name):
+            return name
+    return None
+
+
+def _display_name(row: dict) -> str:
+    """Name to print for a player row. Sports.ru rows are already Russian."""
+    en = row["name"]
+    if CYRILLIC.search(en):
+        return en
+    key = str(row.get("id") or "")
+    if key and key in _names():
+        return _names()[key]["ru"]
+    ru = row.get("ru_stat")  # same player with the identical stat line on the Sports.ru page
+    if not ru or not CYRILLIC.search(ru):
+        ru = _sportsru_name(en)
+    if ru and CYRILLIC.search(ru):
+        if key:
+            _remember(key, en, ru)
+        return ru
+    if key:
+        _queue(key, en, row.get("team", ""))
+    return en
+
+
+# ========================= PLAYERS =========================
+
+
+def _pick_team(abbr: str, rows: list[dict]) -> list[tuple[dict, bool, bool]]:
+    """Top player of the team, plus a second one only when he is standout or Demin/Goldin.
+
+    Returns (row, bold, special_format) tuples."""
+    rows = sorted(rows, key=bot.score_key, reverse=True)
     if not rows:
         return []
-
-    rows = sorted(rows, key=bot.score_key, reverse=True)
-    special_keys: list[str] = []
-    if abbr == "BKN":
-        special_keys = ["дёмин", "demin"]
-    elif abbr == "MIA":
-        special_keys = ["голдин", "goldin"]
-
-    special = None
-    for player in rows:
-        name = (player.get("name") or "").lower()
-        if any(key in name for key in special_keys):
-            special = player
-            break
-
+    keys = SPECIAL_KEYS.get(abbr, [])
+    special = next((p for p in rows if any(k in (p["name"] or "").lower() for k in keys)), None)
     top = rows[0]
-    picked: list[tuple[dict, bool, bool]] = []
-    picked_names: set[str] = set()
-
-    if special and special.get("name") == top.get("name"):
-        picked.append((special, True, True))
-        picked_names.add(special.get("name") or "")
-    elif special:
-        picked.append((top, False, False))
-        picked.append((special, True, True))
-        picked_names.add(top.get("name") or "")
-        picked_names.add(special.get("name") or "")
-    else:
-        picked.append((top, False, False))
-        picked_names.add(top.get("name") or "")
-
-    if len(picked) < 2:
-        for player in rows[1:]:
-            name = player.get("name") or ""
-            if name in picked_names:
-                continue
-            picked.append((player, False, False))
-            break
-
-    return picked[:2]
+    if special is top:
+        return [(special, True, True)]
+    if special is not None:
+        return [(top, False, False), (special, True, True)]
+    picked = [(top, False, False)]
+    second = next((p for p in rows[1:] if bot.second_ok(p)), None)
+    if second is not None:
+        picked.append((second, False, False))
+    return picked
 
 
-# Production formatter uses this function inside build_block().
-bot.pick_team_players = _pick_two_team_players
+def _pick_game(abbr_a, rows_a, abbr_b, rows_b):
+    """Players for both teams: up to two per team, at least three in total."""
+    picks_a = _pick_team(abbr_a, rows_a)
+    picks_b = _pick_team(abbr_b, rows_b)
+    if len(picks_a) + len(picks_b) < 3:
+        taken = {id(p) for p, _, _ in picks_a + picks_b}
+        rest = [(p, picks_a) for p in rows_a if id(p) not in taken]
+        rest += [(p, picks_b) for p in rows_b if id(p) not in taken]
+        rest.sort(key=lambda item: bot.score_key(item[0]), reverse=True)
+        for p, target in rest:
+            if len(picks_a) + len(picks_b) >= 3:
+                break
+            target.append((p, False, False))
+    return picks_a, picks_b
+
+
+def _build_block(info: dict) -> str:
+    A, B = info["teamA"], info["teamB"]
+    recA = info.get("records", {}).get(A["abbr"], "")
+    recB = info.get("records", {}).get(B["abbr"], "")
+    a_win = A["score"] > B["score"]
+    b_win = B["score"] > A["score"]
+    head = (
+        f"{bot.format_score_line(bot.ABBR_TO_RU.get(A['abbr'], A['name']), A['abbr'], A['score'], a_win, recA)}\n"
+        f"{bot.format_score_line(bot.ABBR_TO_RU.get(B['abbr'], B['name']), B['abbr'], B['score'], b_win, recB)}\n\n"
+    )
+    Aname = bot.ABBR_TO_RU.get(A["abbr"], A["name"])
+    Bname = bot.ABBR_TO_RU.get(B["abbr"], B["name"])
+    picks_a, picks_b = _pick_game(
+        A["abbr"], info["players"].get(Aname, []), B["abbr"], info["players"].get(Bname, [])
+    )
+
+    def line(p: dict, bold: bool, special: bool) -> str:
+        shown = {**p, "name": _display_name(p)}
+        text = bot.format_player_special(shown) if special else bot.format_player_regular(shown, bold)
+        return bot.sp(text)
+
+    al = [line(*item) for item in picks_a]
+    bl = [line(*item) for item in picks_b]
+    lines = al + ([""] if al and bl else []) + bl
+    return head + ("\n".join(lines) if lines else "")
+
+
+bot.build_block = _build_block
 
 
 def _event_pair(event: dict) -> frozenset[str]:
@@ -172,12 +305,11 @@ def _smoke_render_known_slate() -> None:
         Bname = bot.ABBR_TO_RU.get(B["abbr"], B["name"])
         rows_a = info["players"].get(Aname, [])
         rows_b = info["players"].get(Bname, [])
-        selected_players = len(bot.pick_team_players(A["abbr"], rows_a)) + len(
-            bot.pick_team_players(B["abbr"], rows_b)
-        )
-        if len(rows_a) >= 2 and len(rows_b) >= 2 and selected_players != 4:
+        picks_a, picks_b = _pick_game(A["abbr"], rows_a, B["abbr"], rows_b)
+        selected_players = len(picks_a) + len(picks_b)
+        if len(rows_a) + len(rows_b) >= 3 and selected_players < 3:
             raise RuntimeError(
-                f"Regression smoke: expected 4 selected players for {event['eventId']}, "
+                f"Regression smoke: expected at least 3 selected players for {event['eventId']}, "
                 f"got {selected_players}"
             )
 
@@ -216,8 +348,10 @@ def _espn_box_rows(espn_event_id: str) -> dict[str, list[dict]]:
                 if not athlete.get("stats"):
                     continue
                 s = dict(zip(keys, athlete["stats"]))
-                name = (athlete.get("athlete") or {}).get("displayName") or ""
+                who = athlete.get("athlete") or {}
+                name = who.get("displayName") or ""
                 row = {
+                    "id": str(who.get("id") or ""),
                     "name": name,
                     "pts": bot._intish(s.get("points")),
                     "reb": bot._intish(s.get("rebounds")),
@@ -233,11 +367,11 @@ def _espn_box_rows(espn_event_id: str) -> dict[str, list[dict]]:
 
 
 def _sportsru_info(event: dict) -> dict | None:
-    """Sports.ru stat page for this game; used only to get Russian player names."""
+    """Sports.ru stat page for this game; used only to match Russian names by stat line."""
     try:
         games = poll._sports_games_for_events([event])
     except Exception as exc:
-        bot.log(f"[DBG] Sports.ru names unavailable {event['eventId']}: {exc!r}")
+        bot.log(f"[DBG] Sports.ru stat page unavailable {event['eventId']}: {exc!r}")
         return None
     return games[0] if games else None
 
@@ -252,15 +386,15 @@ def _sportsru_rows(sru_info: dict | None, abbr: str) -> list[dict]:
     return []
 
 
-def _with_russian_names(espn_rows: list[dict], sru_rows: list[dict]) -> list[dict]:
-    """Take the Sports.ru name when its stat line is identical to ESPN's for the same player."""
+def _match_stat_lines(espn_rows: list[dict], sru_rows: list[dict]) -> list[tuple[dict, str | None]]:
+    """Pair each ESPN row with the Sports.ru name when that name's stat line is identical and unique."""
     by_stats: dict[tuple, list[str]] = {}
     for row in sru_rows:
         by_stats.setdefault(tuple(row[k] for k in STAT_KEYS), []).append(row["name"])
     out = []
     for row in espn_rows:
         found = by_stats.get(tuple(row[k] for k in STAT_KEYS), [])
-        out.append({**row, "name": found[0] if len(found) == 1 else row["name"]})
+        out.append((row, found[0] if len(found) == 1 else None))
     return out
 
 
@@ -268,8 +402,8 @@ def _ready_info(event: dict, espn_by_pair: dict) -> dict | None:
     """Game info with player lines, or None while no box score is ready.
 
     ESPN is the main source. If ESPN has no box score for the game, the Sports.ru
-    stat page is used as before, when it is already published."""
-    espn_ev = espn_by_pair.get(poll._event_pair(event))
+    stat page is used, when it is already published."""
+    espn_ev = espn_by_pair.get(_event_pair(event))
     teams = _espn_box_rows(espn_ev["_raw_ev"]["id"]) if espn_ev else {}
     sru = _sportsru_info(event)
     if not teams:
@@ -288,10 +422,12 @@ def _ready_info(event: dict, espn_by_pair: dict) -> dict | None:
         abbr = info[side]["abbr"]
         espn_rows = teams.get(espn_ids.get(abbr, ""), [])
         ru_name = bot.ABBR_TO_RU.get(abbr, info[side]["name"])
-        players[ru_name] = _with_russian_names(espn_rows, _sportsru_rows(sru, abbr))
+        players[ru_name] = [
+            {**row, "team": abbr, "ru_stat": ru}
+            for row, ru in _match_stat_lines(espn_rows, _sportsru_rows(sru, abbr))
+        ]
     info["players"] = players
-    ru_names = sum(1 for rows in players.values() for r in rows if re.search(r"[А-Яа-яЁё]", r["name"]))
-    bot.log(f"[DBG] ESPN box {event['eventId']} players={bot.players_count(info)} ru_names={ru_names}")
+    bot.log(f"[DBG] ESPN box {event['eventId']} players={bot.players_count(info)}")
     return info
 
 
@@ -308,7 +444,13 @@ def _run_production_tick() -> None:
     Path(bot.MARKER_DIR).mkdir(parents=True, exist_ok=True)
 
     sports_events, sports_pages = poll._sports_completed_events_for_pt_day(d_pt)
-    completed = sports_events if sports_pages > 0 else poll._completed_espn_events_for_pt_day(d_pt)
+    espn_events = poll._completed_espn_events_for_pt_day(d_pt)
+    if sports_pages > 0:
+        # Sports.ru is the main finish signal; ESPN adds finals Sports.ru does not list.
+        listed = {_event_pair(e) for e in sports_events}
+        completed = sports_events + [e for e in espn_events if _event_pair(e) not in listed]
+    else:
+        completed = espn_events
 
     quick = []
     new = []
@@ -323,7 +465,7 @@ def _run_production_tick() -> None:
         print(f"OK poll date_pt={d_pt} completed={len(completed)} quick=0 new=0 publish_now=0")
         return
 
-    espn_by_pair = {poll._event_pair(e): e for e in poll._completed_espn_events_for_pt_day(d_pt)}
+    espn_by_pair = {_event_pair(e): e for e in espn_events}
 
     # Quick markers are upgraded silently once their box score exists.
     infos = []
@@ -365,6 +507,7 @@ def _run_production_tick() -> None:
     bot.espn_completed_events_for_pt_day = lambda _d: actionable
     bot.fetch_sports_games_for_pt_day = lambda _d: infos
     bot.main()
+    save_names()
 
 
 def main() -> None:
@@ -374,8 +517,9 @@ def main() -> None:
         _smoke_render_known_slate()
         return
 
-    # Preserve explicit manual/retro modes exactly as before.
-    if poll._manual_or_test_mode():
+    # Single-event and list modes keep the legacy behaviour. Everything else,
+    # including manual runs with a date and test-chat runs, uses the production tick.
+    if bot.SEND_TEST_MSG or bot.LIST_EVENTS or bot.ONLY_EVENT_ID:
         poll.main()
         return
 
