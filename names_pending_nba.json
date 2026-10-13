@@ -1,32 +1,4 @@
 {
- "2530530": {
-  "en": "T.J. McConnell",
-  "team": "IND"
- },
- "3136777": {
-  "en": "Jae'Sean Tate",
-  "team": "HOU"
- },
- "3442": {
-  "en": "DeAndre Jordan",
-  "team": "NOP"
- },
- "3934673": {
-  "en": "Donte DiVincenzo",
-  "team": "MIN"
- },
- "4066259": {
-  "en": "De'Aaron Fox",
-  "team": "SAS"
- },
- "4066650": {
-  "en": "Zach Collins",
-  "team": "CHI"
- },
- "4278067": {
-  "en": "Nic Claxton",
-  "team": "CHI"
- },
  "4278395": {
   "en": "Taylor Funk",
   "team": "UTA"
@@ -75,10 +47,6 @@
   "en": "Bryce Hopkins",
   "team": "DEN"
  },
- "4593125": {
-  "en": "Santi Aldama",
-  "team": "DAL"
- },
  "4593815": {
   "en": "Rashaun Agee",
   "team": "CLE"
@@ -102,14 +70,6 @@
  "4684443": {
   "en": "Rafael Castro",
   "team": "LAL"
- },
- "4684682": {
-  "en": "Jonas Aidoo",
-  "team": "UTA"
- },
- "4684793": {
-  "en": "Kyle Filipowski",
-  "team": "UTA"
  },
  "4685802": {
   "en": "Robert McCray V",
@@ -138,10 +98,6 @@
  "4702784": {
   "en": "J'Vonne Hadley",
   "team": "MIA"
- },
- "4703396": {
-  "en": "Graham Ike",
-  "team": "GSW"
  },
  "4704043": {
   "en": "Steve Settle III",
@@ -227,10 +183,6 @@
   "en": "Nick Martinelli",
   "team": "LAC"
  },
- "5105839": {
-  "en": "Brice Sensabaugh",
-  "team": "UTA"
- },
  "5105853": {
   "en": "Fletcher Loyer",
   "team": "LAC"
@@ -291,10 +243,6 @@
   "en": "Allen Graves",
   "team": "TOR"
  },
- "5174983": {
-  "en": "Aday Mara",
-  "team": "OKC"
- },
  "5175737": {
   "en": "Yaxel Lendeborg",
   "team": "GSW"
@@ -310,9 +258,5 @@
  "5279129": {
   "en": "Sergio de Larrea",
   "team": "DAL"
- },
- "6440": {
-  "en": "Tobias Harris",
-  "team": "SAS"
  }
 }
