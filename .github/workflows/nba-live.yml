@@ -50,6 +50,7 @@ on:
       - "scripts/nba_poll_once.py"
       - "scripts/nba_poll_once_v2.py"
       - "scripts/persist_nba_markers.sh"
+      - "certs/**"
 
 permissions:
   contents: write

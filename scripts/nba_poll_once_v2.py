@@ -539,21 +539,46 @@ _nba_boxes: dict[str, dict] = {}
 _nba_schedule: list | None = None
 
 
-def _nba_get(path: str) -> dict | None:
+# Backup bridges on the owner's servers (deploy/nba-relay): same API and key, each with its own self-signed
+# certificate kept in certs/ (the bot trusts exactly that certificate for that address).
+NBA_RELAYS = (
+    ("https://167.104.104.3:8790", ROOT / "certs" / "nba-relay-stockholm.pem"),
+    ("https://217.179.50.92:8790", ROOT / "certs" / "nba-relay-warsaw.pem"),
+)
+
+
+def _all_nba_routes() -> list[tuple[str, object]]:
+    for url, cert in NBA_RELAYS:
+        if not cert.exists():
+            bot.log(f"[DBG] NBA relay {url} is off: certificate {cert.name} is missing in certs/")
+    return [(NBA_BRIDGE, True)] + [(url, str(cert)) for url, cert in NBA_RELAYS if cert.exists()]
+
+
+_nba_routes = _all_nba_routes()  # a route that fails is dropped for the rest of the tick
+
+
+def _nba_get(path: str, read_timeout: float = 8) -> dict | None:
+    """NBA's JSON through the first working route: Cloudflare bridge, then Stockholm, then Warsaw."""
     global _nba_down
     if not NBA_KEY or _nba_down:
         return None
-    try:
-        r = _nba_http.get(f"{NBA_BRIDGE}/{path}", timeout=(3, 8),
-                          headers={"x-bridge-key": NBA_KEY, "User-Agent": bot.ESPN_HEADERS["User-Agent"]})
-        if r.status_code == 200:
-            return r.json()
-        bot.log(f"[DBG] NBA bridge HTTP {r.status_code} for {path.split('?')[0]}")
-        if r.status_code in (403, 429) or r.status_code >= 500:
-            _nba_down = True
-    except Exception as exc:
-        bot.log(f"[DBG] NBA bridge failed for {path.split('?')[0]}: {type(exc).__name__}")
-        _nba_down = True
+    what = path.split("?")[0]
+    for route in list(_nba_routes):
+        base, verify = route
+        try:
+            r = _nba_http.get(f"{base}/{path}", timeout=(3, read_timeout), verify=verify,
+                              headers={"x-bridge-key": NBA_KEY, "User-Agent": bot.ESPN_HEADERS["User-Agent"]})
+            if r.status_code == 200:
+                return r.json()
+        except Exception as exc:  # timeout, refused, TLS, broken JSON
+            bot.log(f"[DBG] NBA route {base.split('//')[1]} failed for {what}: {type(exc).__name__}")
+            _nba_routes.remove(route)
+            continue
+        bot.log(f"[DBG] NBA route {base.split('//')[1]} HTTP {r.status_code} for {what}")
+        if r.status_code in (403, 404) and r.headers.get("content-type", "").startswith("application/xml"):
+            return None  # NBA's own «no such file» (S3 XML): the same through every route
+        _nba_routes.remove(route)  # anything else (Akamai, Cloudflare page, key, 5xx) is a problem of this route
+    _nba_down = True
     return None
 
 
@@ -601,7 +626,7 @@ def _nba_day_games(d_pt) -> dict:
     if not games and d_pt < datetime.now(timezone.utc).astimezone(poll.TZ_PT).date():
         global _nba_schedule
         if _nba_schedule is None:  # manual runs for a past day only; 7 MB, fetched once per process
-            sched = _nba_get("cdn.nba.com/static/json/staticData/scheduleLeagueV2.json") or {}
+            sched = _nba_get("cdn.nba.com/static/json/staticData/scheduleLeagueV2.json", read_timeout=30) or {}
             _nba_schedule = [g for d in (sched.get("leagueSchedule") or {}).get("gameDates") or [] for g in d.get("games") or []]
         games = [g for g in _nba_schedule if on_day(g)]
     out = {}
@@ -799,6 +824,14 @@ def _run_production_tick() -> None:
     espn_all = _espn_day_events(d_pt)
     espn_events = [e for e in espn_all if e.get("completed")]
     nba_by_pair = _nba_day_games(d_pt)
+    # Sports.ru day pages also carry cards of neighbouring days (time only, no date), so a card can land on the
+    # wrong PT day. Keep a Sports.ru final only if ESPN or NBA lists that pair on this PT day (when they answer).
+    known = {_event_pair(e) for e in espn_all} | set(nba_by_pair)
+    if known:
+        stray = [e["eventId"] for e in sports_events if _event_pair(e) not in known]
+        if stray:
+            bot.log(f"[DBG] Sports.ru cards not on this PT day per ESPN/NBA, ignored: {','.join(stray)}")
+        sports_events = [e for e in sports_events if _event_pair(e) in known]
     if sports_pages > 0:
         # Sports.ru is the main finish signal; ESPN adds finals Sports.ru does not list.
         listed = {_event_pair(e) for e in sports_events}
@@ -881,9 +914,18 @@ def _smoke_nba() -> None:
     if not NBA_KEY:
         print("NBA bridge: no key, NBA source is off")
         return
-    data = _nba_get("cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json")
-    games = ((data or {}).get("scoreboard") or {}).get("games") or []
-    print(f"NBA bridge: {'OK' if data else 'FAILED'} games_today={len(games)}")
+    for url, cert in NBA_RELAYS:
+        if not cert.exists():
+            print(f"NBA route {url.split('//')[1]}: NO CERT ({cert.name} missing in certs/)")
+    for base, verify in _all_nba_routes():
+        try:
+            r = _nba_http.get(f"{base}/cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json",
+                              timeout=(3, 8), verify=verify,
+                              headers={"x-bridge-key": NBA_KEY, "User-Agent": bot.ESPN_HEADERS["User-Agent"]})
+            games = len(r.json()["scoreboard"]["games"]) if r.status_code == 200 else "-"
+            print(f"NBA route {base.split('//')[1]}: HTTP {r.status_code} games_today={games}")
+        except Exception as exc:
+            print(f"NBA route {base.split('//')[1]}: FAILED {type(exc).__name__}")
 
 
 def main() -> None:

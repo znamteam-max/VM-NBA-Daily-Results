@@ -1,0 +1,31 @@
+[Unit]
+Description=Backup bridge to NBA's own data for the NBA results bot (VM-NBA-Daily-Results)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/nba-relay/relay.py
+Environment=RELAY_PORT=8790
+# key = the same value as the GitHub secret NBA_BRIDGE_KEY; cert = this server's self-signed certificate
+LoadCredential=key:/etc/nba-relay/key
+LoadCredential=cert.pem:/etc/nba-relay/cert.pem
+LoadCredential=cert.key:/etc/nba-relay/cert.key
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+MemoryMax=100M
+CPUQuota=30%
+TasksMax=64
+LimitNOFILE=4096
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

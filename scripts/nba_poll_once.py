@@ -216,10 +216,12 @@ def _sports_completed_events_for_pt_day(d_pt) -> tuple[list[dict], int]:
             url = bot._normalize_match_url(href)
             if url in seen_urls or url.endswith("/basketball/match/live/"):
                 continue
-            seen_urls.add(url)
 
             info = _sports_card_to_event(_nearby_text(a), d_msk, url, d_pt)
             if info:
+                # mark only a card that was read: the previous MSK day's page also links the same
+                # matches (as previews), and marking those first hid the real finals on the next page
+                seen_urls.add(url)
                 events[info["eventId"]] = info
 
     out = sorted(events.values(), key=lambda e: e.get("_start_pt") or datetime.min.replace(tzinfo=TZ_PT))
