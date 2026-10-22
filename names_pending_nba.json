@@ -31,10 +31,6 @@
   "en": "Nate Bittle",
   "team": "TOR"
  },
- "4432737": {
-  "en": "Jaden Bradley",
-  "team": "TOR"
- },
  "4432976": {
   "en": "Coleman Hawkins",
   "team": "DEN"
@@ -42,10 +38,6 @@
  "4433138": {
   "en": "Nimari Burnett",
   "team": "TOR"
- },
- "4565698": {
-  "en": "Bryce Hopkins",
-  "team": "DEN"
  },
  "4593815": {
   "en": "Rashaun Agee",
@@ -79,10 +71,6 @@
   "en": "Ian Schieffelin",
   "team": "MIA"
  },
- "4698719": {
-  "en": "Trevon Brazile",
-  "team": "DEN"
- },
  "4702049": {
   "en": "Duke Miles",
   "team": "PHI"
@@ -90,10 +78,6 @@
  "4702528": {
   "en": "Jaxson Robinson",
   "team": "CLE"
- },
- "4702602": {
-  "en": "CJ Huntley",
-  "team": "PHX"
  },
  "4702784": {
   "en": "J'Vonne Hadley",
@@ -123,14 +107,6 @@
   "en": "Tucker DeVries",
   "team": "BOS"
  },
- "4870564": {
-  "en": "Joshua Jefferson",
-  "team": "BKN"
- },
- "4873153": {
-  "en": "Morez Johnson Jr.",
-  "team": "DAL"
- },
  "4897155": {
   "en": "Anthony Pritchard",
   "team": "OKC"
@@ -147,29 +123,9 @@
   "en": "Tyson Degenhart",
   "team": "TOR"
  },
- "4997537": {
-  "en": "Tristan Vukcevic",
-  "team": "WAS"
- },
- "5037878": {
-  "en": "Ugonna Onyenso",
-  "team": "DET"
- },
- "5101761": {
-  "en": "Mikel Brown Jr.",
-  "team": "BKN"
- },
- "5101845": {
-  "en": "Jayden Quaintance",
-  "team": "SAS"
- },
  "5105555": {
   "en": "Tobe Awaka",
   "team": "CHI"
- },
- "5105571": {
-  "en": "Henri Veesaar",
-  "team": "ATL"
  },
  "5105800": {
   "en": "Josh Dix",
@@ -178,10 +134,6 @@
  "5105817": {
   "en": "Carson Cooper",
   "team": "MEM"
- },
- "5105832": {
-  "en": "Nick Martinelli",
-  "team": "LAC"
  },
  "5105853": {
   "en": "Fletcher Loyer",
@@ -203,17 +155,9 @@
   "en": "Mohamed Wague",
   "team": "UTA"
  },
- "5107157": {
-  "en": "Ryan Conwell",
-  "team": "MIA"
- },
  "5107242": {
   "en": "Dion Brown",
   "team": "BKN"
- },
- "5107251": {
-  "en": "Izaiyah Nelson",
-  "team": "ORL"
  },
  "5109790": {
   "en": "Christoph Tilly",
@@ -226,37 +170,5 @@
  "5116468": {
   "en": "Andrew Holifield",
   "team": "OKC"
- },
- "5142620": {
-  "en": "Darius Acuff Jr.",
-  "team": "SAC"
- },
- "5142621": {
-  "en": "Chris Cenac Jr.",
-  "team": "BOS"
- },
- "5148538": {
-  "en": "Tarik Biberovic",
-  "team": "DAL"
- },
- "5149115": {
-  "en": "Allen Graves",
-  "team": "TOR"
- },
- "5175737": {
-  "en": "Yaxel Lendeborg",
-  "team": "GSW"
- },
- "5214989": {
-  "en": "Bogoljub Markovic",
-  "team": "MIL"
- },
- "5254165": {
-  "en": "Keaton Wagler",
-  "team": "LAC"
- },
- "5279129": {
-  "en": "Sergio de Larrea",
-  "team": "DAL"
  }
 }

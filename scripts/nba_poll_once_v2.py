@@ -5,7 +5,8 @@
 
 Key guarantees:
 - all NBA cards are checked on every tick through the lightweight Sports.ru day pages;
-  finals that Sports.ru does not list (e.g. preseason games) come from ESPN;
+  finals that Sports.ru does not list (e.g. preseason games) come from ESPN; a final that
+  Sports.ru shows before ESPN waits for ESPN (W-L records, full box) up to ESPN_FINAL_GRACE;
 - at most ONE never-posted final is published per tick, so recovery/restarts cannot dump a batch;
 - already-published `quick` results may be upgraded to `full` silently in the same tick;
 - the final score from the Sports.ru day card is authoritative over any score scraped from
@@ -44,6 +45,16 @@ ESPN_SUMMARY = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/sum
 STAT_KEYS = ("pts", "reb", "ast", "stl", "blk")
 # If the ESPN box score is still missing this long after tip-off, post the score alone.
 PLAYERS_WAIT = timedelta(hours=4)
+# A final that Sports.ru shows first is held until ESPN marks it final too (that is when ESPN
+# has the W-L records and the full box score), but at most this long after ESPN's last play.
+# ESPN flipped 0.5–3.5 min after the buzzer on 22.10; normal games post on the first tick after the flip.
+ESPN_FINAL_GRACE = timedelta(minutes=10)
+# If the ESPN summary cannot be fetched at all, keep waiting until this long after tip-off.
+ESPN_SUMMARY_FAIL_CAP = timedelta(hours=3)
+# Name particles that belong to the surname: «Тристан да Силва» -> «Т. да Силва».
+# («ди» is left out: it is also the letter D in «Джей Ди Дэвисон».)
+PARTICLES = {"да", "де", "дель", "делла", "ван", "фон", "ла", "ле", "дос", "дю", "дер", "ду"}
+NAME_SUFFIXES = {"jr.", "jr", "sr.", "sr", "мл.", "ст.", "младший", "старший", "ii", "iii", "iv"}
 # Demin and Goldin always get their own line when they play.
 SPECIAL_KEYS = {"BKN": ["дёмин", "demin"], "MIA": ["голдин", "goldin"]}
 
@@ -142,6 +153,20 @@ def _slug_candidates(en: str) -> list[str]:
     return [plain, plain + "-jr"]
 
 
+def _clean_profile_name(text: str) -> str | None:
+    """Plain Russian name from a Sports.ru heading, or None.
+
+    Sports.ru tells namesakes apart by birth year («Девин Букер 1991»), so years and
+    bracketed notes are dropped; anything that is still not a plain Cyrillic name is rejected."""
+    name = re.sub(r"\(.*?\)", " ", text or "")
+    name = re.sub(r"\b(?:19|20)\d{2}\b", " ", name)
+    name = re.sub(r"\s+(?:II|III|IV)\s*$", " ", name)  # «Гэри Пэйтон II» -> «Гэри Пэйтон»
+    name = re.sub(r"\s+", " ", name).strip(" ,-")
+    if CYRILLIC.search(name) and re.fullmatch(r"[А-Яа-яЁё'’′.\- ]+", name) and len(name.split()) <= 4:
+        return name
+    return None
+
+
 def _sportsru_name(en: str) -> str | None:
     """Russian name from the Sports.ru profile page whose address is built from the English name."""
     for slug in _slug_candidates(en):
@@ -152,30 +177,65 @@ def _sportsru_name(en: str) -> str | None:
         if r.status_code != 200:
             continue
         h1 = bot.BeautifulSoup(r.text, "html.parser").find("h1")
-        name = h1.get_text(" ", strip=True) if h1 else ""
-        if CYRILLIC.search(name):
+        name = _clean_profile_name(h1.get_text(" ", strip=True) if h1 else "")
+        if name:
             return name
     return None
 
 
 def _display_name(row: dict) -> str:
-    """Name to print for a player row. Sports.ru rows are already Russian."""
+    """Name to print for a player row. Sports.ru rows are already Russian.
+
+    Order: «short» override -> a valid name in the names database -> the Sports.ru stat page of
+    this very game (same team, identical and unique stat line; it also repairs a broken database
+    entry) -> Sports.ru profile guessed from the English name -> English name."""
     en = row["name"]
     if CYRILLIC.search(en):
-        return en
+        return _clean_profile_name(en) or en
     key = str(row.get("id") or "")
-    if key and key in _names():
-        return _names()[key]["ru"]
-    ru = row.get("ru_stat")  # same player with the identical stat line on the Sports.ru page
-    if not ru or not CYRILLIC.search(ru):
-        ru = _sportsru_name(en)
-    if ru and CYRILLIC.search(ru):
+    entry = _names().get(key) if key else None
+    if entry and entry.get("short"):
+        return entry["short"]
+    stored = _clean_profile_name(entry.get("ru", "")) if entry else None
+    if stored:
+        return stored
+    ru = _clean_profile_name(row.get("ru_stat") or "")
+    if ru:
+        if key:
+            _remember(key, en, ru)
+        return ru
+    ru = _sportsru_name(en)
+    if ru:
         if key:
             _remember(key, en, ru)
         return ru
     if key:
         _queue(key, en, row.get("team", ""))
     return en
+
+
+def _short_names() -> set[str]:
+    return {v["short"] for v in _names().values() if v.get("short")}
+
+
+def _initials(full: str) -> str:
+    """«Кевин Дюрэнт» -> «К. Дюрэнт», «Тристан да Силва» -> «Т. да Силва»,
+    «Майкл Портер младший» -> «М. Портер младший». Names with a «short» override print whole."""
+    if full in _short_names():
+        return full
+    parts = full.split()
+    if len(parts) < 2:
+        return full
+    start = len(parts) - 1
+    if parts[-1].lower() in NAME_SUFFIXES and len(parts) >= 3:
+        start -= 1
+    while start > 1 and parts[start - 1].lower() in PARTICLES:
+        start -= 1
+    return f"{parts[0][0]}. {' '.join(parts[start:])}"
+
+
+# Every player line (regular and Demin/Goldin format) is shortened through this.
+bot.initials_ru = _initials
 
 
 # ========================= PLAYERS =========================
@@ -327,17 +387,100 @@ def _smoke_render_known_slate() -> None:
     )
 
 
+_summaries: dict[str, dict | None] = {}
+
+
+def _espn_summary(espn_event_id: str) -> dict | None:
+    """ESPN game summary (box score + play-by-play), fetched at most once per tick; None if the request failed."""
+    if espn_event_id not in _summaries:
+        data = None
+        try:
+            r = bot.S.get(ESPN_SUMMARY.format(eid=espn_event_id), headers=bot.ESPN_HEADERS, timeout=bot.HTTP_TIMEOUT)
+            if r.status_code == 200:
+                data = r.json()
+            else:
+                bot.log(f"[DBG] ESPN summary HTTP {r.status_code} {espn_event_id}")
+        except Exception as exc:
+            bot.log(f"[DBG] ESPN summary failed {espn_event_id}: {exc!r}")
+        _summaries[espn_event_id] = data
+    return _summaries[espn_event_id]
+
+
+def _last_play_utc(data: dict) -> datetime | None:
+    stamps = [p.get("wallclock") for p in data.get("plays") or [] if p.get("wallclock")]
+    try:
+        return max(datetime.fromisoformat(s.replace("Z", "+00:00")) for s in stamps) if stamps else None
+    except ValueError:
+        return None
+
+
+def _espn_day_events(d_pt) -> list[dict]:
+    """All ESPN games of the PT day, finished or not, with the same canonical ids as the Sports.ru events."""
+    raw = []
+    for d in bot.espn_dates_for_pt_day(d_pt):
+        raw.extend(poll._fetch_espn_events_for_day_all_types(d))
+    by_pair: dict[frozenset, dict] = {}
+    for e in raw:
+        try:
+            dt = bot._espn_pt_start_dt(e)
+            if not dt or dt.date() != d_pt:
+                continue
+            pair = _event_pair(e)
+            if len(pair) != 2 or "" in pair:
+                continue  # placeholders such as TBD vs TBD
+            if pair in by_pair and by_pair[pair].get("completed"):
+                continue  # a game listed twice keeps its finished copy
+            e = dict(e)
+            e["eventId"] = poll._canonical_event_id(d_pt, *sorted(pair))
+            by_pair[pair] = e
+        except Exception as exc:  # one malformed ESPN event must not stop the tick
+            bot.log(f"[DBG] ESPN event skipped: {exc!r}")
+    return list(by_pair.values())
+
+
+def _espn_grace_over(espn_ev: dict, event: dict) -> bool:
+    """True once ESPN had ESPN_FINAL_GRACE after its last play to mark the game final."""
+    data = _espn_summary(espn_ev["_raw_ev"]["id"])
+    if data is None:  # request failed: keep waiting (next tick retries), but not forever
+        try:
+            tip = datetime.fromisoformat(event["utcDate"].replace("Z", "+00:00"))
+        except (KeyError, ValueError, AttributeError):
+            return True
+        return datetime.now(timezone.utc) >= tip + ESPN_SUMMARY_FAIL_CAP
+    last = _last_play_utc(data)
+    if last is None:
+        return True  # no play-by-play (e.g. exhibitions): nothing to wait for
+    return datetime.now(timezone.utc) >= last + ESPN_FINAL_GRACE
+
+
+def _box_matches_score(teams: dict, espn_ev: dict, event: dict) -> bool:
+    """A box score is complete when each team's player points add up to its final score."""
+    final = {bot.canon_abbr(event[s]["abbr"]): int(event[s]["score"]) for s in ("home", "away")}
+    for s in ("home", "away"):
+        abbr = bot.canon_abbr(espn_ev[s]["abbr"])
+        rows = teams.get(espn_ev[s]["teamId"], [])
+        if abbr not in final or sum(r["pts"] for r in rows) != final[abbr]:
+            return False
+    return True
+
+
+def _copy_records(events: list[dict], espn_by_pair: dict) -> list[dict]:
+    """W-L records from the finished ESPN games already fetched in this tick."""
+    for e in events:
+        espn_ev = espn_by_pair.get(_event_pair(e))
+        if not espn_ev:
+            continue
+        by_abbr = {bot.canon_abbr(espn_ev[s]["abbr"]): espn_ev[s] for s in ("home", "away")}
+        for side in ("home", "away"):
+            src = by_abbr.get(bot.canon_abbr(e[side]["abbr"]))
+            if src and src.get("record"):
+                e[side]["record"] = src["record"]
+    return events
+
+
 def _espn_box_rows(espn_event_id: str) -> dict[str, list[dict]]:
     """Player lines per ESPN team id; empty while the box score is not there yet."""
-    try:
-        r = bot.S.get(ESPN_SUMMARY.format(eid=espn_event_id), headers=bot.ESPN_HEADERS, timeout=bot.HTTP_TIMEOUT)
-        if r.status_code != 200:
-            return {}
-        data = r.json()
-    except Exception as exc:
-        bot.log(f"[DBG] ESPN box score failed {espn_event_id}: {exc!r}")
-        return {}
-
+    data = _espn_summary(espn_event_id) or {}
     out: dict[str, list[dict]] = {}
     for team in (data.get("boxscore") or {}).get("players") or []:
         team_id = str((team.get("team") or {}).get("id") or "")
@@ -387,23 +530,41 @@ def _sportsru_rows(sru_info: dict | None, abbr: str) -> list[dict]:
 
 
 def _match_stat_lines(espn_rows: list[dict], sru_rows: list[dict]) -> list[tuple[dict, str | None]]:
-    """Pair each ESPN row with the Sports.ru name when that name's stat line is identical and unique."""
+    """Pair each ESPN row with the Sports.ru name when the stat line is identical and unique on BOTH sides."""
     by_stats: dict[tuple, list[str]] = {}
     for row in sru_rows:
         by_stats.setdefault(tuple(row[k] for k in STAT_KEYS), []).append(row["name"])
+    espn_count: dict[tuple, int] = {}
+    for row in espn_rows:
+        line = tuple(row[k] for k in STAT_KEYS)
+        espn_count[line] = espn_count.get(line, 0) + 1
     out = []
     for row in espn_rows:
-        found = by_stats.get(tuple(row[k] for k in STAT_KEYS), [])
-        out.append((row, found[0] if len(found) == 1 else None))
+        line = tuple(row[k] for k in STAT_KEYS)
+        found = by_stats.get(line, [])
+        out.append((row, found[0] if len(found) == 1 and espn_count[line] == 1 else None))
     return out
 
 
-def _ready_info(event: dict, espn_by_pair: dict) -> dict | None:
-    """Game info with player lines, or None while no box score is ready.
+def _ready_info(event: dict, espn_by_pair: dict, espn_any: dict) -> dict | None:
+    """Game info with player lines, or None while the game should wait.
 
-    ESPN is the main source. If ESPN has no box score for the game, the Sports.ru
-    stat page is used, when it is already published."""
-    espn_ev = espn_by_pair.get(_event_pair(event))
+    ESPN is the main source. A final that Sports.ru shows first waits until ESPN marks it
+    final as well (records + full box), at most ESPN_FINAL_GRACE after ESPN's last play.
+    If ESPN has no box score for the game, the Sports.ru stat page is used, when published."""
+    pair = _event_pair(event)
+    espn_ev = espn_by_pair.get(pair)
+    if espn_ev is None and pair in espn_any:
+        late = espn_any[pair]
+        if not (_espn_grace_over(late, event) or _wait_expired(event)):
+            bot.log(f"[DBG] waiting for ESPN to mark the final {event['eventId']}")
+            return None
+        # ESPN is late: its current box is used only if it is complete, otherwise the Sports.ru box.
+        if _box_matches_score(_espn_box_rows(late["_raw_ev"]["id"]), late, event):
+            espn_ev = late
+            bot.log(f"[DBG] ESPN not final after the grace, its box adds up — using it {event['eventId']}")
+        else:
+            bot.log(f"[DBG] ESPN not final after the grace and its box is incomplete {event['eventId']}")
     teams = _espn_box_rows(espn_ev["_raw_ev"]["id"]) if espn_ev else {}
     sru = _sportsru_info(event)
     if not teams:
@@ -444,7 +605,8 @@ def _run_production_tick() -> None:
     Path(bot.MARKER_DIR).mkdir(parents=True, exist_ok=True)
 
     sports_events, sports_pages = poll._sports_completed_events_for_pt_day(d_pt)
-    espn_events = poll._completed_espn_events_for_pt_day(d_pt)
+    espn_all = _espn_day_events(d_pt)
+    espn_events = [e for e in espn_all if e.get("completed")]
     if sports_pages > 0:
         # Sports.ru is the main finish signal; ESPN adds finals Sports.ru does not list.
         listed = {_event_pair(e) for e in sports_events}
@@ -466,19 +628,20 @@ def _run_production_tick() -> None:
         return
 
     espn_by_pair = {_event_pair(e): e for e in espn_events}
+    espn_any = {_event_pair(e): e for e in espn_all}
 
     # Quick markers are upgraded silently once their box score exists.
     infos = []
     for event in quick:
-        info = _ready_info(event, espn_by_pair)
+        info = _ready_info(event, espn_by_pair, espn_any)
         if info is not None:
             infos.append(info)
 
-    # At most one never-posted final per tick. It is posted only with its ESPN box
-    # score, or score-only once PLAYERS_WAIT has passed since tip-off.
+    # At most one never-posted final per tick. It is posted only with its box score
+    # (ESPN once final, see _ready_info), or score-only once PLAYERS_WAIT has passed since tip-off.
     publish = None
     for event in new:
-        info = _ready_info(event, espn_by_pair)
+        info = _ready_info(event, espn_by_pair, espn_any)
         if info is not None or _wait_expired(event):
             publish = event
             if info is not None:
@@ -493,10 +656,9 @@ def _run_production_tick() -> None:
         )
         return
 
-    # Enrichment is expensive relative to the day-page check, so only do it for
-    # the tiny actionable set. Sports.ru stays authoritative for finish + score.
-    if sports_pages > 0:
-        actionable = poll._enrich_with_espn(actionable, d_pt)
+    # W-L records come from the ESPN games fetched above (no second ESPN round trip).
+    # Sports.ru stays authoritative for finish + score.
+    actionable = _copy_records(actionable, espn_by_pair)
 
     print(
         "ACTION quick=" + ",".join(e["eventId"] for e in quick) +
@@ -510,9 +672,19 @@ def _run_production_tick() -> None:
     save_names()
 
 
+def _check_names_db() -> None:
+    """Every stored Russian name must be a plain name (no years, brackets, Latin)."""
+    bad = [(k, v.get("ru")) for k, v in _names().items()
+           if not v.get("ru") or _clean_profile_name(v["ru"]) != v["ru"]]
+    if bad:
+        raise RuntimeError(f"Names DB: {len(bad)} names are not plain Russian names, e.g. {bad[:5]}")
+    print(f"OK names db={len(_names())} pending={len(_pending())}")
+
+
 def main() -> None:
     if poll.SMOKE_TEST:
         # Current-source probe plus a fixed known slate regression.
+        _check_names_db()
         poll._run_smoke(bot.pick_report_date_pacific_env())
         _smoke_render_known_slate()
         return
