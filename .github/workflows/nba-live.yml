@@ -85,6 +85,8 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TEAM_EMOJI_JSON: ${{ secrets.TEAM_EMOJI_JSON }}
+          # Key of our Cloudflare bridge to NBA's own data; without it the bot uses Sports.ru + ESPN only.
+          NBA_BRIDGE_KEY: ${{ secrets.NBA_BRIDGE_KEY }}
           DEBUG_NBA: "1"
           REPORT_DATE_PT: ${{ inputs.report_date_pt }}
           SEND_TEST_MESSAGE: ${{ inputs.send_test_message && '1' || '' }}
